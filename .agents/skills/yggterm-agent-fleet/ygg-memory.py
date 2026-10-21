@@ -6017,6 +6017,247 @@ def cmd_connections(args):
     print(json.dumps(result, indent=None if getattr(args, "json", False) else 2))
 
 
+# ── [slice 8] pattern learning — evidence-linked, holdout-gated (gap 4) ─────
+# Gap 4 (lores 2026-10-16-yggterm-memory-post-build-gaps-sol): pattern
+# proposals carry supporting episodes, counterexamples, scope and
+# uncertainty. Repetition copied across summaries counts as ONE episode,
+# never independent evidence. Observed practice is distinguished from owner
+# instruction, and promotion is not a seat-level act: a pattern reaches
+# promotion-eligible only WITH a measured holdout gate ref (the falsifier
+# "no measured improvement = no promotion"), and `promoted` is owner-only.
+
+PATTERNS_FILENAME = "patterns.json"
+PATTERN_AUTHORITIES = ("observed-practice", "owner-instruction")
+PATTERN_SEAT_STATUSES = ("proposed", "validated", "rejected", "superseded")
+PATTERN_GATE_STATUS = "promotion-eligible"
+PATTERN_PROMOTED_STATUS = "promoted"
+
+
+def patterns_path(root: Path, ns: str) -> Path:
+    return root / "dream" / ns / PATTERNS_FILENAME
+
+
+def load_patterns(root: Path, ns: str) -> dict:
+    path = patterns_path(root, ns)
+    if not path.is_file():
+        return {"version": 1, "patterns": []}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data.get("patterns"), list):
+            data["patterns"] = []
+        return data
+    except Exception:
+        return {"version": 1, "patterns": []}
+
+
+def save_patterns(root: Path, ns: str, data: dict) -> None:
+    path = patterns_path(root, ns)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    data["patterns"] = data.get("patterns", [])[-5_000:]
+    path.write_text(json.dumps(data, indent=1) + "\n", encoding="utf-8")
+
+
+def _pattern_id(ns: str, statement: str, scope: str, authority: str) -> str:
+    digest = hashlib.sha256(f"{ns}|{statement}|{scope}|{authority}".encode("utf-8")).hexdigest()
+    return f"pat-{digest[:12]}"
+
+
+def _episode_eid(kind: str, ref: str, text: str) -> str:
+    """Content identity of one supporting episode. The same text surfacing
+    in several summaries lands on one eid — repetition folds, never weights."""
+    return hashlib.sha256(f"{kind}|{ref}|{text}".encode("utf-8")).hexdigest()[:16]
+
+
+def pattern_distinct_sources(pattern: dict) -> int:
+    """Independent-evidence count: distinct episode content identities.
+    Copied repetition across summaries never inflates this."""
+    return len({e.get("eid", "") for e in pattern.get("episodes", []) if e.get("eid")})
+
+
+def _parse_episode(token: str) -> dict:
+    """--episode 'kind:ref' — kind is the episode class, ref maps the
+    episode to a resolvable source (door path, ACK thread, claim id,
+    case id, ledger row). Content hash rides the ref context; the same
+    (kind, ref) pair folds on rerun."""
+    kind, sep, ref = token.partition(":")
+    if not sep or not kind.strip() or not ref.strip():
+        raise SystemExit("patterns: --episode format is 'kind:ref' (e.g. case:9bb1c2ff..., board:infra/meta/ACK-59caabcd)")
+    return {"kind": kind.strip(), "ref": ref.strip(),
+            "eid": _episode_eid(kind.strip(), ref.strip(), ref.strip()),
+            "as_of": budget_today()}
+
+
+def pattern_propose(
+    root: Path, ns: str, statement: str, scope: str, authority: str, *,
+    uncertainty: str, uncertainty_reason: str, episodes: list[dict] | None = None,
+    counterexamples: list[dict] | None = None, no_counterexample_found: str | None = None,
+    owner_source_ref: str | None = None, falsification_test: str | None = None,
+    review_days: int | None = None, created_by: str = "seat",
+) -> dict:
+    """Yang-style pattern admission. Fail-closed: unstated authority,
+    empty scope, unsearched counterexamples, or inflated evidence all refuse."""
+    if authority not in PATTERN_AUTHORITIES:
+        raise SystemExit(f"patterns: authority must be one of {', '.join(PATTERN_AUTHORITIES)} (unstated authority refuses)")
+    if authority == "owner-instruction" and not (owner_source_ref or "").strip():
+        raise SystemExit("patterns: authority owner-instruction requires --owner-source-ref (the owner's directive/ruling ref)")
+    if not (statement or "").strip() or not (scope or "").strip():
+        raise SystemExit("patterns: --statement and --scope are required (a pattern with no scope routes nothing)")
+    if uncertainty not in ("low", "medium", "high"):
+        raise SystemExit("patterns: --uncertainty is low|medium|high with a mandatory --uncertainty-reason")
+    if not (uncertainty_reason or "").strip():
+        raise SystemExit("patterns: --uncertainty-reason is required")
+    episodes = episodes or []
+    counterexamples = counterexamples or []
+    if not episodes:
+        raise SystemExit("patterns: at least one supporting episode is required (a pattern without episodes is an opinion)")
+    for episode in episodes:
+        for field in ("kind", "ref", "eid"):
+            if not (episode.get(field) or "").strip():
+                raise SystemExit(f"patterns: malformed episode — {field!r} missing")
+    if not counterexamples and not (no_counterexample_found or "").strip():
+        raise SystemExit("patterns: the counterexample search must be honest — pass --counterexample entries OR --no-counterexample-found with the search you ran")
+    data = load_patterns(root, ns)
+    patterns = data.setdefault("patterns", [])
+    pid = _pattern_id(ns, statement.strip(), scope.strip(), authority)
+    today = budget_today()
+    for pattern in patterns:
+        if pattern.get("id") == pid:
+            # Rerun folds: new distinct episode identities strengthen the
+            # pattern; duplicates are history, never re-counted.
+            fresh = [e for e in episodes
+                     if e.get("eid") not in {x.get("eid") for x in pattern.get("episodes", [])}]
+            if fresh:
+                pattern["episodes"] = (pattern.get("episodes", []) + fresh)[-200:]
+                pattern["strengthened_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+                pattern["distinct_sources"] = pattern_distinct_sources(pattern)
+                save_patterns(root, ns, data)
+                return {"action": "strengthened", "id": pid, "distinct_sources": pattern["distinct_sources"]}
+            return {"action": "deduplicated", "id": pid, "distinct_sources": pattern.get("distinct_sources")}
+    entry = {
+        "id": pid, "ns": ns, "statement": statement.strip(), "scope": scope.strip(),
+        "authority": authority, "status": "proposed",
+        "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "created_by": created_by,
+        "episodes": episodes[-200:],
+        "counterexamples": counterexamples[-50:],
+        "uncertainty": {"level": uncertainty, "reason": uncertainty_reason.strip()},
+        "distinct_sources": pattern_distinct_sources({"episodes": episodes}),
+    }
+    if authority == "owner-instruction":
+        entry["owner_source_ref"] = owner_source_ref.strip()
+    if (no_counterexample_found or "").strip():
+        entry["no_counterexample_found"] = no_counterexample_found.strip()
+    if (falsification_test or "").strip():
+        entry["falsification_test"] = falsification_test.strip()
+        entry["review_by"] = (datetime.date.fromisoformat(today) + datetime.timedelta(days=review_days or CONNECTION_HYPOTHESIS_DAYS)).isoformat()
+    patterns.append(entry)
+    save_patterns(root, ns, data)
+    return {"action": "created", "id": pid, "distinct_sources": entry["distinct_sources"]}
+
+
+def pattern_set_status(root: Path, ns: str, pattern_id: str, status: str, *, ref: str | None = None) -> dict:
+    """Seat-level transitions only. 'promotion-eligible' needs the measured
+    gate ref (the holdout falsifier's recorded improvement); 'promoted' is
+    owner-only and refuses any seat attempt."""
+    if status == PATTERN_PROMOTED_STATUS:
+        raise SystemExit("patterns: 'promoted' is owner-only — a seat's ceiling is promotion-eligible with a measured gate ref")
+    if status in PATTERN_SEAT_STATUSES or status == PATTERN_GATE_STATUS:
+        if status == PATTERN_GATE_STATUS and not (ref or "").strip():
+            raise SystemExit("patterns: promotion-eligible requires the measured holdout gate ref — no measured improvement means no promotion")
+    else:
+        raise SystemExit(f"patterns: seat statuses are {', '.join(PATTERN_SEAT_STATUSES)} | {PATTERN_GATE_STATUS}(--gate-ref required)")
+    data = load_patterns(root, ns)
+    for pattern in data.get("patterns", []):
+        if pattern.get("id") == pattern_id:
+            pattern["status"] = status
+            if ref:
+                pattern["status_ref"] = ref.strip()
+            pattern["status_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            save_patterns(root, ns, data)
+            return {"action": "status-set", "id": pattern_id, "status": status}
+    raise SystemExit(f"patterns: no pattern {pattern_id} in ns {ns}")
+
+
+def cmd_patterns(args):
+    """[slice 8] Evidence-linked pattern learning (gap 4): propose, list,
+    and gate patterns. Every pattern carries supporting episodes (deduped
+    by content identity), counterexamples or an honest none-found note,
+    scope, uncertainty, and an authority class. Promotion is holdout-gated
+    and owner-owned; the falsifier 'no measured improvement = no promotion'
+    is enforced at the status gate, not in prose."""
+    root = Path(getattr(args, "root", None) or DEFAULT_MEMORY_ROOT)
+    ns = detect_namespace(override=getattr(args, "ns", None))
+    if not ns:
+        raise SystemExit("patterns: --ns is required")
+    if getattr(args, "propose", False):
+        episodes = [_parse_episode(token) for token in (args.episode or [])]
+        counterexamples = []
+        for token in (args.counterexample or []):
+            ref, sep, note = token.partition(",")
+            if not sep or not note.strip():
+                raise SystemExit("patterns: --counterexample format is 'ref,why it counts against'")
+            counterexamples.append({"ref": ref.strip(), "note": note.strip()})
+        result = pattern_propose(
+            root, ns, args.statement, args.scope, args.authority,
+            uncertainty=args.uncertainty, uncertainty_reason=args.uncertainty_reason,
+            episodes=episodes, counterexamples=counterexamples,
+            no_counterexample_found=args.no_counterexample_found,
+            owner_source_ref=args.owner_source_ref,
+            falsification_test=args.falsification_test, review_days=args.review_days,
+            created_by=args.created_by,
+        )
+    elif getattr(args, "import_json", None):
+        rows = json.loads(Path(args.import_json).read_text(encoding="utf-8"))
+        if isinstance(rows, dict):
+            rows = rows.get("patterns", [])
+        results = []
+        for row in rows:
+            episodes = []
+            for episode in row.get("episodes", []):
+                if not all(episode.get(f) for f in ("kind", "ref", "eid", "as_of")):
+                    raise SystemExit(f"patterns import: malformed episode in row — expecting kind/ref/eid/as_of")
+                episodes.append({field: episode[field] for field in ("kind", "ref", "eid", "as_of")})
+            results.append(pattern_propose(
+                root, ns, row.get("statement", ""), row.get("scope", ""),
+                row.get("authority", "observed-practice"),
+                uncertainty=(row.get("uncertainty") or {}).get("level", ""),
+                uncertainty_reason=(row.get("uncertainty") or {}).get("reason", ""),
+                episodes=episodes,
+                counterexamples=[{"ref": e.get("ref", ""), "note": e.get("note", "")}
+                                 for e in row.get("counterexamples", [])],
+                no_counterexample_found=row.get("no_counterexample_found"),
+                owner_source_ref=row.get("owner_source_ref"),
+                falsification_test=row.get("falsification_test"),
+                review_days=row.get("review_days"),
+                created_by=args.created_by,
+            ))
+        created = sum(1 for r in results if r["action"] == "created")
+        strengthened = sum(1 for r in results if r["action"] == "strengthened")
+        folded = sum(1 for r in results if r["action"] == "deduplicated")
+        result = {"imported": len(results), "created": created,
+                  "strengthened": strengthened, "folded": folded}
+    elif getattr(args, "set_status", None):
+        result = pattern_set_status(root, ns, args.set_status, args.status_set, ref=args.status_ref)
+    else:  # --list
+        query = (args.query or "").lower()
+        state = getattr(args, "status", "all") or "all"
+        rows = []
+        for pattern in load_patterns(root, ns).get("patterns", []):
+            if pattern.get("status") == PATTERN_PROMOTED_STATUS and not args.all:
+                continue
+            if state != "all" and pattern.get("status") != state:
+                continue
+            text = " ".join((pattern.get("statement", ""), pattern.get("scope", ""), pattern.get("authority", ""))).lower()
+            if query and query not in text:
+                continue
+            view = dict(pattern)
+            view["_computed"] = {"distinct_sources": pattern.get("distinct_sources") or pattern_distinct_sources(pattern),
+                                 "episode_rows": len(pattern.get("episodes", []))}
+            rows.append(view)
+        result = {"ns": ns, "count": len(rows), "patterns": rows}
+    print(json.dumps(result, indent=None if getattr(args, "json", False) else 2))
+
+
 def cmd_claims(args):
     """[slice 3] Bounded retrieval over the persistent claim store — the
     compaction-safety guarantee made reachable: after any amount of brief
@@ -8098,6 +8339,35 @@ def main():
     p_conn.add_argument("--outcome", default="supported", choices=["supported", "rejected"], help="test outcome for --test")
     p_conn.set_defaults(fn=cmd_connections)
 
+    # [slice 8] evidence-linked pattern learning, holdout-gated
+    p_pat = subparsers.add_parser(
+        "patterns",
+        parents=[common_parser],
+        help="[slice 8] The pattern-learning plane (gap 4): --propose an evidence-linked pattern (episodes, counterexamples, scope, uncertainty, authority), --list, --set-status (promotion is holdout-gated + owner-owned)",
+    )
+    pat_actions = p_pat.add_mutually_exclusive_group(required=True)
+    pat_actions.add_argument("--propose", action="store_true", help="admit one pattern (statement, scope, authority, uncertainty, episodes, counterexample search)")
+    pat_actions.add_argument("--list", action="store_true", help="patterns for --ns (promoted rows are owner-visible history; --all includes them)")
+    pat_actions.add_argument("--set-status", metavar="PATTERN_ID", help="transition one pattern (validated|rejected|superseded|promotion-eligible)")
+    p_pat.add_argument("--import-json", metavar="FILE", help="bulk-admit candidate pattern rows (miner output / store export) — every row runs the same admission guards")
+    p_pat.add_argument("--statement", default="", help="the pattern itself (what generalizes, stated as a rule)")
+    p_pat.add_argument("--scope", default="", help="the distribution/route the pattern applies to (a pattern with no scope routes nothing)")
+    p_pat.add_argument("--authority", default="observed-practice", choices=list(PATTERN_AUTHORITIES), help="observed-practice vs owner-instruction (owner-instruction requires --owner-source-ref)")
+    p_pat.add_argument("--owner-source-ref", default=None, help="the owner directive/ruling ref (mandatory for authority owner-instruction)")
+    p_pat.add_argument("--uncertainty", default="medium", choices=["low", "medium", "high"], help="how confident the pattern should be consulted as")
+    p_pat.add_argument("--uncertainty-reason", default="", help="why this level (mandatory)")
+    p_pat.add_argument("--episode", action="append", default=[], metavar="KIND:REF", help="supporting episode (repeatable; identical content folds — repetition never becomes independent evidence)")
+    p_pat.add_argument("--counterexample", action="append", default=[], metavar="REF,NOTE", help="a case that counts against the pattern (repeatable)")
+    p_pat.add_argument("--no-counterexample-found", default=None, help="the search that found nothing (mandatory when no counterexamples are cited)")
+    p_pat.add_argument("--falsification-test", default=None, help="observable falsification test (adds a review-by clock)")
+    p_pat.add_argument("--review-days", type=int, default=None, help="hypothesis-mode review window (default 7)")
+    p_pat.add_argument("--status-set", dest="status_set", default=None, choices=list(PATTERN_SEAT_STATUSES) + [PATTERN_GATE_STATUS], help="for --set-status")
+    p_pat.add_argument("--status-ref", default=None, help="the evidence ref for the status transition (the measured gate ref needed for promotion-eligible)")
+    p_pat.add_argument("--created-by", default="seat", help="provenance of the proposal")
+    p_pat.add_argument("--query", default="", help="substring filter for --list")
+    p_pat.add_argument("--all", action="store_true", help="--list: include promoted rows")
+    p_pat.set_defaults(fn=cmd_patterns)
+
     # [slice 2] owner-declared work-class registry
     p_registry = subparsers.add_parser(
         "work-registry",
@@ -8189,6 +8459,8 @@ def main():
         cmd_claims(args)
     elif args.subcommand == "connections":
         cmd_connections(args)
+    elif args.subcommand == "patterns":
+        cmd_patterns(args)
     elif args.subcommand == "task-pickup":
         cmd_task_pickup(args)
     elif args.subcommand == "_budget-op":
