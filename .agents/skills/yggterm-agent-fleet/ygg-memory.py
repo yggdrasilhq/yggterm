@@ -2645,6 +2645,15 @@ def cmd_sync_harness(args):
     """Bidirectional sync between harness-local directory and ~/.yggterm/memory."""
     root = Path(args.root)
     harness = detect_harness(args.harness)
+    if harness == "unknown":
+        # F5 fix 2026-10-22: env-only detection from a plain shell (cron,
+        # ssh, a seat's exec) yields "unknown" and died as a cryptic
+        # "Unsupported harness memory backend" ValueError. Say what to do.
+        raise SystemExit(
+            "sync-harness: cannot detect a harness from this shell's env — "
+            "pass --harness <name> (known: antigravity, autoclaw, claude, "
+            "gemini, grok, kimi, muse, opencode, pi, qwen, zcode)"
+        )
     adapter = get_harness_adapter(harness)
 
     if not getattr(args, "all", False):
@@ -5008,6 +5017,13 @@ def _dream_auto(root: Path, ns_filter: str, args, dreamer: dict | None = None) -
             if not ns_dir.is_dir():
                 continue
             ns = ns_dir.name
+            # F4 fix 2026-10-22: dream/ also holds data dirs (budget/ — the
+            # budget admission journal). Treating them as namespaces made the
+            # budget journal a forever-candidate whose clean-tick failures
+            # re-stamped the fleet-wide failure backoff every tick. Only real
+            # namespaces (dash-slugs, _global) are dreamable.
+            if not (ns.startswith("-") or ns == GLOBAL_NAMESPACE):
+                continue
             if dreamer is not None:
                 if ns not in dreamer.get("ns_scope", []):
                     continue
@@ -5111,6 +5127,11 @@ def _dream_auto(root: Path, ns_filter: str, args, dreamer: dict | None = None) -
         _dream_auto_backoff(root, reason)
         _dream_receipt(root, "failed", reason, ns)
         return "auto-dream: composer failed; 1h backoff stamped"
+    if "clean tick" in (run_.stdout or ""):
+        # F4 fix 2026-10-22: rc0 clean ticks must not be recorded as
+        # applied — the delta was consumed by another seat's run.
+        _dream_receipt(root, "idle", "clean tick (delta consumed elsewhere)", ns)
+        return f"auto-dream[{ns}]: clean tick (delta consumed elsewhere)"
     lines = (run_.stdout or "").strip().splitlines()
     receipt = lines[-1] if lines else "dreamed"
     # [T-002 m2] POST-DREAM TASK PICKUP — after a clean applied tick the
@@ -7445,7 +7466,13 @@ def cmd_dream(args):
                 print(message)
             if not args.run:
                 return
-            raise SystemExit("dream --run: nothing to dream (clean tick)")
+            # F4 fix 2026-10-22: a clean tick is not a failure. The auto
+            # dreamer treated rc!=0 here as a composer failure and stamped
+            # the 1h failure backoff on every quiet tick, deadlocking the
+            # whole auto leg (measured on dev 2026-10-21..22: 12 failed +
+            # 50 backoff-deferred receipts, 0 applied). Exit 0 honestly.
+            print("dream --run: nothing to dream (clean tick)")
+            return
 
     if args.run:
         pending = get_dream_dir(root, ns) / "pending"
@@ -7742,7 +7769,12 @@ def cmd_dream(args):
             f"({contested} contested), {len(applied_ops)} op(s); watermark → seq {watermark['last_seq']}; "
             f"oplog {done / 'OPLOG.md'}"
         )
-        print("dream: run `ygg-memory sync-harness --all` to propagate NOW.md into native stores")
+        print(
+            "dream: propagate NOW.md into native stores with "
+            "`ygg-memory sync-harness --harness <name> --all` "
+            "(--harness is required from a plain shell: "
+            "autoclaw|pi|zcode|opencode|...)"
+        )
 
 
 # System-1 is deliberately lazy: ordinary grep never loads config or a model.
