@@ -31,7 +31,7 @@ import tempfile
 LEDGER = os.path.expanduser(
     "~/.yggterm/memory/namespaces/_global/fleet-task-ledger.md")
 WEIGHT = {"big": 4.0, "moderate": 2.0, "small": 1.0}
-BLOCK_RE = re.compile(r"^### \[(T-\d+(?:-[A-Z])?)\] (.+)$", re.M)  # -C suffix ids legal (T-024-C class)
+BLOCK_RE = re.compile(r"^#{3,} *(?:#+ *)?\[(T-\d+(?:-[A-Z])?)\] *(.+)$", re.M)  # -C suffix ids legal (T-024-C class); extra `#`s tolerated — a "### ### [T-022]" heading once swallowed T-022 into T-021's field dict and resurrected a done task into the batch (T-035, 2026-10-23)
 # §BATCH daily-brief form: "- **T-022 [BIG] (open) — Title.** body" — the
 # status lives inline in the parens (may nest one level, e.g.
 # "(claimed(x, y) — note)"). Parsing it killed the claim-race class measured
@@ -53,6 +53,7 @@ def parse_ledger(text):
         task = {"id": m.group(1), "title": m.group(2).strip()}
         # fields are "- key: value" bullets; the first bullet packs
         # several fields as "size: X ; value: Y ; est: Z" — split on " ; "
+        statuses = []
         for line in block.splitlines():
             line = line.strip()
             if not (line.startswith("- ") and ":" in line):
@@ -60,7 +61,16 @@ def parse_ledger(text):
             for seg in line[2:].split(" ; "):
                 if ":" in seg:
                     k, v = seg.split(":", 1)
-                    task[k.strip()] = v.strip()
+                    k = k.strip()
+                    if k == "status":
+                        statuses.append(v.strip())
+                    else:
+                        task[k] = v.strip()
+        if statuses:
+            # done is ABSORBING: a stale auto-claim line appended after a done
+            # line must not resurrect the task (T-022 sat in the waitlist that way)
+            task["status"] = next((s for s in statuses if s.startswith("done")),
+                                  statuses[-1])
         tasks.append(task)
     # §BATCH daily briefs: same task plane, inline-status form. They are the
     # already-prepared batch, so plan() reports them as-is (no re-ranking).
@@ -324,18 +334,41 @@ def selftest():
 - route: codex ; deps: none
 - status: blocked(owner-scan-pending — corpus not uploaded yet)
 
+### [T-109] done with stale trailing claim
+- size: big ; value: 5 ; est: x
+- route: glm-idle ; deps: none
+- status: done(merged report) [by zcode, 2026-10-18]
+- status: claimed(orch-x, 2026-10-22) — auto-claim residue
+
+### ### [T-112] heading carries stray extra hashes
+- size: moderate ; value: 5 ; est: x
+- route: glm-idle ; deps: none
+- status: open
+
 ## §BOOK — one-liners of finished work
 """
     p = plan(parse_ledger(synthetic))
     ids = [t["id"] for t in p["glm_idle_batch"]["tasks"]]
     # T-111-C (suffix id, value 4) ties T-106 at 2.0 and sits earlier in
-    # the file — stable sort keeps it in the moderate slot
-    assert ids == ["T-102", "T-103", "T-111-C"], ids
+    # the file — stable sort keeps it in the moderate slot; T-112 (the
+    # stray-hash heading, value 5) outranks it and takes the other slot
+    assert ids == ["T-102", "T-103", "T-112"], ids
+    # T-035 regressions (2026-10-23, measured on the seq #101999 door):
+    # a done task with a stale trailing auto-claim stays done (done is
+    # absorbing), and a `### ### [T-x]` heading parses as its OWN block
+    # instead of being absorbed into the previous task's field dict
+    # (which had resurrected T-021 as a big claimed pick).
+    tasks = {t["id"]: t for t in parse_ledger(synthetic)}
+    assert tasks["T-109"]["status"].startswith("done"), tasks["T-109"]["status"]
+    assert tasks["T-112"]["title"].startswith("heading carries"), tasks["T-112"]
+    assert all(t["id"] != "T-109" for t in p["glm_idle_batch"]["tasks"])
     assert all(t["id"] != "T-105" for t in p["glm_idle_batch"]["tasks"])
     assert p["owner_gated"] and p["owner_gated"][0]["id"] == "T-104"
     assert {t["id"] for t in p["claimed"]} == {"T-110"}, p["claimed"]
     assert all(t["id"] != "T-110" for t in p["glm_idle_batch"]["tasks"])
-    assert any(t["id"] == "T-111-C" for t in p["glm_idle_batch"]["tasks"])
+    # T-111-C lost its moderate slot to T-112 (higher score) — waitlist, not batch
+    assert all(t["id"] != "T-111-C" for t in p["glm_idle_batch"]["tasks"])
+    assert any(t["id"] == "T-111-C" for t in p["glm_waitlist"])
     assert p["held_for_deps"][0]["id"] == "T-105"
     # T-106 (route any) lost its glm moderate slot to T-111-C -> codex queue
     assert [x["id"] for x in p["codex_queue"]["tasks"]] == ["T-106", "T-101"]
