@@ -201,33 +201,69 @@ def mark_done(text, tid, proof, by, date):
     return text
 
 
-def mark_claimed(text, tid, by, date, note=""):
+def _claim_refusal(status):
+    """Fail-closed claim grammar (2026-10-22): `open` claims; explicit owned
+    states refuse outright; UNRECOGNIZED mid-grind prose (T-026 'STOOD UP …',
+    measured 2026-10-20 — the safe --claim path was blind to it and seats fell
+    back to hand-edit+publish, the exact error surface this path exists to
+    kill) refuses with the --claim-force takeover path. Returns None when the
+    claim may proceed."""
+    s = status.strip()
+    if s.startswith("open"):
+        if "gated" in s:
+            return "task is owner-gated — only the owner opens it (never force)"
+        return None
+    if s.startswith("done("):
+        return "task is already done — claims are meaningless on it"
+    if s.startswith("gated"):
+        return "task is owner-gated — only the owner opens it (never force)"
+    owned = ("claimed(", "blocked(", "armed", "STOOD UP")
+    if s.startswith(owned):
+        if s.startswith("blocked(") or s.startswith("claimed("):
+            return (f"task is {s.split('—')[0].strip()[:60]} — another seat "
+                    "holds it; --claim-force documents a takeover")
+        return (f"task is in an explicit non-open state ({s[:40]}…) — "
+                "--claim-force documents a takeover")
+    return ("task status is unrecognized mid-grind prose — refusing "
+            "fail-closed; pass --claim-force for a documented takeover "
+            "(or book via get→edit→publish)")
+
+
+def mark_claimed(text, tid, by, date, note="", force=False):
     """Transform the ledger markdown: task status -> claimed(by, date).
     Pure text transform — the caller publishes via ygg-memory. The claim is
     ID-KEYED (same discipline as mark_done): the seat hands the task id and
     this matches the exact block — hand regex over the door text has the
     mis-target hazard measured 2026-10-17 (a claim edit skipped past a
     just-claimed T-002 and landed on T-003). Refuses when the task is no
-    longer open in the text being claimed. Understands both entry forms:
-    §QUEUE `### [T-xxx]` headers and §BATCH `- **T-xxx [SIZE] (status) —
-    Title.**` briefs (the 2026-10-18 T-022 claim race happened because the
-    §BATCH form was hand-edited)."""
+    longer open in the text being claimed (grammar in _claim_refusal;
+    force=True is the documented-takeover path, never valid on done/gated).
+    Understands both entry forms: §QUEUE `### [T-xxx]` headers and §BATCH
+    `- **T-xxx [SIZE] (status) — Title.**` briefs (the 2026-10-18 T-022 claim
+    race happened because the §BATCH form was hand-edited)."""
     m = re.search(r"^### \[" + re.escape(tid) + r"\] (.+)$", text, re.M)
     if not m:
         bm = _batch_item(text, tid)
         if bm is None:
             raise SystemExit(f"task {tid} not found in the ledger (neither "
                              "§QUEUE header nor §BATCH item)")
-        if not bm.group("status").startswith("open"):
-            raise SystemExit(f"task {tid} is no longer open — another seat took it first")
-        suffix = f" — {note}" if note else ""
+        refusal = _claim_refusal(bm.group("status"))
+        if refusal and (not force or refusal.startswith("task is already done")
+                        or refusal.startswith("task is owner-gated")):
+            raise SystemExit(f"task {tid}: {refusal}")
+        suffix = f" — {note}" + (" [force-takeover]" if refusal else "")
         return _splice_batch_status(text, bm, f"claimed({by}, {date}){suffix}")
     nxt = re.search(r"^### \[T-", text[m.end():], re.M)
     block_end = m.end() + nxt.start() if nxt else len(text)
     block = text[m.end():block_end]
-    if not re.search(r"^- status: open", block, re.M):
-        raise SystemExit(f"task {tid} is no longer open — another seat took it first")
-    suffix = f" — {note}" if note else ""
+    sm = re.search(r"^- status: (.*)$", block, re.M)
+    if not sm:
+        raise SystemExit(f"task {tid} has no status line to claim")
+    refusal = _claim_refusal(sm.group(1))
+    if refusal and (not force or refusal.startswith("task is already done")
+                    or refusal.startswith("task is owner-gated")):
+        raise SystemExit(f"task {tid}: {refusal}")
+    suffix = f" — {note}" + (" [force-takeover]" if refusal else "")
     new_block, n = re.subn(r"^- status: .*$",
                            f"- status: claimed({by}, {date}){suffix}",
                            block, count=1, flags=re.M)
@@ -278,6 +314,16 @@ def selftest():
 - route: any ; deps: none
 - status: open
 
+### [T-107] mid-grind prose status
+- size: moderate ; value: 4 ; est: x
+- route: glm-idle ; deps: none
+- status: STOOD UP 2026-10-20 — policy door live; grind in flight
+
+### [T-108] blocked with no owner gate
+- size: small ; value: 2 ; est: x
+- route: codex ; deps: none
+- status: blocked(owner-scan-pending — corpus not uploaded yet)
+
 ## §BOOK — one-liners of finished work
 """
     p = plan(parse_ledger(synthetic))
@@ -305,6 +351,40 @@ def selftest():
             raise AssertionError(f"claim {bad_id} should refuse")
         except SystemExit:
             pass
+    # fail-closed claim grammar (2026-10-22): mid-grind prose and owned
+    # statuses refuse; --claim-force is the documented-takeover path and is
+    # itself refused on done()/gated
+    try:
+        mark_claimed(synthetic, "T-107", "zcode", "2026-10-22")
+        raise AssertionError("mid-grind prose claim should refuse fail-closed")
+    except SystemExit:
+        pass
+    forced = mark_claimed(synthetic, "T-107", "zcode", "2026-10-22",
+                          "documented takeover", force=True)
+    assert ("- status: claimed(zcode, 2026-10-22) — documented takeover "
+            "[force-takeover]" in forced)
+    try:
+        mark_claimed(synthetic, "T-108", "zcode", "2026-10-22")
+        raise AssertionError("blocked() claim should refuse")
+    except SystemExit:
+        pass
+    forced_block = mark_claimed(synthetic, "T-108", "zcode", "2026-10-22",
+                                "deps re-verified", force=True)
+    assert "claimed(zcode, 2026-10-22) — deps re-verified [force-takeover]" \
+        in forced_block
+    done_text = mark_done(synthetic, "T-101", "x", "zcode", "2026-10-17")
+    for always_refused in (False, True):
+        try:
+            mark_claimed(done_text, "T-101", "zcode", "2026-10-22",
+                         force=always_refused)
+            raise AssertionError("done() claim must refuse even with force")
+        except SystemExit:
+            pass
+    try:
+        mark_claimed(synthetic, "T-104", "zcode", "2026-10-22", force=True)
+        raise AssertionError("gated claim must refuse even with force")
+    except SystemExit:
+        pass
     # §BATCH form: claim/done on list-item briefs, refusal when not open
     batch = synthetic + """
 ## §BATCH — three ready-to-fire briefs
@@ -359,9 +439,13 @@ def main():
                          "ygg-memory publish (hub doors are never edited "
                          "in place) + adds the §BOOK one-liner")
     ap.add_argument("--claim", metavar="TASK_ID",
-                    help="book a claim (id-keyed, refuses a no-longer-open "
-                         "task): rewrites the ledger door via ygg-memory "
-                         "publish; the safe way to mark a task taken")
+                    help="book a claim (id-keyed, fail-closed on owned/"
+                         "mid-grind statuses): rewrites the ledger door via "
+                         "ygg-memory publish; the safe way to mark a task taken")
+    ap.add_argument("--claim-force", action="store_true",
+                    help="with --claim: documented-takeover path — overrides "
+                         "claimed(/blocked(/mid-grind prose refusals (never "
+                         "done(/gated); records [force-takeover] in the status")
     ap.add_argument("--note", default="",
                     help="with --claim: the claim note (what/where)")
     ap.add_argument("--proof", help="proof ref for --done (lane/main sha, board ACK, door seq)")
@@ -402,7 +486,8 @@ def main():
 
     if a.claim:
         text = open(a.ledger, encoding="utf-8").read()
-        new = mark_claimed(text, a.claim, a.by, a.day, a.note)
+        new = mark_claimed(text, a.claim, a.by, a.day, a.note,
+                           force=a.claim_force)
         if a.dry_run:
             print(new)
             return 0
