@@ -1,0 +1,9 @@
+[Unit]
+Description=yggterm dream spawner timer (every 20 minutes)
+
+[Timer]
+OnCalendar=*:0/20
+Persistent=false
+
+[Install]
+WantedBy=timers.target

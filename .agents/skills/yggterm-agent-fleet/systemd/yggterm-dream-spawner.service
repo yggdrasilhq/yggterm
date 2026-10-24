@@ -1,0 +1,11 @@
+[Unit]
+Description=yggterm dream spawner pass (supply->demand top-up; armed hosts only)
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/.yggterm/bin/ygg/ygg-dream-orchestrator.py topup
+ExecStartPost=%h/.yggterm/bin/ygg/ygg-dream-orchestrator.py supervise
+# passes are internally bounded (<=7min); the unit timeout is the backstop
+TimeoutStartSec=600
+# no auto-restart: the timer is the scheduler; a failed pass is a ledger line
