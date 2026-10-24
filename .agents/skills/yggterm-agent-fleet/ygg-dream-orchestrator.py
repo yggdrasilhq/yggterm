@@ -202,7 +202,7 @@ def cmd_topup(cfg):
     st = load_state()
     today = datetime.now(IST).strftime("%F")
     if st.get("day") != today:
-        st = {"day": today, "counts": {}, "moderate": 0, "dry": {}}
+        st = {"day": today, "counts": {}, "moderate": 0, "dry": {}, "staged_shas": {}}
     rows = qjson(cfg, ["list"])
     backlog = len([r for r in rows if r.get("status") in ("queued", "retry_wait", "cooldown_wait")])
     gates = plane_gates(cfg)
@@ -225,6 +225,18 @@ def cmd_topup(cfg):
             st["dry"][pick["ns"]] = st["dry"].get(pick["ns"], 0) + 1
             save_state(st)
             continue
+        # the brief stays in pending until the executor consumes it — without a
+        # sha guard every topup pass re-enqueued the SAME brief (measured:
+        # medgraph/yggterm queued 2-3x each on 2026-10-24)
+        rc2, sha_out, _ = run(["ssh", cfg["queue"]["host"],
+                               f"sha256sum {staged["brief"]} 2>/dev/null | cut -d\' \' -f1"], 20)
+        brief_sha = (sha_out or "").strip()
+        if brief_sha and st.get("staged_shas", {}).get(pick["ns"]) == brief_sha:
+            st["dry"][pick["ns"]] = st["dry"].get(pick["ns"], 0) + 1
+            save_state(st)
+            continue
+        if brief_sha:
+            st.setdefault("staged_shas", {})[pick["ns"]] = brief_sha
         n_done = st["counts"].get(pick["ns"], 0)
         route = livable[n_done % len(livable)]
         kind = cfg["kinds"][n_done % len(cfg["kinds"])]
