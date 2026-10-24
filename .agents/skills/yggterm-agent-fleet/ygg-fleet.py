@@ -29,7 +29,8 @@ def run(cmd, timeout=30):
 
 def fleet_hosts():
     try:
-        hosts = [h.strip() for h in FLEET_HOSTS_FILE.read_text().split() if h.strip() and not h.startswith("#")]
+        raw = FLEET_HOSTS_FILE.read_text().split()
+        hosts = [x for h in raw if not h.startswith("#") for x in h.split(",") if x.strip()]
         return hosts or []
     except Exception:
         return []
@@ -71,6 +72,12 @@ def cmd_agents(as_json):
 def zai_plans_local():
     """zcode-tui plans --json from the local install (start plan + grants)."""
     rc, out, err = run(["zcode-tui", "plans", "--json"], 45)
+    if rc != 0:
+        # non-interactive PATHs often lack the ynpm bin dir — try the canonical paths
+        for cand in (Path.home() / ".yggterm/ynpm/bin/zcode-tui",):
+            if cand.exists():
+                rc, out, err = run([str(cand), "plans", "--json"], 45)
+                break
     if rc != 0:
         return None
     try:
