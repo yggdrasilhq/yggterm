@@ -238,7 +238,12 @@ def cmd_topup(cfg):
         if brief_sha:
             st.setdefault("staged_shas", {})[pick["ns"]] = brief_sha
         n_done = st["counts"].get(pick["ns"], 0)
-        route = livable[n_done % len(livable)]
+        # route/kind rotate on the GLOBAL dispatch counter: per-ns count is 0
+        # for every first staging (dedupe makes it the only one), so the old
+        # modulo pinned every dream on livable[0] and starved the other
+        # planes — autoclaw went 48h unused (owner dashboard, 2026-10-24).
+        total_done = sum(st["counts"].values())
+        route = livable[total_done % len(livable)]
         kind = cfg["kinds"][n_done % len(cfg["kinds"])]
         moderate = kind in ("verify", "sweep")
         ok, line = enqueue(cfg, route, pick["ns"], kind, moderate,
