@@ -305,6 +305,35 @@ def cmd_supervise(cfg):
             run(queue_cli(cfg) + ["revoke", r["id"], "--reason", "false-completion: zero-token error turn", "--json"], 60)
             ledger["revoked"].append({"id": r["id"]})
             print(f"supervise: REVOKED false completion {r['id'][:16]}")
+    # UX-parity watch (owner 2026-10-24): the TUI parity dreamer runs 24x7 —
+    # if no parity task is alive on any plane, spawn the next one from the
+    # standing contract so the work never sleeps.
+    watch = cfg.get("ux_parity_watch") or {}
+    if watch.get("enabled"):
+        alive = [r for r in rows if "UX-PARITY" in (r.get("title") or "").upper()
+                 and r.get("status") in ("queued", "running", "retry_wait", "cooldown_wait")]
+        if not alive:
+            pf = watch.get("prompt_file")
+            rc2, _, err2 = run(["ssh", cfg["queue"]["host"],
+                f"test -f {pf} && echo YES || echo NO"], 15)
+            if "YES" in rc2 and "YES" in (err2 or "") or "YES" in open("/dev/null").read() if False else True:
+                pass
+            chk, chk_out, _ = run(["ssh", cfg["queue"]["host"], f"test -f {pf} && echo YES || echo NO"], 15)
+            if "YES" in chk_out:
+                route = watch.get("route", "autoclaw")
+                remote = (f"cd {cfg["queue"]["repo"]} && {cfg["queue"]["cli"]} enqueue"
+                          f" --route {route} --prompt-file {pf}"
+                          f" --workspace {watch.get("workspace", "/home/pi/gh/zcode-tui--ux-sol-2")}"
+                          f" --title 'UX-PARITY continuous: opencode-indistinguishable TUI (autoclaw 24x7)'"
+                          f" --max-attempts 3")
+                rc3, out3, _ = run(["ssh", cfg["queue"]["host"], remote], 90)
+                if rc3 == 0:
+                    ledger["notes"].append({"spawned": "ux-parity", "route": route})
+                    print(f"supervise: UX-parity dreamer not alive — respawned on {route}")
+                else:
+                    ledger["notes"].append({"spawn_failed": "ux-parity", "err": (out3 or "")[-120:]})
+            else:
+                ledger["notes"].append({"ux_watch": f"prompt file missing: {pf}"})
     LEDGER.parent.mkdir(parents=True, exist_ok=True)
     with LEDGER.open("a") as f:
         f.write(json.dumps(ledger) + "\n")
