@@ -24,7 +24,7 @@ exits 0 silently (units install fleet-wide, arming happens once).
 Owner law baked in: banked resets are NEVER consumed by any automated path;
 quota exhaustion means hold/reroute, never a reset.
 """
-import fcntl, json, random, shlex, subprocess, sys, time
+import fcntl, json, random, shlex, subprocess, sys, time, uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
