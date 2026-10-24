@@ -179,7 +179,10 @@ def enqueue(cfg, route, ns, kind, moderate, prompt):
     title = f"DREAM[{kind}{'/mod' if moderate else ''}]: {ns} consolidation"
     # ssh JOINS argv into one remote shell string — every variable arg must be
     # shlex-quoted or a title with spaces shatters (measured 2026-10-24).
-    remote = (f"cd {shlex.quote(q['repo'])} && {q['cli']} enqueue"
+    repo = q["repo"]
+    if repo.startswith("~/"):
+        repo = "$HOME/" + repo[2:]  # remote shell expands; shlex.quote would freeze the tilde
+    remote = (f"cd {shlex.quote(repo)} && {q['cli']} enqueue"
               f" --route {shlex.quote(route)} --prompt-file {shlex.quote(str(pf))}"
               f" --workspace {shlex.quote(str(HOME / 'gh/zcode-tui'))}"
               f" --title {shlex.quote(title)}")
@@ -252,10 +255,17 @@ def cmd_supervise(cfg):
     ledger = {"t": int(time.time()), "audited": 0, "revoked": [], "rerouted": [], "held": [], "notes": []}
     rows = qjson(cfg, ["list"])
     gates = plane_gates(cfg)
+    day_ago_ms = now_ms - 24 * 3600 * 1000
+    seen_notes = set()
     for r in rows:
         low = (r.get("last_error") or "").lower()
         if r.get("status") != "failed":
             continue
+        if (r.get("updated_at") or 0) < day_ago_ms:
+            continue  # history, not news
+        if r["id"] in seen_notes:
+            continue
+        seen_notes.add(r["id"])
         if any(s in low for s in QUOTA_SIGNS):
             alt = next((p for p in cfg["routes"] if p != r["route"] and gates[p]["ok"]), None)
             if alt:
