@@ -47,15 +47,24 @@ EXPERIMENT = ("CANARY", "FALSIFIER", "PROBE", "TEST", "SMOKE")
 # expected share is a FAULT of the system, not weather. Checked over the
 # whole 48h ledger, appended to the wake report, and FAILs any wake whose
 # sampled sessions ran on an over-weight plane while a healthy plane starved.
-EXPECTED_SHARE = {"zai-coding-plan": 0.34, "autoclaw": 0.25, "codex": 0.2, "opencode-free": 0.15}
+EXPECTED_SHARE = {"zai-coding-plan": 0.34, "autoclaw": 0.25, "codex": 0.2,
+                  "opencode-free": 0.15, "zai-offpeak": 0.1}
 
 
 def route_balance(rows):
     """sol finding 5: shares are WEIGHTS over ELIGIBLE routes — normalize over
     the routes actually dispatched in the window, so a route that is down is
-    excluded from the denominator instead of silently deflating every target."""
+    excluded from the denominator instead of silently deflating every target.
+    Measured defect 2026-10-25: raw rows double-counted status-updated ids
+    (zai's 15 cancels + retries inflated the denominator and deflated every
+    other route into false starvation) and zai-offpeak was missing from the
+    table entirely. Dedupe to each id's LATEST status before counting."""
     from collections import Counter
-    c = Counter(r["route"] for r in rows if r.get("status") in ("completed", "failed", "running", "retry_wait"))
+    latest = {}
+    for r in rows:
+        latest[r["id"]] = r
+    c = Counter(r["route"] for r in latest.values()
+                if r.get("status") in ("completed", "failed", "running", "retry_wait"))
     n = sum(c.values()) or 1
     eligible = [r for r in EXPECTED_SHARE if c.get(r, 0) > 0]
     wsum = sum(EXPECTED_SHARE[r] for r in eligible) or 1.0
