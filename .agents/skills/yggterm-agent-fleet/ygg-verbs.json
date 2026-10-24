@@ -19,7 +19,11 @@
     "fleet-binary-sync.sh",
     "yggterm-socket-sweep.sh",
     "ygg-memory-tick",
-    "fleet-daemon-audit.sh"
+    "fleet-daemon-audit.sh",
+    "ygg",
+    "ygg-dream-orchestrator.py",
+    "ygg-fleet.py",
+    "ygg-init.sh"
   ],
   "owner_managed": [
     "ygg-memory",
@@ -80,6 +84,10 @@
     "fleet-binary-sync.sh",
     "yggterm-socket-sweep.sh",
     "ygg-memory-tick",
-    "fleet-daemon-audit.sh"
+    "fleet-daemon-audit.sh",
+    "ygg",
+    "ygg-dream-orchestrator.py",
+    "ygg-fleet.py",
+    "ygg-init.sh"
   ]
 }
