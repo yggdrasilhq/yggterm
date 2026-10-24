@@ -267,7 +267,7 @@ def cmd_supervise(cfg):
     ledger = {"t": int(time.time()), "audited": 0, "revoked": [], "rerouted": [], "held": [], "notes": []}
     rows = qjson(cfg, ["list"])
     gates = plane_gates(cfg)
-    day_ago_ms = now_ms - 24 * 3600 * 1000
+    day_ago_ms = int(time.time() * 1000) - 24 * 3600 * 1000
     seen_notes = set()
     for r in rows:
         low = (r.get("last_error") or "").lower()
