@@ -1,0 +1,46 @@
+# Minimal valid v2 config — the conformance suite's happy-path seed.
+schema_version: 2
+identity:
+  config_id: conformance-genesis
+  authority_epoch: 1
+  revision: 1
+  parent_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  change_id: "11111111-2222-4333-8444-555555555555"
+  proposed_by: owner
+  reason: conformance genesis
+fleet: {authority_host: dev, hosts: [dev, jojo], dispatch_host: dev}
+kernel:
+  contract_version: "2.0"
+  minimum_consumer_version: "2.0"
+  state_dir: "~/.yggterm/swarm"
+maintenance:
+  service: ygg-swarm-maintenance-orchestrator.service
+  supervisor: {harness: deterministic-python, model: null, controller_host: dev, poll_seconds: 30}
+catalog:
+  harnesses: {h1: {kind: consult-cli}, h2: {kind: dispatch-queue}}
+  providers: {p1: {id: p1}}
+  accounts: {a1: {provider: p1}}
+  plans: {pl1: {provider: p1, kind: subscription}}
+  bindings:
+    b1: {harness: h1, provider: p1, model: m1, plan: pl1, account: a1, status: admitted, capabilities: [editorial]}
+    b2: {status: declared, capabilities: [editorial]}
+planes:
+  plane1: {owner_policy: enabled, binding_refs: [b1], budget_refs: [bud1]}
+  plane2: {owner_policy: disabled, binding_refs: [b2]}
+roles:
+  editor: {kind: editorial, default_binding_ref: b1, fallback_binding_refs: [b2]}
+editor_scenarios:
+  swap:
+    binding_order: [b2, b1]
+    activation: {requires_admitted_target: true, ttl_seconds: 600, max_swaps_per_incident: 1}
+campaign_policies:
+  burn:
+    mode: directed_multi_direction
+    authorization: {source_ref: owner-test}
+    directions: {max_active: 1}
+    allocation: {budget_ref: bud1, maintenance_reserve_is_spendable: false}
+supply:
+  budgets:
+    bud1: {scope: test, hard_limits: {tokens: 100}}
+intent: {canonical: "~/x.md"}
+sync: {protocol_version: 1}

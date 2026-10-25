@@ -1,0 +1,306 @@
+# =============================================================================
+# swarm-config.yaml — THE SWARM SURVIVAL LEDGER (v2, owner-editable)
+# =============================================================================
+# One file lists every orchestrator, dreamer, intelligence role, and binding
+# in the fleet: which model + harness + plan each runs on. In catastrophe
+# (quota death, account loss, provider outage) the OWNER edits this file on
+# ANY host; the sync plane captures the edit as a proposal, the deterministic
+# maintenance service validates and activates it, and the swarm reboots from
+# it, then self-heals (holds expire, reroutes rebalance, intelligence returns
+# when its plan does).
+#
+# THE MAINTENANCE BOUNDARY (read before editing `maintenance:`):
+#   ygg-swarm-maintenance-orchestrator.service
+#       A DETERMINISTIC python supervisor. No model, no network creativity.
+#       It validates and activates this config, syncs accepted revisions
+#       fleet-wide, supervises the adapters below, and contains failures.
+#   ygg-swarm-executor@zcode.service
+#       The queue transport adapter (the zcode-tui serve) — replaceable,
+#       owned by the maintenance service, never its dependency.
+#   The OS starts the maintenance service with no queue, no model, and no
+#   YAML parser: recovery reads swarm/config/checkpoint.json (plain JSON).
+#
+# LAWS:
+#  - The deterministic core runs with ZERO model calls. If `roles.intelligence`
+#    is dead, the core contains (holds, expiries, reroutes) and defers novel
+#    decisions. Novel decisions never block the core.
+#  - Any harness-organization change starts FROM the yggterm seed repo
+#    (tools/swarm-config.yaml is stamped from it) — never a bolt-on addon.
+#  - A binding marked `declared` is a logical profile only: it cannot receive
+#    work until its harness/provider/model/account are resolved and it is
+#    flipped to `admitted`.
+#  - Plan metadata describes the purchased arrangement. Remaining quota and
+#    health are OBSERVATIONS (reported read-only), never edited here.
+#  - Deny latches (owner stops/drains) live in ~/.yggterm/swarm/control/ —
+#    they survive even a broken edit of this file.
+#
+# SYNC: multi-directional ledger. dev is the writer; every host may propose.
+# An owner edit on any host is captured by the next reconcile (300s), signed
+# by content identity, and accepted against the parent hash — see `sync:`.
+# =============================================================================
+
+schema_version: 2
+
+identity:
+  config_id: fleet-swarm
+  authority_epoch: 1        # bump only via owner-authorized epoch transfer
+  revision: 2               # monotonic within epoch; one accept() = one revision
+  parent_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+  change_id: "7f3c2a10-5d4e-4b8a-9c1f-2e6d8a4b5c01"
+  proposed_by: owner
+  reason: "v2 genesis: authority chain, catalog, planes separation, maintenance boundary"
+
+fleet:
+  authority_host: dev       # the ONLY writer of accepted revisions
+  hosts: [dev, oc, jojo, practice]
+  dispatch_host: dev
+  failover: owner-authorized-epoch-transfer   # no automatic election, ever
+
+kernel:
+  # the portable swarm-harness kernel (contracts, wire schema, policy
+  # vocabulary, receipts, fixtures). Adapters bind it to this infra.
+  contract_version: "2.0"
+  minimum_consumer_version: "2.0"
+  repo: "~/gh/yggterm"                       # SSOT seed; kernel in tools/swarmharness/
+  policy_dir: "~/.yggterm/dream/policy"
+  feedback: "~/.yggterm/dream/audit-feedback.json"   # the audit wire
+  dream_state_dir: "~/.yggterm/dream"
+  state_dir: "~/.yggterm/swarm"              # activation store + ledger + control
+  wake_interval_min: 20                      # spawner cadence; snapshot validity derives from it
+  on_no_usable_config: containment-only      # retain work, hold admissions, defer novel decisions
+
+maintenance:
+  service: ygg-swarm-maintenance-orchestrator.service
+  executor_service: ygg-swarm-executor@zcode.service
+  supervisor:
+    harness: deterministic-python            # INVARIANT: validated, never edited to a model
+    model: null                              # INVARIANT: null — zero model dependency
+    controller_host: dev                     # full supervisor; other hosts run replicas
+    replica_hosts: [oc, jojo, practice]
+    poll_seconds: 30
+    dependency_timeout_seconds: 30
+    restart_limit: {attempts: 3, window_seconds: 900}
+    backoff_seconds: [10, 60, 300]
+  repair_role_ref: core-keeper               # optional model-assisted repair, OUTSIDE the queue it may fix
+  permitted_actions:                         # exhaustive allowlist for the maintenance service
+    - validate-config
+    - replicate-accepted-config
+    - capture-replica-proposal
+    - restart-allowlisted-unit
+    - contain-ineligible-work
+    - invoke-versioned-recovery-procedure
+    - launch-authorized-repair-role
+  prohibited_actions:                        # violation = defect, not judgment
+    - invent-owner-policy
+    - increase-budget
+    - redeem-banked-reset
+    - purchase-credit
+    - change-credentials
+    - install-unreviewed-code
+    - promote-generated-procedure
+    - clear-deny-latch-without-owner
+
+catalog:
+  harnesses:            # installed adapters; launch commands live in the installed manifest, never here
+    zcode-tui: {kind: dispatch-queue, adapter_ref: queue-serve-v2}
+    codex: {kind: consult-cli, adapter_ref: consult-codex-v1}
+    agy: {kind: consult-cli, adapter_ref: consult-agy-v1}
+    autoclaw: {kind: desktop-chat, adapter_ref: autoclaw-managed-plane-v1}
+    opencode: {kind: dreamer-cli, adapter_ref: opencode-cli-v1}
+    deterministic-python: {kind: none, adapter_ref: none}
+  providers:
+    zai: {id: zai}
+    openai: {id: openai}
+    google: {id: google}
+    opencode: {id: opencode}
+    moonshot: {id: moonshot}
+  accounts:             # OPAQUE references; no credential material ever lives here
+    zai-primary: {provider: zai, credential_ref: keyring/zai-coding-plan, permitted_hosts: [dev, jojo]}
+    openai-sol: {provider: openai, credential_ref: keyring/codex-primary, permitted_hosts: [dev, jojo]}
+    google-bundled: {provider: google, credential_ref: keyring/agy-jio, permitted_hosts: [dev, jojo]}
+  plans:                # purchased arrangements; remaining quota is an observation, not a declaration
+    zai-coding-plan: {provider: zai, account: zai-primary, kind: subscription, quota_dimensions: [requests, tokens], metering_source: measured-local}
+    zai-offpeak: {provider: zai, account: zai-primary, kind: privilege, quota_dimensions: [requests], metering_source: measured-local}
+    openai-paid: {provider: openai, account: openai-sol, kind: subscription, quota_dimensions: [requests], metering_source: measured-local}
+    gemini-bundled: {provider: google, account: google-bundled, kind: subscription, quota_dimensions: [requests], metering_source: unmeasured}
+    autoclaw-legacy: {provider: zai, account: zai-primary, kind: managed-plane, quota_dimensions: [tokens], metering_source: unmeasured}
+    opencode-free: {provider: opencode, kind: free-tier, quota_dimensions: [requests], metering_source: unmeasured}
+  bindings:             # declared = logical profile (cannot receive work); admitted = dispatchable
+    glm-workhorse:
+      {harness: zcode-tui, provider: zai, model: "GLM-5.3-Flash", reasoning: max,
+       plan: zai-coding-plan, account: zai-primary, status: admitted,
+       capabilities: [implementation, execution, maintenance, dreamer],
+       task_restrictions: [], note: "the agentic workhorse; peak window Mon-Fri 11:30-15:30 IST"}
+    glm-offpeak:
+      {harness: zcode-tui, provider: zai, model: "GLM-5.3-Flash", reasoning: high,
+       plan: zai-offpeak, account: zai-primary, status: admitted,
+       capabilities: [implementation, execution, dreamer], task_restrictions: [offpeak-only]}
+    sol-editor:
+      {harness: codex, provider: openai, model: "gpt-6.1-sol", reasoning: high,
+       plan: openai-paid, account: openai-sol, status: admitted,
+       capabilities: [editorial, review, architecture, planning], task_restrictions: []}
+    gemini-reviewer:
+      {harness: agy, provider: google, model: "gemini-3.8-flash", reasoning: high,
+       plan: gemini-bundled, account: google-bundled, status: admitted,
+       capabilities: [review, knowledge, creativity], task_restrictions: []}
+    kimi-editor:
+      {status: declared, capabilities: [editorial], note: "logical editor profile ONLY (sol turn-5): exact harness/provider/model/account/metering unverified; cannot receive work until admitted"}
+    autoclaw-chat:
+      {harness: autoclaw, provider: zai, status: declared,
+       capabilities: [execution, dreamer],
+       note: "BUG-005 chat 401 — walled; capture pending; model identifier unverified"}
+    opencode-free-dreamer:
+      {harness: opencode, provider: opencode, status: declared,
+       capabilities: [dreamer], note: "free-tier quota exhausted 2026-10-23; remedy pending"}
+
+planes:
+  # owner_policy is DESIRE (enabled | draining | disabled). Health is an
+  # OBSERVATION reported by the named source — a stale observation never
+  # reopens a route, and disabled planes are excluded from dispatch outright.
+  zai-peak:
+    {owner_policy: enabled, binding_refs: [glm-workhorse],
+     allowed_task_classes: [implementation, execution, maintenance, dreamer],
+     health_contract: {source_ref: queue-route-health, ttl_seconds: 300},
+     budget_refs: [b-workhorse-daily]}
+  zai-offpeak:
+    {owner_policy: enabled, binding_refs: [glm-offpeak],
+     allowed_task_classes: [implementation, execution, dreamer],
+     health_contract: {source_ref: queue-route-health, ttl_seconds: 300},
+     budget_refs: [b-offpeak-daily]}
+  intelligence-consult:
+    {owner_policy: enabled, binding_refs: [sol-editor, gemini-reviewer],
+     allowed_task_classes: [editorial, review],
+     health_contract: {source_ref: consult-probe, ttl_seconds: 900},
+     budget_refs: [b-consult-daily]}
+  autoclaw-chat:
+    {owner_policy: disabled, binding_refs: [autoclaw-chat],
+     allowed_task_classes: [dreamer],
+     health_contract: {source_ref: autoclaw-probe, ttl_seconds: 300},
+     budget_refs: [b-autoclaw-daily],
+     note: "BUG-005 chat 401 — drained by owner policy; flip to enabled only after capture confirms a fix"}
+  opencode-free:
+    {owner_policy: disabled, binding_refs: [opencode-free-dreamer],
+     allowed_task_classes: [dreamer],
+     health_contract: {source_ref: opencode-probe, ttl_seconds: 600},
+     budget_refs: [b-opencode-daily],
+     note: "free-tier quota exhausted 2026-10-23; remedy pending"}
+
+roles:
+  core-maintenance:
+    # THE deterministic level-0 orchestrator boundary (systemd unit below).
+    kind: deterministic
+    supervisor_ref: maintenance.supervisor
+    model: null
+  core-keeper:
+    # the GLM maintenance lane that keeps the swarm core alive (bugs, timers,
+    # load balance). A ROLE filled by whatever workhorse seat holds the
+    # yggterm campaign — launched independently of the queue it may repair.
+    kind: model-assisted-maintenance
+    binding_refs: [glm-workhorse]
+    reserve_ref: maintenance-reserve
+    lease_seconds: 1800
+    heartbeat_seconds: 60
+    max_attempts_per_incident: 3
+    escalation: owner
+  editor:
+    # sol is the standing chief editor; kimi-editor is a DECLARED hot-swap
+    # profile (see editor_scenarios.re-editor-blocked).
+    kind: editorial
+    default_binding_ref: sol-editor
+    fallback_binding_refs: [kimi-editor]
+    scenario_policy_ref: editor_scenarios
+    authority_ref: owner
+  intelligence:
+    # standing ROLE, episodic compute: deterministic ticks (no model),
+    # decision-point consults, periodic editorial reviews. The core never waits.
+    kind: proposal-and-review
+    binding_refs: [sol-editor, gemini-reviewer]
+    triggers: [materially-new-evidence, scheduled-material-review]
+    rhythms: {decision_consults: on-novel-evidence, editorial_review: daily-when-material}
+  dreamers:
+    kind: execution
+    profiles:
+      ux_parity:
+        binding_ref: glm-workhorse
+        max_attempts: 3
+        workspace: "~/gh/zcode-tui--ux-sol-2"
+        prompt_file: "~/.yggterm/config/dream/ux-parity-prompt.md"
+  # sub_orchestrators: spawned on MEASURED coordination burden only (sol
+  # turn-3 lifecycle: proposed -> admitted -> active -> draining ->
+  # handed_back -> retired); they are RUNTIME records with leases, never
+  # static config — the registry (P1 v2) holds them, this file stays policy.
+
+editor_scenarios:
+  re-editor-blocked:
+    # RE-classifier blocks can silence sol; the owner hot-swaps the editor.
+    scope: {campaign_refs: [reverse-eng, bookshelf], task_classes: [reverse_engineering]}
+    permitted_trigger_classes: [owner_selection, confirmed_editor_classification_block]
+    binding_order: [kimi-editor, sol-editor]   # kimi first once ADMITTED; today it stays declared
+    activation:
+      requires_admitted_target: true           # a declared profile can never be activated
+      authority_ref: owner
+      ttl_seconds: 3600
+      max_swaps_per_incident: 1
+    handover_contract_ref: editorial-handover-v1
+    on_no_eligible_editor: retain-work-and-defer-editorial-decisions
+
+campaign_policies:
+  exploration-yggterm-mackvm:
+    # owner burn directive 2026-10-25: multi-direction token burn where the
+    # campaign bottlenecks SOTA; the owner (or named delegate) is the editor.
+    mode: directed_multi_direction
+    authorization:
+      source_ref: owner-directive-2026-10-25
+      scope: {campaign_refs: [yggterm, mackvm]}
+      valid_until: null          # standing authority until owner revokes
+    editor: {authority: owner, role_ref: editor}
+    directions:
+      require_distinct_question: true
+      require_evidence_deliverable: true
+      max_active: 3
+      max_waves: 4
+    allocation:
+      budget_ref: b-exploration
+      reserve_per_direction: {tokens: 400000}
+      editor_review_reserve: {tokens: 200000}
+      maintenance_reserve_is_spendable: false
+    review:
+      triggers: [wave_complete, budget_threshold, material_discovery]
+      dispositions: [continue, deepen, fork, merge_findings, stop]
+    stop_conditions: [hard_budget_exhausted, authority_expired, no_eligible_capacity, owner_stop]
+
+supply:
+  namespaces_ref: "~/.yggterm/config/dream/floors.json"   # phase-5 absorbs this; floors.json remains the production supply authority until cutover
+  admission: {global_max_concurrent: 6, per_family: {ux_parity: 2}}
+  schedules: {peak_window: "Mon-Fri 11:30-15:30 IST", wake_interval_min: 20}
+  retry_policy: {max_attempts: 3, timeout_seconds: 2700, defer_minutes: 45}
+  budgets:
+    b-workhorse-daily: {scope: plane/zai-peak, window_hours: 24, hard_limits: {tokens: 4000000}}
+    b-offpeak-daily: {scope: plane/zai-offpeak, window_hours: 24, hard_limits: {tokens: 1500000}}
+    b-consult-daily: {scope: plane/intelligence-consult, window_hours: 24, hard_limits: {consults: 40}}
+    b-autoclaw-daily: {scope: plane/autoclaw-chat, window_hours: 24, hard_limits: {tokens: 200000}}
+    b-opencode-daily: {scope: plane/opencode-free, window_hours: 24, hard_limits: {tokens: 100000}}
+    b-exploration: {scope: campaign/yggterm+mackvm, window_hours: 168, hard_limits: {tokens: 6000000}}
+    maintenance-reserve: {scope: maintenance, window_hours: 168, hard_limits: {tokens: 200000}, spendable: false, note: "protected — never spent to keep exploration or dreams alive"}
+  maintenance_reserve_ref: maintenance-reserve
+
+intent:
+  # P4: authority-classed intent. Canonical record is the owner-intent doc.
+  canonical: "~/git/journal-papers/swarm-harness2/00-intent.md"
+  revision: 5
+  hash: null                 # pinned at the next editorial review
+  authority_class: owner
+  research: "~/git/journal-papers/swarm-harness2"
+  registry_ref: "~/.yggterm/swarm/registry"   # P1 v2 (campaign registry + procedure library)
+  kasten_ref: null           # reasoning-history link deliberately open
+  hub_door: "owner-model-portfolio-intent"
+
+sync:
+  # multi-directional ledger: dev writes accepted revisions; every host may
+  # propose. Owner edits on ANY host are captured by the next reconcile.
+  protocol_version: 1
+  transport_adapter_ref: swarm-ledger-v1
+  reconcile_seconds: 300
+  require_receiver_validation: true          # replicas re-validate before installing
+  activation_ack_consumers: [dream-orchestrator, spawner-timer, audit-timer, executor-adapter]
+  disconnected_dispatch: deny                # a stale replica cannot originate dispatches

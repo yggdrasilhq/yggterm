@@ -1,0 +1,6 @@
+# EXPECT: invariant_violation
+schema_version: 2
+identity: {config_id: t, authority_epoch: 1, revision: 1, parent_hash: "0000000000000000000000000000000000000000000000000000000000000000", change_id: "7f3c2a10-5d4e-4b8a-9c1f-2e6d8a4b5c01", proposed_by: owner, reason: t}
+fleet: {authority_host: dev, hosts: [dev], dispatch_host: dev}
+maintenance:
+  supervisor: {harness: gpt-agent, model: null, controller_host: dev, poll_seconds: 30}
