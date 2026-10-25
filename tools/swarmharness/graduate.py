@@ -95,6 +95,10 @@ def trial(gid, fixture_path, *, base=DEFAULT_BASE, timeout=60):
     sandbox = Path(tempfile.mkdtemp(prefix=f"grad-{gid[:8]}-"))
     shutil.copy(d / "script.py", sandbox / "script.py")
     shutil.copy(fx, sandbox / "fixture.py")
+    # immutable snapshot: hash and execute THE SAME copied bytes — a staged
+    # swap during the run cannot desynchronize evidence from execution
+    # (sol t11#13 TOCTOU)
+    snapshot_sha = _sha256_file(sandbox / "script.py")
     # run the fixture in a SUBPROCESS with a hard timeout — in-process exec
     # cannot bound a runaway fixture (sol t9#13)
     runner = (
@@ -124,9 +128,8 @@ def trial(gid, fixture_path, *, base=DEFAULT_BASE, timeout=60):
         result = {"pass": False, "detail": f"fixture crashed: {e!r}"}
     finally:
         shutil.rmtree(sandbox, ignore_errors=True)
-    # evidence identity: hash the staged script AT TRIAL TIME (the manifest
-    # hash can be stale after a swap — sol t10#13)
-    trial_script_sha = _sha256_file(d / "script.py")
+    # evidence identity: the hash of the EXACT snapshot that executed
+    trial_script_sha = snapshot_sha
     row = {"at": _now(), "fixture": str(fx), "fixture_sha256": fx_sha,
            "script_sha256": trial_script_sha,
            "pass": bool(result.get("pass")),
@@ -189,7 +192,7 @@ def promote(gid, *, procedure_id, title, scope, actor, base=DEFAULT_BASE,
                                       for t in passing),
         "verified_at": _now(),
         "graduated_from": gid,
-        "script_sha256": man["script_sha256"],
+        "script_sha256": cur_sha,   # the re-tested bytes, not the stale manifest (t11 reg-2)
     }
     out = reg.put(rec, actor, base=base)
     if out.get("ok"):
