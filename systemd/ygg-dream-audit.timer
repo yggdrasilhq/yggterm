@@ -1,0 +1,7 @@
+[Unit]
+Description=run dream-audit every 30min — keeps the audit-feedback wire fresh for the policy loop
+[Timer]
+OnCalendar=*-*-* *:00/30:00
+Persistent=true
+[Install]
+WantedBy=timers.target
