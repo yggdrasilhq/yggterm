@@ -102,10 +102,15 @@ def reconcile(state=sc.DEFAULT_STATE):
             continue
         entry = {"reachable": False}
         # 1. capture-before-pull: pull the replica's outbox first
-        r = _ssh(host, ["python3", "-c",
-                        "import sys; sys.path.insert(0,'$HOME/.yggterm/swarmkernel');sys.path.insert(0,'$HOME/gh/yggterm/tools/swarmharness');"
-                        "import swarm_ledger as sl, json;"
-                        f"print(json.dumps(sl.capture('{state}', reason='controller-invoked')))"],
+        remote_code = (
+            "import sys, json; "
+            "sys.path.insert(0,'$HOME/.yggterm/swarmkernel');"
+            "sys.path.insert(0,'$HOME/gh/yggterm/tools/swarmharness');"
+            "import swarm_ledger as sl; "
+            "r = sl.capture('~/.yggterm/swarm', reason='controller-invoked'); "
+            "print(json.dumps(r))"
+        )
+        r = _ssh(host, ["python3 -c '" + remote_code.replace("'", '"') + "'"],
                  timeout=25)
         if r["ok"]:
             entry["reachable"] = True
@@ -114,8 +119,8 @@ def reconcile(state=sc.DEFAULT_STATE):
             except Exception:
                 entry["remote_capture"] = {"error": "unparseable"}
         # 2. fetch outbox bundles (at-least-once)
-        r = _ssh(host, ["bash", "-lc",
-                        "cd ~/.yggterm/swarm/sync/config/outbox 2>/dev/null && tar -cf - . || tar -cf - /dev/null"],
+        r = _ssh(host, ["cd ~/.yggterm/swarm/sync/config/outbox 2>/dev/null "
+                        "&& tar -cf - . || true"],
                  timeout=25)
         if r["ok"] and r["stdout"].strip():
             dest = inbox / host
@@ -143,29 +148,29 @@ def reconcile(state=sc.DEFAULT_STATE):
             if not out["hosts"][host].get("reachable"):
                 out["hosts"][host]["install"] = "pending"
                 continue
-            r = _ssh(host, ["bash", "-lc",
-                            "mkdir -p ~/.yggterm/swarm/sync/config/published && cat > ~/.yggterm/swarm/sync/config/published/bundle.tar"],
+            r = _ssh(host, ["mkdir -p ~/.yggterm/swarm/sync/config/published "
+                            "&& cat > ~/.yggterm/swarm/sync/config/published/bundle.tar"],
                      timeout=30, input_bytes=payload)
             if not r["ok"]:
                 out["hosts"][host]["install"] = f"push-failed rc={r['rc']}"
                 continue
-            argv = ["python3", "-c",
-                    "import sys; sys.path.insert(0,'$HOME/.yggterm/swarmkernel');sys.path.insert(0,'$HOME/gh/yggterm/tools/swarmharness');"
-                    "import swarm_ledger as sl, json, hashlib, pathlib;"
-                    "b=pathlib.Path('~/.yggterm/swarm/sync/config/published/bundle.tar').expanduser().read_bytes();"
-                    "import io, tarfile;"
-                    "tf=tarfile.open(fileobj=io.BytesIO(b)); files={};"
-                    "[files.__setitem__(m.name.split('/')[-1], tf.extractfile(m).read()) for m in tf.getmembers()];"
-                    "d=pathlib.Path('~/.yggterm/swarm/config/releases').expanduser()/hashlib.sha256(files['release.json']).hexdigest()[:0];"
-                    "import swarmconfig as sc;"
-                    "body=json.loads(files['release.json']);"
-                    "h=sc.content_hash(body);"
-                    "rd=pathlib.Path('~/.yggterm/swarm/config/releases').expanduser()/h;"
-                    "rd.mkdir(parents=True, exist_ok=True);"
-                    "(rd/'release.yaml').write_bytes(files['release.yaml']);"
-                    "(rd/'release.json').write_bytes(files['release.json']);"
-                    "print(json.dumps(sl.install_accepted('~/.yggterm/swarm', h, origin_bytes=files['release.yaml'])))"]
-            r2 = _ssh(host, argv, timeout=30)
+            inst_code = (
+                "import sys, json, io, tarfile, pathlib; "
+                "sys.path.insert(0,'$HOME/.yggterm/swarmkernel');"
+                "sys.path.insert(0,'$HOME/gh/yggterm/tools/swarmharness');"
+                "import swarm_ledger as sl, swarmconfig as sc; "
+                "b = pathlib.Path('~/.yggterm/swarm/sync/config/published/bundle.tar').expanduser().read_bytes(); "
+                "tf = tarfile.open(fileobj=io.BytesIO(b)); "
+                "files = {m.name.split('/')[-1]: tf.extractfile(m).read() for m in tf.getmembers()}; "
+                "body = json.loads(files['release.json']); "
+                "h = sc.content_hash(body); "
+                "rd = pathlib.Path('~/.yggterm/swarm/config/releases').expanduser() / h; "
+                "rd.mkdir(parents=True, exist_ok=True); "
+                "(rd / 'release.yaml').write_bytes(files['release.yaml']); "
+                "(rd / 'release.json').write_bytes(files['release.json']); "
+                "print(json.dumps(sl.install_accepted('~/.yggterm/swarm', h, origin_bytes=files['release.yaml'])))"
+            )
+            r2 = _ssh(host, ["python3 -c '" + inst_code.replace("'", '"') + "'"], timeout=30)
             try:
                 out["hosts"][host]["install"] = json.loads(r2["stdout"].decode() or "{}")
             except Exception:
@@ -183,23 +188,17 @@ def replica_sync(state=sc.DEFAULT_STATE, dev_host="dev"):
     out = {"role": "replica", "captured": cap.get("captured")}
     sync_dir = Path(state).expanduser() / "sync" / "config"
     # push outbox bundles (at-least-once; dev dedupes by change_id)
-    r = _ssh(authority, ["bash", "-lc",
-                         "mkdir -p ~/.yggterm/swarm/sync/config/inbox/$HOSTNAME 2>/dev/null; "
-                         "mkdir -p ~/.yggterm/swarm/sync/config/inbox/$(hostname -s); "
-                         "cat > /dev/null"], timeout=20)
     bundles = sync_dir / "outbox"
     if bundles.is_dir() and any(bundles.iterdir()):
         t = subprocess.run(["tar", "-cf", "-", "."], cwd=bundles, capture_output=True)
         if t.stdout:
             host = sl.load_replica(state).get("host") or "unknown"
-            r = _ssh(authority, ["bash", "-lc",
-                                 f"mkdir -p ~/.yggterm/swarm/sync/config/inbox/{host} && "
-                                 f"tar -xf - -C ~/.yggterm/swarm/sync/config/inbox/{host}"],
+            r = _ssh(authority, [f"mkdir -p ~/.yggterm/swarm/sync/config/inbox/{host} "
+                                 f"&& tar -xf - -C ~/.yggterm/swarm/sync/config/inbox/{host}"],
                      timeout=25, input_bytes=t.stdout)
             out["push"] = "ok" if r["ok"] else f"rc={r['rc']}"
     # pull the published head bundle
-    r = _ssh(authority, ["bash", "-lc",
-                         "cat ~/.yggterm/swarm/sync/config/published/bundle.tar 2>/dev/null | head -c 20000000"],
+    r = _ssh(authority, ["cat ~/.yggterm/swarm/sync/config/published/bundle.tar 2>/dev/null"],
              timeout=30)
     if r["ok"] and r["stdout"].strip():
         import io, tarfile
