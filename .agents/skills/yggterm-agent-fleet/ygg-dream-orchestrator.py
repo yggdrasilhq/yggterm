@@ -778,9 +778,14 @@ def cmd_supervise(cfg):
     ledger = {"t": int(time.time()), "audited": 0, "revoked": [], "rerouted": [], "held": [], "notes": []}
     # the v2 PERMISSION gate constrains supervise mutations too (sol t10#10):
     # reroutes and watch enqueues on a blocked route are suppressed here
-    _watch_route = (cfg.get("ux_parity_watch") or {}).get("route") \
-        if isinstance(cfg.get("ux_parity_watch"), dict) else None
-    _gate_routes = list(cfg["routes"]) + ([_watch_route] if _watch_route and _watch_route not in cfg["routes"] else [])
+    # EFFECTIVE watch route derived ONCE, including the dispatch default
+    # fallback ("autoclaw" when omitted/invalid) — permission and enqueue
+    # must see the same route or the gate is bypassable (sol t13)
+    _watch_cfg = cfg.get("ux_parity_watch") if isinstance(cfg.get("ux_parity_watch"), dict) else {}
+    _watch_route = _watch_cfg.get("route")
+    if not _watch_route or _watch_route not in cfg["routes"]:
+        _watch_route = "autoclaw"
+    _gate_routes = list(cfg["routes"]) + ([_watch_route] if _watch_route not in cfg["routes"] else [])
     v2_blocked_sup, v2_note_sup = v2_blocked_routes(_gate_routes)
     if v2_blocked_sup:
         print(f"orchestrator: supervise v2 gate — blocked: {sorted(v2_blocked_sup)}"
@@ -895,7 +900,7 @@ def cmd_supervise(cfg):
                  and r.get("status") in ("queued", "running", "retry_wait", "cooldown_wait")]
         if not alive:
             pol = resolve_policy(family="ux_parity")
-            route = watch.get("route", "autoclaw")
+            route = _watch_route  # same value the permission gate resolved
             gate = gates.get(route, {})
             if route in pol["blocked_routes"] or route in v2_blocked_sup:
                 ledger["notes"].append({"ux_watch": f"route {route} held by policy/v2 gate — waiting (recovery check after expiry)"})
