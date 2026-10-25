@@ -1157,6 +1157,83 @@ def main():
     check("T18-9 suspension dominates exemption",
           ress["outcome"] == "SUSPENDED", json.dumps(ress)[:160])
 
+    # T18-10 (N09): restaging identical bytes cannot ride an older approval
+    rvq0 = mk_review()
+    snq0 = rvq0.stage_snapshot(subject="genuine", completion_claim="genuine")
+    checksq0 = passing_checks(snq0)
+    edq0 = ed_ok(rvq0, snq0, overall="accept", scope=crit, checks=checksq0)
+    rvq0.ingest_verdict(snapshot_digest=snq0["subject_digest"], editor=edq0,
+                        findings=[], overall="accept", approval_scope=crit,
+                        checks_evidence=checksq0)
+    resq0 = rvq0.resolve(current_subject_digest=snq0["subject_digest"])
+    check("T18-10 genuine approval completes", resq0["outcome"] == "COMPLETE")
+    rvq = mk_review()
+    snq1 = rvq.stage_snapshot(subject="same-bytes", completion_claim="claim-v1")
+    checksq = passing_checks(snq1)
+    edq = ed_ok(rvq, snq1, overall="accept", scope=crit, checks=checksq)
+    rvq.ingest_verdict(snapshot_digest=snq1["subject_digest"], editor=edq,
+                       findings=[], overall="accept", approval_scope=crit,
+                       checks_evidence=checksq)
+    rvq.stage_snapshot(subject="same-bytes", completion_claim="claim-v2-changed")
+    resq2 = rvq.resolve(current_subject_digest=snq1["subject_digest"])
+    check("T18-10b restage after approval -> REVISE",
+          resq2["outcome"] == "REVISE"
+          and any("not been reviewed" in r for r in resq2["reasons"]),
+          json.dumps(resq2)[:200])
+    snq2 = rvq.snapshots()[-1]
+    checksq2 = passing_checks(snq2)
+    edq2 = ed_ok(rvq, snq2, overall="accept", scope=crit, checks=checksq2)
+    rvq.ingest_verdict(snapshot_digest=snq2["subject_digest"], editor=edq2,
+                       findings=[], overall="accept", approval_scope=crit,
+                       checks_evidence=checksq2)
+    resq3 = rvq.resolve(current_subject_digest=snq2["subject_digest"])
+    check("T18-10c fresh verdict on the new round completes",
+          resq3["outcome"] == "COMPLETE", json.dumps(resq3)[:160])
+
+    # T18-11 (N10): debt rows retain the authority receipt for re-verification
+    check("T18-11 debt row retains authority_receipt",
+          ok_debt.get("authority_receipt") == debt["authority_receipt"])
+
+    # T18-8 (N01): a valid receipt cannot be replayed after the head moves
+    rvr = mk_review()
+    snr1 = rvr.stage_snapshot(subject="replay-v1", completion_claim="done")
+    checksr = passing_checks(snr1)
+    edr = ed_ok(rvr, snr1, overall="accept", scope=crit, checks=checksr)
+    first = rvr.ingest_verdict(snapshot_digest=snr1["subject_digest"],
+                               editor=edr, findings=[], overall="accept",
+                               approval_scope=crit, checks_evidence=checksr)
+    check("T18-8 receipt valid at its own head", first["ok"])
+    replay = rvr.ingest_verdict(snapshot_digest=snr1["subject_digest"],
+                                editor=edr, findings=[], overall="accept",
+                                approval_scope=crit, checks_evidence=checksr)
+    check("T18-8b identical verdict replay after head move refused",
+          replay["ok"] is False
+          and "authenticated" in replay["faults"][0], json.dumps(replay)[:160])
+
+    # T18-9 (N04): suspension dominates the none tier
+    rvs = mk_review(tier="none")
+    snns = rvs.stage_snapshot(subject="suspended-subject",
+                              completion_claim="no-op reuse")
+    rcs = sr.exemption_receipt(
+        "rev-suspend-none", crit, snns["subject_digest"],
+        snns["subject_digest"], key=TKEY,
+        opened_context={"worker": {"session_uuid": "s", "harness": "zcode"},
+                        "tier": "none", "config_digest": None,
+                        "editor_binding": None},
+        snapshot_round=snns["round"])
+    rvs2 = sr.SessionReview.create(
+        worker={"session_uuid": "s", "harness": "zcode"},
+        acceptance_criteria=crit, tier="none", base=temp_state(),
+        review_id="rev-suspend-none", exemption_receipt=rcs,
+        provenance_verifier=t_prov, debt_verifier=t_debt,
+        exemption_verifier=t_exemp)
+    snns2 = rvs2.stage_snapshot(subject="suspended-subject",
+                                completion_claim="no-op reuse")
+    rvs2.suspend("quota wall")
+    ress = rvs2.resolve(current_subject_digest=snns2["subject_digest"])
+    check("T18-9 suspension dominates exemption",
+          ress["outcome"] == "SUSPENDED", json.dumps(ress)[:160])
+
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
     if FAIL:
         print("FAILED:", *FAIL, sep="\n  - ")

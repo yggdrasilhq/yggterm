@@ -542,6 +542,7 @@ class SessionReview:
         if not verified:
             return {"ok": False, "faults": ["debt authority not authenticated"]}
         row = {"kind": "debt_accepted", "authority_verified": True,
+               "authority_receipt": authority_receipt,
                "verification_head": self.rows[-1]["record_hash"],
                "finding_id": finding_id, "owner": owner,
                "tracking_ref": tracking_ref, "revisit": revisit,
@@ -631,7 +632,9 @@ class SessionReview:
                     "unresolved": []}
         last = verdicts[-1]
         reasons = []
-        if not snaps or snaps[-1]["subject_digest"] != last["snapshot_digest"]:
+        if (not snaps
+                or snaps[-1]["subject_digest"] != last["snapshot_digest"]
+                or snaps[-1]["seq"] > last["seq"]):
             reasons.append("latest snapshot has not been reviewed")
         try:
             live = _live_digest(snaps[-1]) if snaps else None
