@@ -125,18 +125,26 @@ def _live_digest(snapshot):
 # EDITOR-side process holds the key and signs; worker-side handles verify.
 # No verifier wired (or key absent) means the path is HELD — fail closed.
 
-def _receipt_material(review_id, opened, snapshot, editor, payload):
+def _receipt_material(review_id, opened, snapshot, editor, payload, *,
+                      review_head):
     return {"kind": "editor-invocation", "review_id": review_id,
-            "opened": opened, "snapshot_digest": (snapshot or {}).get("subject_digest"),
-            "editor_identity": (editor or {}).get("identity"), "payload": payload}
+            "opened": opened, "review_head": review_head,
+            "snapshot": {k: (snapshot or {}).get(k) for k in (
+                "round", "subject_digest", "subject_manifest", "base_revision",
+                "evidence_manifest", "completion_claim")},
+            "editor": {k: v for k, v in (editor or {}).items()
+                       if k != "invocation_receipt"}, "payload": payload}
 
 
-def editor_receipt(review_id, opened, snapshot, editor, payload, *, key):
+def editor_receipt(review_id, opened, snapshot, editor, payload, *, key,
+                   review_head):
+    """Receipt binds the verdict to the review's chain head AT SIGNING —
+    a receipt cannot be replayed against a different (longer) history."""
     if isinstance(key, str):
         key = key.encode()
     return hmac.new(key, _canonical(_receipt_material(
-        review_id, opened, snapshot, editor, payload)).encode(),
-        hashlib.sha256).hexdigest()
+        review_id, opened, snapshot, editor, payload,
+        review_head=review_head)).encode(), hashlib.sha256).hexdigest()
 
 
 def verdict_payload(overall, findings, prior_dispositions=None,
@@ -148,11 +156,12 @@ def verdict_payload(overall, findings, prior_dispositions=None,
             "approval_scope": approval_scope, "checks_evidence": checks_evidence}
 
 
-def debt_receipt(review_id, opened, history, debt, *, key):
+def debt_receipt(review_id, opened, history, debt, *, key, review_head):
     if isinstance(key, str):
         key = key.encode()
     material = {"kind": "debt-authority", "review_id": review_id,
                 "opened": opened, "finding_history": history,
+                "review_head": review_head,
                 "debt": {k: v for k, v in debt.items()
                          if k != "authority_receipt"}}
     return hmac.new(key, _canonical(material).encode(),
@@ -160,13 +169,16 @@ def debt_receipt(review_id, opened, history, debt, *, key):
 
 
 def exemption_receipt(review_id, acceptance_criteria, snapshot_digest,
-                      current_subject_digest, *, key):
+                      current_subject_digest, *, key, opened_context,
+                      snapshot_round):
     if isinstance(key, str):
         key = key.encode()
     material = {"kind": "review-exemption", "review_id": review_id,
                 "acceptance_criteria": list(acceptance_criteria),
                 "snapshot_digest": snapshot_digest,
-                "current_digest": current_subject_digest}
+                "current_digest": current_subject_digest,
+                "opened_context": opened_context,
+                "snapshot_round": snapshot_round}
     return hmac.new(key, _canonical(material).encode(),
                     hashlib.sha256).hexdigest()
 
@@ -175,30 +187,35 @@ def _load_key(key_path=None):
     p = Path(key_path).expanduser() if key_path else CONTROL_KEY.expanduser()
     if not p.is_file():
         raise ValueError(f"control key not found: {p}")
-    return p.read_bytes().strip()
+    key = p.read_bytes().strip()
+    if not key:
+        raise ValueError("empty control key")
+    return key
 
 
 def hmac_provenance_verifier(key_path=None):
     key = _load_key(key_path)
 
-    def verify(review_id, opened, snapshot, editor, payload):
+    def verify(review_id, opened, snapshot, editor, payload, review_head):
         rcpt = (editor or {}).get("invocation_receipt")
         if not isinstance(rcpt, str) or not rcpt:
             return False
         return hmac.compare_digest(rcpt, editor_receipt(
-            review_id, opened, snapshot, editor, payload, key=key))
+            review_id, opened, snapshot, editor, payload, key=key,
+            review_head=review_head))
     return verify
 
 
 def hmac_debt_verifier(key_path=None):
     key = _load_key(key_path)
 
-    def verify(review_id, opened, history, debt):
+    def verify(review_id, opened, history, debt, review_head):
         rcpt = (debt or {}).get("authority_receipt")
         if not isinstance(rcpt, str) or not rcpt:
             return False
         return hmac.compare_digest(rcpt, debt_receipt(
-            review_id, opened, history, debt, key=key))
+            review_id, opened, history, debt, key=key,
+            review_head=review_head))
     return verify
 
 
@@ -211,7 +228,10 @@ def hmac_exemption_verifier(key_path=None):
         return hmac.compare_digest(receipt, exemption_receipt(
             review_id, opened.get("acceptance_criteria") or [],
             (snapshot or {}).get("subject_digest"), current_subject_digest,
-            key=key))
+            key=key,
+            opened_context={k: opened.get(k) for k in (
+                "worker", "tier", "config_digest", "editor_binding")},
+            snapshot_round=(snapshot or {}).get("round")))
     return verify
 
 
@@ -323,7 +343,8 @@ class SessionReview:
                     raise ValueError("record must be a mapping")
                 body = {k: v for k, v in row.items() if k != "record_hash"}
                 digest = _sha(_canonical(body))
-                if (row.get("seq") != seq or row.get("prev_hash") != prev
+                if (type(row.get("seq")) is not int or row.get("seq") != seq
+                        or row.get("prev_hash") != prev
                         or row.get("record_hash") != digest
                         or row.get("kind") not in RECORD_KINDS
                         or (seq == 0) != (row.get("kind") == "review_opened")):
@@ -450,11 +471,12 @@ class SessionReview:
                                    "bound to the reviewed snapshot"]}
         payload = verdict_payload(overall, findings, prior_dispositions,
                                   approval_scope, checks_evidence)
+        head = self.rows[-1]["record_hash"]
         try:
             verified = (self._provenance_verifier is not None
                         and self._provenance_verifier(
                             self.review_id, opened, snaps[-1], editor,
-                            payload) is True)
+                            payload, head) is True)
         except Exception:
             verified = False
         if not verified:
@@ -469,6 +491,7 @@ class SessionReview:
                 for f in findings]
         row = {"kind": "editor_verdict", "snapshot_digest": snapshot_digest,
                "editor": editor, "overall": overall,
+               "signed_payload": payload, "verification_head": head,
                "approval_scope": approval_scope,
                "checks_evidence": checks_evidence,
                "findings": norm,
@@ -513,12 +536,13 @@ class SessionReview:
         try:
             verified = (self._debt_verifier is not None and self._debt_verifier(
                 self.review_id, self._last("review_opened"), history,
-                debt) is True)
+                debt, self.rows[-1]["record_hash"]) is True)
         except Exception:
             verified = False
         if not verified:
             return {"ok": False, "faults": ["debt authority not authenticated"]}
         row = {"kind": "debt_accepted", "authority_verified": True,
+               "verification_head": self.rows[-1]["record_hash"],
                "finding_id": finding_id, "owner": owner,
                "tracking_ref": tracking_ref, "revisit": revisit,
                "authority": authority,
@@ -586,8 +610,6 @@ class SessionReview:
                     "unresolved": [k for k, v in self.finding_state().items()
                                    if v != "closed_by_editor"]}
         opened = self._last("review_opened")
-        if opened and opened.get("tier") == "none":
-            return self._evaluate_none(opened, current_subject_digest)
         res_idx = [i for i, r in enumerate(rows) if r["kind"] == "resolution"]
         if res_idx:
             last_i = res_idx[-1]
@@ -600,6 +622,8 @@ class SessionReview:
                                     "— retention, never acceptance"],
                         "unresolved": [k for k, v in self.finding_state().items()
                                        if v != "closed_by_editor"]}
+        if opened and opened.get("tier") == "none":
+            return self._evaluate_none(opened, current_subject_digest)
         verdicts = [r for r in rows if r["kind"] == "editor_verdict"]
         snaps = [r for r in rows if r["kind"] == "snapshot_staged"]
         if not verdicts:
@@ -656,15 +680,28 @@ class SessionReview:
     def _evaluate_none(self, opened, current_subject_digest):
         """Tier none: no editor call, but the exemption receipt must verify —
         it proves no substantive work (or an already-approved same subject).
-        Missing verification stays REVISE; it is never a bypass."""
+        The CURRENT subject identity is established here (live rehash for
+        file sets); a stale attestation can never qualify."""
         snaps = self.snapshots()
+        try:
+            live = _live_digest(snaps[-1]) if snaps else None
+        except (ValueError, OSError):
+            live = None
+            snaps = []  # unavailable artifacts cannot qualify
+        cur = live if live is not None else current_subject_digest
+        if (not snaps or not isinstance(cur, str)
+                or cur != snaps[-1]["subject_digest"]
+                or (live is not None and current_subject_digest is not None
+                    and live != current_subject_digest)):
+            return {"outcome": "REVISE", "reasons": ["exemption subject not current"],
+                    "unresolved": sorted(self.finding_state())}
         receipt = opened.get("exemption_receipt")
         try:
-            verified = (snaps and not self.finding_state()
+            verified = (not self.finding_state()
                         and self._exemption_verifier is not None
                         and self._exemption_verifier(
                             self.review_id, opened, snaps[-1], receipt,
-                            current_subject_digest) is True)
+                            cur) is True)
         except Exception:
             verified = False
         if verified:

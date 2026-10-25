@@ -778,13 +778,15 @@ def main():
               scope=None, checks=None, identity="sol",
               ref="codex-session-xyz", key=TKEY):
         """Editor dict whose invocation_receipt signs the EXACT payload that
-        ingest_verdict rebuilds from the same call args."""
+        ingest_verdict rebuilds from the same call args, bound to the
+        review's chain head at signing time."""
         opened = rv.rows[0]
         base = {"identity": identity, "invocation_ref": ref}
         payload = sr.verdict_payload(overall, findings or [], prior or [],
                                      scope, checks)
         base["invocation_receipt"] = sr.editor_receipt(
-            rv.review_id, opened, snap, base, payload, key=key)
+            rv.review_id, opened, snap, base, payload, key=key,
+            review_head=rv.rows[-1]["record_hash"])
         return base
 
     def passing_checks(snap, ref="conformance.log"):
@@ -877,7 +879,8 @@ def main():
     debt_history = [f for r in rv5.rows if r["kind"] == "editor_verdict"
                     for f in r["findings"] if f["id"] == "fW"]
     debt["authority_receipt"] = sr.debt_receipt(
-        rv5.review_id, rv5.rows[0], debt_history, debt, key=TKEY)
+        rv5.review_id, rv5.rows[0], debt_history, debt, key=TKEY,
+        review_head=rv5.rows[-1]["record_hash"])
     ok_debt = rv5.defer_accepted(**debt)
     check("S6b owner-verified deferral accepted",
           ok_debt.get("authority_verified") is True, json.dumps(ok_debt)[:160])
@@ -1070,8 +1073,13 @@ def main():
     snn = rvn.stage_snapshot(subject="same-subject",
                              completion_claim="no-op reuse")
     exempt_rid = "rev-exempt-fixed"
-    rcpt = sr.exemption_receipt(exempt_rid, crit, snn["subject_digest"],
-                                snn["subject_digest"], key=TKEY)
+    rcpt = sr.exemption_receipt(
+        exempt_rid, crit, snn["subject_digest"], snn["subject_digest"],
+        key=TKEY, opened_context={"worker": {"session_uuid": "x",
+                                             "harness": "zcode"},
+                                  "tier": "none", "config_digest": None,
+                                  "editor_binding": None},
+        snapshot_round=snn["round"])
     rvn2 = sr.SessionReview.create(
         worker={"session_uuid": "x", "harness": "zcode"},
         acceptance_criteria=crit, tier="none", base=temp_state(),
@@ -1108,6 +1116,46 @@ def main():
     except ValueError:
         dup_raised = True
     check("T18-7c duplicate create refused", dup_raised)
+
+    # T18-8 (N01): a valid receipt cannot be replayed after the head moves
+    rvr = mk_review()
+    snr1 = rvr.stage_snapshot(subject="replay-v1", completion_claim="done")
+    checksr = passing_checks(snr1)
+    edr = ed_ok(rvr, snr1, overall="accept", scope=crit, checks=checksr)
+    first = rvr.ingest_verdict(snapshot_digest=snr1["subject_digest"],
+                               editor=edr, findings=[], overall="accept",
+                               approval_scope=crit, checks_evidence=checksr)
+    check("T18-8 receipt valid at its own head", first["ok"])
+    replay = rvr.ingest_verdict(snapshot_digest=snr1["subject_digest"],
+                                editor=edr, findings=[], overall="accept",
+                                approval_scope=crit, checks_evidence=checksr)
+    check("T18-8b identical verdict replay after head move refused",
+          replay["ok"] is False
+          and "authenticated" in replay["faults"][0], json.dumps(replay)[:160])
+
+    # T18-9 (N04): suspension dominates the none tier
+    rvs = mk_review(tier="none")
+    snns = rvs.stage_snapshot(subject="suspended-subject",
+                              completion_claim="no-op reuse")
+    rcs = sr.exemption_receipt(
+        "rev-suspend-none", crit, snns["subject_digest"],
+        snns["subject_digest"], key=TKEY,
+        opened_context={"worker": {"session_uuid": "s", "harness": "zcode"},
+                        "tier": "none", "config_digest": None,
+                        "editor_binding": None},
+        snapshot_round=snns["round"])
+    rvs2 = sr.SessionReview.create(
+        worker={"session_uuid": "s", "harness": "zcode"},
+        acceptance_criteria=crit, tier="none", base=temp_state(),
+        review_id="rev-suspend-none", exemption_receipt=rcs,
+        provenance_verifier=t_prov, debt_verifier=t_debt,
+        exemption_verifier=t_exemp)
+    snns2 = rvs2.stage_snapshot(subject="suspended-subject",
+                                completion_claim="no-op reuse")
+    rvs2.suspend("quota wall")
+    ress = rvs2.resolve(current_subject_digest=snns2["subject_digest"])
+    check("T18-9 suspension dominates exemption",
+          ress["outcome"] == "SUSPENDED", json.dumps(ress)[:160])
 
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
     if FAIL:
