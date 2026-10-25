@@ -355,9 +355,10 @@ def maintenance_pass(state=sc.DEFAULT_STATE):
                 out["executor"] = {"unit": DEFAULT_EXECUTOR_UNIT, "active": None,
                                    "note": "systemctl unavailable"}
     out["elapsed_s"] = round(time.time() - started, 2)
-    if cfg and res["mode"] == "active":
+    if cfg and res["mode"] == "active" and res.get("revision"):
         try:
-            sc.ack("ygg-swarm-maintenance-orchestrator", state)
+            sc.ack("ygg-swarm-maintenance-orchestrator", state,
+                   revision_hash=res["revision"]["content_hash"])
         except Exception:
             pass
     hb = Path(state).expanduser() / "supervisor.json"

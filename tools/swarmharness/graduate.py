@@ -98,26 +98,37 @@ def trial(gid, fixture_path, *, base=DEFAULT_BASE, timeout=60):
     # run the fixture in a SUBPROCESS with a hard timeout — in-process exec
     # cannot bound a runaway fixture (sol t9#13)
     runner = (
-        "import importlib.util, json, sys; "
+        "import importlib.util, json, sys, pathlib; "
         "spec = importlib.util.spec_from_file_location('grad_fixture', sys.argv[1]); "
         "mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod); "
-        "print(json.dumps(mod.run(sys.argv[2]) or {'pass': False, 'detail': 'fixture returned None'}))"
+        "res = mod.run(pathlib.Path(sys.argv[2])); "
+        "res = res if isinstance(res, dict) else {'pass': False, 'detail': f'fixture returned {type(res).__name__}'}; "
+        "open(sys.argv[3], 'w').write(json.dumps(res))"
     )
+    result_file = sandbox / "result.json"
     try:
         p = subprocess.run([sys.executable, "-c", runner, str(sandbox / "fixture.py"),
-                            str(sandbox / "script.py")],
+                            str(sandbox / "script.py"), str(result_file)],
                            capture_output=True, text=True, timeout=timeout)
         if p.returncode != 0:
             result = {"pass": False, "detail": f"fixture rc={p.returncode}: {p.stderr[-200:]}"}
+        elif not result_file.exists():
+            result = {"pass": False, "detail": "fixture wrote no result file"}
         else:
-            result = json.loads((p.stdout or "").strip() or '{"pass": false, "detail": "no output"}')
+            raw = json.loads(result_file.read_text() or "{}")
+            result = raw if isinstance(raw, dict) else {
+                "pass": False, "detail": f"result not a mapping ({type(raw).__name__})"}
     except subprocess.TimeoutExpired:
         result = {"pass": False, "detail": f"fixture exceeded {timeout}s timeout"}
     except Exception as e:  # noqa: BLE001 — a crashing fixture is a failed trial
         result = {"pass": False, "detail": f"fixture crashed: {e!r}"}
     finally:
         shutil.rmtree(sandbox, ignore_errors=True)
+    # evidence identity: hash the staged script AT TRIAL TIME (the manifest
+    # hash can be stale after a swap — sol t10#13)
+    trial_script_sha = _sha256_file(d / "script.py")
     row = {"at": _now(), "fixture": str(fx), "fixture_sha256": fx_sha,
+           "script_sha256": trial_script_sha,
            "pass": bool(result.get("pass")),
            "detail": str(result.get("detail", ""))[:300]}
     # the fixture is RETAINED with the trial — no fixture, no promotion (t9#13)
@@ -148,20 +159,19 @@ def promote(gid, *, procedure_id, title, scope, actor, base=DEFAULT_BASE,
     man = json.loads(man_p.read_text())
     trials = [json.loads(x) for x in (d / "trials.jsonl").read_text().splitlines()] \
         if (d / "trials.jsonl").exists() else []
-    passing = [t for t in trials if t["pass"]]
-    if not passing:
-        return {"ok": False, "faults": ["no passing trial; promote refused"]}
-    # STALE-EVIDENCE guard (sol t9#13): the script on disk must still hash to
-    # the staged manifest hash — a post-trial edit invalidates the evidence
     cur_sha = _sha256_file(d / "script.py")
-    if cur_sha != man["script_sha256"]:
-        return {"ok": False, "faults": [f"script changed after trials "
-                                        f"({man['script_sha256'][:12]} -> {cur_sha[:12]}); re-trial"]}
-    # at least one PASSING trial's fixture must be retained alongside
-    kept = {q.name.split("-", 1)[0] for q in (d / "fixtures").glob("*")} \
-        if (d / "fixtures").exists() else set()
-    if not any(t["fixture_sha256"][:12] in kept for t in passing):
-        return {"ok": False, "faults": ["passing trial's fixture not retained; promote refused"]}
+    # EVIDENCE IDENTITY (sol t10#13): a passing trial must exist whose
+    # RECORDED at-trial-time script hash equals the current script bytes,
+    # and whose fixture is retained BY CONTENT HASH
+    passing = [t for t in trials if t["pass"]
+               and t.get("script_sha256") == cur_sha]
+    if not passing:
+        return {"ok": False, "faults": ["no passing trial against the CURRENT script bytes; promote refused"]}
+    kept_hashes = {hashlib.sha256(q.read_bytes()).hexdigest()
+                   for q in (d / "fixtures").glob("*")} \
+        if (d / "fixtures").is_dir() else set()
+    if not any(t["fixture_sha256"] in kept_hashes for t in passing):
+        return {"ok": False, "faults": ["passing trial's fixture not retained by content; promote refused"]}
     rec = {
         "kind": "procedure", "id": procedure_id, "revision": 1,
         "title": title, "cue": (man.get("cue") or "") + " " + title.lower(),

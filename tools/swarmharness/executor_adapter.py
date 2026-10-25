@@ -43,7 +43,9 @@ def main():
         print("executor-adapter: empty transport command", file=sys.stderr)
         return 2
     try:
-        sc.ack("executor-adapter")   # consumer acknowledgement (distinct state)
+        # acknowledgement binds to the LOADED revision (sol t10#6)
+        if res.get("revision"):
+            sc.ack("executor-adapter", revision_hash=res["revision"]["content_hash"])
     except Exception:
         pass
     print(f"executor-adapter: config {res['revision']['content_hash'][:12]} "

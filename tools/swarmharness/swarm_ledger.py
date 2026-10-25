@@ -643,8 +643,9 @@ def install_accepted(state, release_hash, origin_bytes=None, area="config",
     # ancestry: shipped records with a verifying chain naming this hash...
     vouched = False
     local = journal_records(state, area)
+    local_head = local[-1] if local else None
     if shipped_journal:
-        ok, bad = verify_ancestry(records=shipped_journal)
+        ok, bad = verify_ancestry(state=state, area=area, records=shipped_journal)
         if not ok:
             return {"installed": False, "detail": f"shipped journal chain broken at record {bad}"}
         if shipped_journal[-1].get("canonical_hash") != release_hash:
@@ -658,15 +659,15 @@ def install_accepted(state, release_hash, origin_bytes=None, area="config",
         shipped_journal = suffix
         vouched = True
     else:
-        # no shipped records: the LOCAL journal must already vouch the hash
-        # (strict: the journal append IS the commit point — a sealed-but-
-        # unjournaled release is never operational truth; bootstrap happens
-        # through a shipped chain, which the controller always includes)
-        if any(r.get("canonical_hash") == release_hash for r in local):
+        # no shipped records: the LOCAL journal must vouch the hash AND its
+        # own chain must verify — a bare canonical_hash line proves nothing
+        # (sol t10#5)
+        ok_local, _bad = verify_ancestry(state=state, area=area)
+        if ok_local and any(r.get("canonical_hash") == release_hash for r in local):
             vouched = True
         else:
             return {"installed": False,
-                    "detail": "unvouched: no local journal record and none shipped"}
+                    "detail": "unvouched: local journal missing hash or fails chain verification"}
     if not vouched:
         return {"installed": False, "detail": "unvouched install refused"}
 
@@ -678,17 +679,10 @@ def install_accepted(state, release_hash, origin_bytes=None, area="config",
     ipath = _sync_dir(state, area) / "install-intent.json"
     atomic_write_json(ipath, intent)
 
-    # atomic pointer + checkpoint updates (bundle already immutable/verified)
-    atomic_write_json(_paths(st)["active"], {"content_hash": release_hash,
-                                             "epoch": target["epoch"],
-                                             "revision": target["revision"],
-                                             "change_id": target["change_id"],
-                                             "activated_at": _now()})
-    atomic_write_json(_paths(st)["checkpoint"], body)
-    _refresh_current_yaml(state)
-
-    # persist the shipped acceptance records into the LOCAL journal so a
-    # later pointer corruption recovers from committed history (sol t9#5)
+    # REPLICA COMMIT ORDER (sol t10 reg-1): persist the shipped acceptance
+    # records into the LOCAL journal FIRST (fsync = the local commit point),
+    # and only then the pointer + checkpoint. A journal failure must leave
+    # containment, never an active pointer over an uncommitted release.
     if shipped_journal:
         j = _ledger_dir(state, area) / "journal.jsonl"
         j.parent.mkdir(parents=True, exist_ok=True)
@@ -705,6 +699,18 @@ def install_accepted(state, release_hash, origin_bytes=None, area="config",
                               {"revision": headj[-1].get("revision"),
                                "canonical_hash": headj[-1].get("canonical_hash"),
                                "event_hash": headj[-1].get("event_hash")})
+    else:
+        ok_local, _ = verify_ancestry(state=state, area=area)
+        if local and not ok_local:
+            return {"installed": False, "detail": "local journal fails chain verification"}
+
+    atomic_write_json(_paths(st)["active"], {"content_hash": release_hash,
+                                             "epoch": target["epoch"],
+                                             "revision": target["revision"],
+                                             "change_id": target["change_id"],
+                                             "activated_at": _now()})
+    atomic_write_json(_paths(st)["checkpoint"], body)
+    _refresh_current_yaml(state)
     rep = load_replica(state, area) or dict(old_rep)
     rep["installed_head"] = target
     rep["active_head"] = target

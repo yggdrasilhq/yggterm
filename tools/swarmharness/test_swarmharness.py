@@ -697,19 +697,45 @@ def main():
     stray6 = temp_state() / "s.py"
     stray6.write_text("def helper():\n    return 7\n")
     fx6 = temp_state() / "fx.py"
-    fx6.write_text("def run(p):\n    import importlib.util\n"
+    fx6.write_text("import pathlib\n"
+                   "def run(p):\n"
+                   "    import importlib.util\n"
                    "    s = importlib.util.spec_from_file_location('m', str(p))\n"
                    "    m = importlib.util.module_from_spec(s); s.loader.exec_module(m)\n"
                    "    return {'pass': m.helper() == 7}\n")
     fb6 = temp_state()
     s6 = gr.stage(str(stray6), "r13", base=fb6)
-    gr.trial(s6["id"], str(fx6), base=fb6)
-    # post-trial edit of the RETAINED copy (sol t9#13) — the origin is gone
-    (Path(fb6) / "staging" / s6["id"] / "script.py").write_text("def helper():\n    return 8\n")
+    tr6 = gr.trial(s6["id"], str(fx6), base=fb6)
+    check("R13 trial passes (Path arg contract)", tr6["ok"] and tr6["passing"])
+    staged6 = Path(fb6) / "staging" / s6["id"]
+    staged6.joinpath("script.py").write_text("def helper():\n    return 8\n")
     pr6 = gr.promote(s6["id"], procedure_id="proc-r13", title="x", scope="t",
                      actor="t", base=fb6)
     check("R13 post-trial edit refuses promotion", pr6.get("ok") is False
-          and "changed after trials" in pr6["faults"][0], json.dumps(pr6)[:160])
+          and "CURRENT script bytes" in pr6["faults"][0], json.dumps(pr6)[:180])
+    # swap to B, trial B, restore A: promotion must still refuse while the
+    # current bytes are B (B's passing trial exists, A's was refused above)
+    pr6b = gr.promote(s6["id"], procedure_id="proc-r13b", title="x", scope="t",
+                      actor="t", base=fb6)
+    check("R13 B-bytes promote refused (B never passed a trial)",
+          pr6b.get("ok") is False and "CURRENT script bytes" in pr6b["faults"][0],
+          json.dumps(pr6b)[:180])
+    staged6.joinpath("script.py").write_text("def helper():\n    return 8\n")
+    fx7 = temp_state() / "fx7.py"
+    fx7.write_text(fx6.read_text().replace("== 7", "== 8"))
+    tr7 = gr.trial(s6["id"], str(fx7), base=fb6)  # passing trial against B
+    check("R13 trial records at-trial-time script hash",
+          tr7["trial"]["script_sha256"] != tr6["trial"]["script_sha256"])
+    pr6c = gr.promote(s6["id"], procedure_id="proc-r13c", title="x", scope="t",
+                      actor="t", base=fb6)
+    check("R13 promote succeeds for the bytes the trial actually ran",
+          pr6c.get("ok") is True, json.dumps(pr6c)[:160])
+    # never-tried bytes C refuse even with A and B both trialed
+    staged6.joinpath("script.py").write_text("def helper():\n    return 9\n")
+    pr6d = gr.promote(s6["id"], procedure_id="proc-r13d", title="x", scope="t",
+                      actor="t", base=fb6)
+    check("R13 never-tried bytes refuse", pr6d.get("ok") is False
+          and "CURRENT script bytes" in pr6d["faults"][0])
 
     # R14: identity/planes malformed types fault cleanly (t9#14)
     cR = json.loads(json.dumps(cfg))
