@@ -396,9 +396,12 @@ def enqueue(cfg, route, ns, kind, moderate, prompt):
     title = f"DREAM[{kind}{'/mod' if moderate else ''}]: {ns} consolidation"
     # ssh JOINS argv into one remote shell string — every variable arg must be
     # shlex-quoted or a title with spaces shatters (measured 2026-10-24).
+    # Measured 2026-10-25: "~" -> "$HOME" still fails — shlex.quote wraps the
+    # path in SINGLE quotes and $HOME does not expand inside them. Expand to
+    # the absolute path locally (fleet convention: pi@/home/pi everywhere).
     repo = q["repo"]
     if repo.startswith("~/"):
-        repo = "$HOME/" + repo[2:]  # remote shell expands; shlex.quote would freeze the tilde
+        repo = str(HOME) + repo[1:]
     remote = (f"cd {shlex.quote(repo)} && {q['cli']} enqueue"
               f" --route {shlex.quote(route)} --prompt-file {shlex.quote(str(pf))}"
               f" --workspace {shlex.quote(str(HOME / 'gh/zcode-tui'))}"
