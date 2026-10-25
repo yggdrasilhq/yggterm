@@ -753,34 +753,67 @@ def main():
     check("R16 broken cutover artifact never ok", v16["ok"] is False)
 
     # =====================================================================
-    # 50+. SESSION-REVIEW CONTRACT (sol turn-17 traps)
+    # 50+. SESSION-REVIEW CONTRACT (sol turn-17 traps; turn-18 hardening)
     # =====================================================================
     import session_review as sr
     from hashlib import sha256 as _sha256
 
-    def mk_review(tier="full"):
+    TKEY = b"turn18-test-control-key"
+    _tk = temp_state() / "owner.key"
+    _tk.write_bytes(TKEY)
+    t_prov = sr.hmac_provenance_verifier(key_path=_tk)
+    t_debt = sr.hmac_debt_verifier(key_path=_tk)
+    t_exemp = sr.hmac_exemption_verifier(key_path=_tk)
+    crit = ["no regressions", "gates green"]
+
+    def mk_review(tier="full", **kw):
+        kw.setdefault("base", temp_state())
         return sr.SessionReview.create(
             worker={"session_uuid": str(uuid.uuid4()), "harness": "zcode"},
-            acceptance_criteria=["no regressions", "gates green"],
-            tier=tier, base=temp_state())
+            acceptance_criteria=crit, tier=tier,
+            provenance_verifier=t_prov, debt_verifier=t_debt,
+            exemption_verifier=t_exemp, **kw)
+
+    def ed_ok(rv, snap, overall="accept", findings=None, prior=None,
+              scope=None, checks=None, identity="sol",
+              ref="codex-session-xyz", key=TKEY):
+        """Editor dict whose invocation_receipt signs the EXACT payload that
+        ingest_verdict rebuilds from the same call args."""
+        opened = rv.rows[0]
+        base = {"identity": identity, "invocation_ref": ref}
+        payload = sr.verdict_payload(overall, findings or [], prior or [],
+                                     scope, checks)
+        base["invocation_receipt"] = sr.editor_receipt(
+            rv.review_id, opened, snap, base, payload, key=key)
+        return base
+
+    def passing_checks(snap, ref="conformance.log"):
+        return [{"status": "pass", "snapshot_digest": snap["subject_digest"],
+                 "receipt_ref": ref}]
 
     # S1: full loop to COMPLETE
     rv = mk_review()
     snap = rv.stage_snapshot(subject="work-v1", completion_claim="done")
-    ed = {"identity": "sol", "invocation_ref": "codex-session-xyz"}
+    f1 = [{"id": "f1", "criterion": "gates green", "blocking": True,
+           "evidence": "probe output", "expected": "green", "observed": "red",
+           "probe": "python3 probe.py"}]
+    ed = ed_ok(rv, snap, overall="revise", findings=f1)
     r1 = rv.ingest_verdict(snapshot_digest=snap["subject_digest"], editor=ed,
-                           findings=[{"id": "f1", "criterion": "gates green",
-                                      "blocking": True, "evidence": "probe"}],
-                           overall="revise")
-    check("S1 verdict with provenance accepted", r1["ok"])
+                           findings=f1, overall="revise")
+    check("S1 verdict with authenticated provenance accepted", r1["ok"],
+          json.dumps(r1)[:160])
     rv.disposition("f1", "repair", evidence_refs=["commit-abc"])
     snap2 = rv.stage_snapshot(subject="work-v2", completion_claim="done-v2")
-    rv.ingest_verdict(snapshot_digest=snap2["subject_digest"], editor=ed,
-                      findings=[],
-                      prior_dispositions=[{"id": "f1", "closed": True}],
-                      overall="accept", checks_evidence="conformance.log")
+    checks2 = passing_checks(snap2)
+    ed2 = ed_ok(rv, snap2, overall="accept", prior=[{"id": "f1", "closed": True}],
+                scope=crit, checks=checks2)
+    rv.ingest_verdict(snapshot_digest=snap2["subject_digest"], editor=ed2,
+                      findings=[], prior_dispositions=[{"id": "f1", "closed": True}],
+                      overall="accept", approval_scope=crit,
+                      checks_evidence=checks2)
     res = rv.resolve(current_subject_digest=snap2["subject_digest"])
-    check("S1 full loop -> COMPLETE", res["outcome"] == "COMPLETE", json.dumps(res)[:160])
+    check("S1 full loop -> COMPLETE", res["outcome"] == "COMPLETE",
+          json.dumps(res)[:160])
 
     # S2: worker-authored verdict without provenance rejected
     rv2 = mk_review()
@@ -788,51 +821,293 @@ def main():
     rbad = rv2.ingest_verdict(snapshot_digest=sn2["subject_digest"], editor=None,
                               findings=[], overall="accept")
     check("S2 worker-authored verdict rejected", rbad["ok"] is False)
+    fab = {"identity": "sol", "invocation_ref": "codex-session-xyz"}
+    rfab = rv2.ingest_verdict(snapshot_digest=sn2["subject_digest"], editor=fab,
+                              findings=[], overall="accept", approval_scope=crit)
+    check("S2b fabricated editor receipt refused",
+          rfab["ok"] is False and "authenticated" in rfab["faults"][0],
+          json.dumps(rfab)[:160])
 
     # S3: stale-snapshot approval refused
-    rbad2 = rv2.ingest_verdict(snapshot_digest="stale-digest", editor=ed,
-                               findings=[], overall="accept")
+    ed3 = ed_ok(rv2, sn2, overall="accept", scope=crit)
+    rbad2 = rv2.ingest_verdict(snapshot_digest="stale-digest", editor=ed3,
+                               findings=[], overall="accept", approval_scope=crit)
     check("S3 stale-snapshot refused", rbad2["ok"] is False)
 
     # S4: worker 'repair' never closes; omitted findings stay open
     rv3 = mk_review()
     sn3 = rv3.stage_snapshot(subject="y", completion_claim="done")
-    rv3.ingest_verdict(snapshot_digest=sn3["subject_digest"], editor=ed,
-                       findings=[{"id": "f9", "criterion": "c", "blocking": True}],
-                       overall="revise")
+    f9 = [{"id": "f9", "criterion": "gates green", "blocking": True,
+           "evidence": "e", "expected": "x", "observed": "y", "probe": "p"}]
+    ed4 = ed_ok(rv3, sn3, overall="revise", findings=f9)
+    rv3.ingest_verdict(snapshot_digest=sn3["subject_digest"], editor=ed4,
+                       findings=f9, overall="revise")
     rv3.disposition("f9", "repair")
     res3 = rv3.resolve()
     check("S4 worker repair never closes", res3["outcome"] == "REVISE"
           and "f9" in res3["unresolved"], json.dumps(res3)[:160])
 
-    # S5: quota exhaustion -> SUSPENDED, never COMPLETE
+    # S5: quota exhaustion -> SUSPENDED, never COMPLETE; resume lifts it
     rv4 = mk_review()
     rv4.stage_snapshot(subject="z", completion_claim="done")
     rv4.suspend("consult budget exhausted")
     res4 = rv4.resolve()
     check("S5 suspension never implies acceptance", res4["outcome"] == "SUSPENDED")
+    rv4.stage_snapshot(subject="z2", completion_claim="resume after quota reset")
+    res4b = rv4.resolve()
+    check("S5b suspension lifts on resumed work", res4b["outcome"] == "REVISE",
+          json.dumps(res4b)[:160])
 
-    # S6: unilateral self-deferral cannot waive a criterion
+    # S6: self-authorized deferral refused; owner-verified deferral completes
     rv5 = mk_review()
     sn5 = rv5.stage_snapshot(subject="w", completion_claim="done")
-    rv5.ingest_verdict(snapshot_digest=sn5["subject_digest"], editor=ed,
-                       findings=[{"id": "fW", "criterion": "gates green",
-                                  "blocking": True}], overall="revise")
-    rv5.defer_accepted("fW", owner="worker", tracking_ref="self",
-                       revisit="never", authority="self", waives_criterion=True)
-    res5 = rv5.resolve()
-    check("S6 self-deferral cannot complete", res5["outcome"] == "REVISE"
-          and any("criterion" in r for r in res5["reasons"]),
+    fW = [{"id": "fW", "criterion": "gates green", "blocking": True,
+           "evidence": "e", "expected": "x", "observed": "y", "probe": "p"}]
+    ed5 = ed_ok(rv5, sn5, overall="revise", findings=fW)
+    rv5.ingest_verdict(snapshot_digest=sn5["subject_digest"], editor=ed5,
+                       findings=fW, overall="revise")
+    self_debt = rv5.defer_accepted("fW", owner="worker", tracking_ref="self",
+                                   revisit="never", authority="self",
+                                   waives_criterion=True)
+    check("S6 self-authorized deferral refused at the API",
+          self_debt.get("ok") is False, json.dumps(self_debt)[:160])
+    debt = {"finding_id": "fW", "owner": "avikalpa",
+            "tracking_ref": "ledger:T-99", "revisit": "2026-11-30",
+            "authority": "owner", "waives_criterion": True}
+    debt_history = [f for r in rv5.rows if r["kind"] == "editor_verdict"
+                    for f in r["findings"] if f["id"] == "fW"]
+    debt["authority_receipt"] = sr.debt_receipt(
+        rv5.review_id, rv5.rows[0], debt_history, debt, key=TKEY)
+    ok_debt = rv5.defer_accepted(**debt)
+    check("S6b owner-verified deferral accepted",
+          ok_debt.get("authority_verified") is True, json.dumps(ok_debt)[:160])
+    checks5 = passing_checks(sn5, "ledger-log")
+    ed5b = ed_ok(rv5, sn5, overall="accept", scope=crit, checks=checks5)
+    rv5.ingest_verdict(snapshot_digest=sn5["subject_digest"], editor=ed5b,
+                       findings=[], overall="accept", approval_scope=crit,
+                       checks_evidence=checks5)
+    res5 = rv5.resolve(current_subject_digest=sn5["subject_digest"])
+    check("S6c verified deferral completes with accepted_debts",
+          res5["outcome"] == "COMPLETE" and res5.get("accepted_debts") == ["fW"],
           json.dumps(res5)[:200])
 
     # S7: subject drift after acceptance -> REVISE
     rv6 = mk_review()
     sn6 = rv6.stage_snapshot(subject="v1", completion_claim="done")
-    rv6.ingest_verdict(snapshot_digest=sn6["subject_digest"], editor=ed,
-                       findings=[], overall="accept", checks_evidence="log")
+    checks6 = passing_checks(sn6)
+    ed6 = ed_ok(rv6, sn6, overall="accept", scope=crit, checks=checks6)
+    rv6.ingest_verdict(snapshot_digest=sn6["subject_digest"], editor=ed6,
+                       findings=[], overall="accept", approval_scope=crit,
+                       checks_evidence=checks6)
     drift = _sha256(b"v2-drift").hexdigest()
     res6 = rv6.resolve(current_subject_digest=drift)
     check("S7 drift after acceptance -> REVISE", res6["outcome"] == "REVISE")
+
+    # T18-1 (F02): live file bytes are rehashed at verdict AND resolution
+    art = temp_state() / "subject-a.txt"
+    art.write_text("v1")
+    rv7 = mk_review()
+    sn7 = rv7.stage_snapshot(subject=[art], completion_claim="files done")
+    check("T18-1 file subject bound by content",
+          sn7["subject_manifest"]["kind"] == "files"
+          and sn7["subject_manifest"]["files"][0]["sha256"]
+          == _sha256(b"v1").hexdigest())
+    art.write_text("v2-changed")
+    ed7 = ed_ok(rv7, sn7, overall="accept", scope=crit, checks=passing_checks(sn7))
+    r7 = rv7.ingest_verdict(snapshot_digest=sn7["subject_digest"], editor=ed7,
+                            findings=[], overall="accept", approval_scope=crit,
+                            checks_evidence=passing_checks(sn7))
+    check("T18-1b verdict on drifted live bytes refused",
+          r7["ok"] is False and "changed since staging" in r7["faults"][0],
+          json.dumps(r7)[:160])
+    art.write_text("v1")
+    ed7b = ed_ok(rv7, sn7, overall="accept", scope=crit, checks=passing_checks(sn7))
+    rv7.ingest_verdict(snapshot_digest=sn7["subject_digest"], editor=ed7b,
+                       findings=[], overall="accept", approval_scope=crit,
+                       checks_evidence=passing_checks(sn7))
+    art.write_text("v3-drift-after-accept")
+    res7 = rv7.resolve()
+    check("T18-1c resolution rehashes live bytes",
+          res7["outcome"] == "REVISE"
+          and any("differs" in r for r in res7["reasons"]),
+          json.dumps(res7)[:200])
+
+    # T18-2 (F03): malformed verdicts and unstable finding ids refused
+    rv8 = mk_review()
+    sn8 = rv8.stage_snapshot(subject="m", completion_claim="done")
+    ed8s = ed_ok(rv8, sn8, overall="accept",
+                 prior=[{"id": "f1", "closed": "false"}], scope=crit)
+    r8a = rv8.ingest_verdict(snapshot_digest=sn8["subject_digest"], editor=ed8s,
+                             findings=[], overall="accept",
+                             prior_dispositions=[{"id": "f1", "closed": "false"}],
+                             approval_scope=crit)
+    check("T18-2 string-closed disposition refused", r8a["ok"] is False)
+    fA1 = [{"id": "fA", "criterion": "no regressions", "blocking": True,
+            "evidence": "e", "expected": "x", "observed": "y", "probe": "p"}]
+    ed8a = ed_ok(rv8, sn8, overall="revise", findings=fA1)
+    rv8.ingest_verdict(snapshot_digest=sn8["subject_digest"], editor=ed8a,
+                       findings=fA1, overall="revise")
+    fA2 = [{"id": "fA", "criterion": "gates green", "blocking": True,
+            "evidence": "e", "expected": "x", "observed": "y", "probe": "p"}]
+    ed8b = ed_ok(rv8, sn8, overall="revise", findings=fA2)
+    r8b = rv8.ingest_verdict(snapshot_digest=sn8["subject_digest"], editor=ed8b,
+                             findings=fA2, overall="revise")
+    check("T18-2b finding id rebinding refused",
+          r8b["ok"] is False and "rebound" in r8b["faults"][0],
+          json.dumps(r8b)[:160])
+
+    # T18-3 (F04): a renewed editor objection reopens a closed finding
+    rv9 = mk_review()
+    sn9 = rv9.stage_snapshot(subject="r", completion_claim="done")
+    ed9 = ed_ok(rv9, sn9, overall="revise", findings=fA1)
+    rv9.ingest_verdict(snapshot_digest=sn9["subject_digest"], editor=ed9,
+                       findings=fA1, overall="revise")
+    checks9 = passing_checks(sn9)
+    ed9b = ed_ok(rv9, sn9, overall="accept", prior=[{"id": "fA", "closed": True}],
+                 scope=crit, checks=checks9)
+    rv9.ingest_verdict(snapshot_digest=sn9["subject_digest"], editor=ed9b,
+                       findings=[], prior_dispositions=[{"id": "fA", "closed": True}],
+                       overall="accept", approval_scope=crit,
+                       checks_evidence=checks9)
+    fA3 = [{"id": "fA", "criterion": "no regressions", "blocking": True,
+            "evidence": "regressed again", "expected": "closure holds",
+            "observed": "new failure", "probe": "probe-2"}]
+    ed9c = ed_ok(rv9, sn9, overall="revise", findings=fA3)
+    r9 = rv9.ingest_verdict(snapshot_digest=sn9["subject_digest"], editor=ed9c,
+                            findings=fA3, overall="revise")
+    check("T18-3 reopened objection ingested", r9["ok"])
+    res9 = rv9.resolve()
+    check("T18-3b reopen -> REVISE", res9["outcome"] == "REVISE"
+          and "fA" in res9["unresolved"], json.dumps(res9)[:200])
+
+    # T18-4 (F05/F06): chain integrity + durable idempotent finalization
+    rv10 = mk_review()
+    sn10 = rv10.stage_snapshot(subject="t", completion_claim="done")
+    good = rv10.path.read_text()
+    rv10.path.write_text(good.replace('"done"', '"done-TAMPERED"'))
+    try:
+        rv10.rows
+        tamper_raised = False
+    except ValueError:
+        tamper_raised = True
+    check("T18-4 rewritten record detected", tamper_raised)
+    rv10.path.write_text(good + json.dumps({"kind": "editor_verdict"}) + "\n")
+    try:
+        rv10.rows
+        corrupt_raised = False
+    except ValueError:
+        corrupt_raised = True
+    check("T18-4b corrupt record detected", corrupt_raised)
+    rv10.path.write_text(good)
+    checks10 = passing_checks(sn10)
+    ed10 = ed_ok(rv10, sn10, overall="accept", scope=crit, checks=checks10)
+    rv10.ingest_verdict(snapshot_digest=sn10["subject_digest"], editor=ed10,
+                        findings=[], overall="accept", approval_scope=crit,
+                        checks_evidence=checks10)
+    r10a = rv10.resolve(current_subject_digest=sn10["subject_digest"])
+    r10b = rv10.resolve(current_subject_digest=sn10["subject_digest"])
+    n_complete = len([x for x in rv10.rows if x["kind"] == "resolution"
+                      and x.get("outcome") == "COMPLETE"])
+    check("T18-4c durable idempotent completion",
+          r10a["outcome"] == r10b["outcome"] == "COMPLETE" and n_complete == 1,
+          json.dumps(r10a)[:160])
+    try:
+        rv10.stage_snapshot(subject="t2", completion_claim="post-terminal")
+        terminal_raised = False
+    except ValueError:
+        terminal_raised = True
+    check("T18-4d terminal review refuses writes", terminal_raised)
+    mutated = rv10.rows
+    mutated.pop()
+    check("T18-4e rows are defensive copies", len(rv10.rows) > len(mutated))
+
+    # T18-4f: concurrent non-terminal resolves converge on one row
+    rv12 = mk_review()
+    rv12.stage_snapshot(subject="cc", completion_claim="done")
+    ra = rv12.resolve()
+    rb = rv12.resolve()
+    n_revise = len([x for x in rv12.rows if x["kind"] == "resolution"
+                    and x.get("outcome") == "REVISE"])
+    check("T18-4f identical re-resolves dedupe to one row",
+          ra["outcome"] == rb["outcome"] == "REVISE" and n_revise == 1,
+          json.dumps({"a": ra["outcome"], "b": rb["outcome"], "n": n_revise})[:160])
+
+    # T18-5 (F08): checks/scope/claim strictness at ingest and resolve
+    rv11 = mk_review()
+    sn11 = rv11.stage_snapshot(subject="u", completion_claim="done")
+    fail_checks = [{"status": "fail", "snapshot_digest": sn11["subject_digest"],
+                    "receipt_ref": "l"}]
+    ed11f = ed_ok(rv11, sn11, overall="accept", scope=crit, checks=fail_checks)
+    r11 = rv11.ingest_verdict(snapshot_digest=sn11["subject_digest"],
+                              editor=ed11f, findings=[], overall="accept",
+                              approval_scope=crit, checks_evidence=fail_checks)
+    check("T18-5 failing checks receipt refused at ingest", r11["ok"] is False)
+    partial = ["no regressions"]
+    ed11 = ed_ok(rv11, sn11, overall="accept", scope=partial,
+                 checks=passing_checks(sn11))
+    rv11.ingest_verdict(snapshot_digest=sn11["subject_digest"], editor=ed11,
+                        findings=[], overall="accept", approval_scope=partial,
+                        checks_evidence=passing_checks(sn11))
+    res11 = rv11.resolve(current_subject_digest=sn11["subject_digest"])
+    check("T18-5b partial approval scope -> REVISE",
+          res11["outcome"] == "REVISE"
+          and any("approval" in r for r in res11["reasons"]),
+          json.dumps(res11)[:200])
+    try:
+        mk_review().stage_snapshot(subject="nc", completion_claim="   ")
+        empty_claim_raised = False
+    except ValueError:
+        empty_claim_raised = True
+    check("T18-5c empty completion claim refused", empty_claim_raised)
+
+    # T18-6 (F09): none tier is receipt-gated, never a bypass
+    rvn = mk_review(tier="none")
+    resn = rvn.resolve()
+    check("T18-6 tier none without verified exemption -> REVISE",
+          resn["outcome"] == "REVISE"
+          and any("exemption" in r for r in resn["reasons"]),
+          json.dumps(resn)[:160])
+    snn = rvn.stage_snapshot(subject="same-subject",
+                             completion_claim="no-op reuse")
+    exempt_rid = "rev-exempt-fixed"
+    rcpt = sr.exemption_receipt(exempt_rid, crit, snn["subject_digest"],
+                                snn["subject_digest"], key=TKEY)
+    rvn2 = sr.SessionReview.create(
+        worker={"session_uuid": "x", "harness": "zcode"},
+        acceptance_criteria=crit, tier="none", base=temp_state(),
+        review_id=exempt_rid, exemption_receipt=rcpt,
+        provenance_verifier=t_prov, debt_verifier=t_debt,
+        exemption_verifier=t_exemp)
+    snn2 = rvn2.stage_snapshot(subject="same-subject",
+                               completion_claim="no-op reuse")
+    resn2 = rvn2.resolve(current_subject_digest=snn2["subject_digest"])
+    check("T18-6b verified exemption completes without editor call",
+          resn2["outcome"] == "COMPLETE", json.dumps(resn2)[:160])
+
+    # T18-7 (F10): id containment, unopened rejection, duplicate create
+    try:
+        sr.SessionReview("../escape")
+        escape_raised = False
+    except ValueError:
+        escape_raised = True
+    check("T18-7 review id containment", escape_raised)
+    rogue = sr.SessionReview("never-created", base=temp_state())
+    try:
+        rogue.stage_snapshot(subject="x", completion_claim="claim")
+        unopened_raised = False
+    except ValueError:
+        unopened_raised = True
+    check("T18-7b unopened review refuses events", unopened_raised)
+    shared_base = temp_state()
+    dupid = mk_review(base=shared_base)
+    try:
+        sr.SessionReview.create(worker={"session_uuid": "y", "harness": "zcode"},
+                                acceptance_criteria=["c"], base=shared_base,
+                                review_id=dupid.review_id)
+        dup_raised = False
+    except ValueError:
+        dup_raised = True
+    check("T18-7c duplicate create refused", dup_raised)
 
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
     if FAIL:
