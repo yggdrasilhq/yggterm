@@ -567,9 +567,11 @@ def enqueue(cfg, route, ns, kind, moderate, prompt):
 
 
 def cmd_topup(cfg):
-    try:  # the spawner timer's consumer code acks the active revision here
+    try:  # the spawner timer acks the revision it will operate on
         from swarmharness import swarmconfig as _sc3
-        _sc3.ack("spawner-timer")
+        _res3 = _sc3.load()
+        if _res3.get("revision"):
+            _sc3.ack("spawner-timer", revision_hash=_res3["revision"]["content_hash"])
     except Exception:
         pass
     st = load_state()
@@ -735,20 +737,24 @@ def falsify_pass():
                         outcome += 1
                         if a.get("verdict") in ("FAIL", "UNKNOWN") or a.get("issues"):
                             failed += 1
-            ev = _falsify.evaluate(c["claim_id"], window_start=c["opened_at"],
-                                   window_end=w_end, route=route,
-                                   exposed_tasks=len(exposed), outcome_tasks=outcome,
-                                   failed_tasks=failed)
-            if ev["disposition"] == "falsified":
-                _falsify.consume(c["claim_id"], ev, action="rollback")
-                notes.append(f"claim {c['claim_id']} FALSIFIED ({ev['verdict']}) — patch rolled back")
-            elif ev["disposition"] == "supported":
-                _falsify.consume(c["claim_id"], ev, action="retain")
-                notes.append(f"claim {c['claim_id']} supported ({ev['verdict']}) — retained")
-            else:
-                _falsify.consume(c["claim_id"], ev, action="expire")
-                notes.append(f"claim {c['claim_id']} undetermined — expired")
-            _falsify.mark_consumed(c["claim_id"])
+            try:
+                ev = _falsify.evaluate(c["claim_id"], window_start=c["opened_at"],
+                                       window_end=w_end, route=route,
+                                       exposed_tasks=len(exposed), outcome_tasks=outcome,
+                                       failed_tasks=failed)
+                if ev["disposition"] == "falsified":
+                    _falsify.consume(c["claim_id"], ev, action="rollback")
+                    notes.append(f"claim {c['claim_id']} FALSIFIED ({ev['verdict']}) — patch rolled back")
+                elif ev["disposition"] == "supported":
+                    _falsify.consume(c["claim_id"], ev, action="retain")
+                    notes.append(f"claim {c['claim_id']} supported ({ev['verdict']}) — retained")
+                else:
+                    _falsify.consume(c["claim_id"], ev, action="expire")
+                    notes.append(f"claim {c['claim_id']} undetermined — expired")
+                _falsify.mark_consumed(c["claim_id"])
+            except Exception as e3:  # per-claim isolation: claim N's fault
+                # never skips claim N+1 (sol t10#12)
+                notes.append(f"claim {c['claim_id']} evaluation fault: {e3!r}")
     except Exception as e:  # noqa: BLE001 — falsification failures never stop supervision
         notes.append(f"falsify_pass fault: {e!r}")
     return notes
@@ -756,9 +762,17 @@ def falsify_pass():
 
 def cmd_supervise(cfg):
     ledger = {"t": int(time.time()), "audited": 0, "revoked": [], "rerouted": [], "held": [], "notes": []}
-    try:  # consumer acknowledgement of the active revision (sol turn-7 #5)
+    # the v2 PERMISSION gate constrains supervise mutations too (sol t10#10):
+    # reroutes and watch enqueues on a blocked route are suppressed here
+    v2_blocked_sup, v2_note_sup = v2_blocked_routes(cfg["routes"])
+    if v2_blocked_sup:
+        print(f"orchestrator: supervise v2 gate — blocked: {sorted(v2_blocked_sup)}"
+              + (f" ({v2_note_sup})" if v2_note_sup else ""))
+    try:  # consumer acknowledgement binds to the LOADED revision (sol t10#6)
         from swarmharness import swarmconfig as _sc2
-        _sc2.ack("dream-orchestrator")
+        _res = _sc2.load()
+        if _res.get("revision"):
+            _sc2.ack("dream-orchestrator", revision_hash=_res["revision"]["content_hash"])
     except Exception:
         pass
     for fnote in falsify_pass():
@@ -788,7 +802,11 @@ def cmd_supervise(cfg):
             continue
         seen_notes.add(r["id"])
         if any(s in low for s in QUOTA_SIGNS):
-            alt = next((p for p in cfg["routes"] if p != r["route"] and gates[p]["ok"]), None)
+            if r["route"] in v2_blocked_sup:
+                ledger["notes"].append({"id": r["id"], "why": f"v2 gate: {r['route']} blocked — reroute suppressed"})
+                continue
+            alt = next((p for p in cfg["routes"] if p != r["route"] and gates[p]["ok"]
+                        and p not in v2_blocked_sup), None)
             if alt:
                 rc, _, _ = run(queue_cli(cfg) + ["reroute", r["id"], "--to", alt, "--json"], 60)
                 # sol repair 6: mutations are verified by readback, not by rc
@@ -850,9 +868,9 @@ def cmd_supervise(cfg):
             pol = resolve_policy(family="ux_parity")
             route = watch.get("route", "autoclaw")
             gate = gates.get(route, {})
-            if route in pol["blocked_routes"]:
-                ledger["notes"].append({"ux_watch": f"route {route} held by policy — waiting (recovery check after expiry)"})
-                print(f"supervise: UX-parity watch — {route} under policy hold, waiting")
+            if route in pol["blocked_routes"] or route in v2_blocked_sup:
+                ledger["notes"].append({"ux_watch": f"route {route} held by policy/v2 gate — waiting (recovery check after expiry)"})
+                print(f"supervise: UX-parity watch — {route} under policy hold/v2 gate, waiting")
             elif gate and not gate.get("ok", True):
                 ledger["notes"].append({"ux_watch": f"route {route} plane-gated ({gate.get('why')})"})
                 print(f"supervise: UX-parity watch — {route} gated, waiting")

@@ -93,24 +93,29 @@ def select_editor(scenario_id, trigger, campaign_ref=None, authority_ref="owner"
     if limit0 is not None and int(limit0) <= 0:
         return {"decision": "swap_budget_exhausted", "scenario": scenario_id,
                 "swaps_so_far": 0, "limit": 0}
-    # swap budget per incident
-    if incident_id:
-        inc_dir = _dir(state) / "incidents"
-        try:
-            swaps = len(json.loads((inc_dir / f"{incident_id}.json").read_text()).get("swaps", []))
-        except Exception:
-            swaps = 0
-        limit = act.get("max_swaps_per_incident")
-        limit = 1 if limit is None else int(limit)
-        if swaps >= limit:  # a 0 allowance is honored, not defaulted
-            return {"decision": "swap_budget_exhausted", "scenario": scenario_id,
-                    "swaps_so_far": swaps}
+    # NOTE (sol t10#8): the swap budget read/check moved INSIDE the epoch
+    # lock below — a pre-lock read races publication and double-selects.
 
     _epoch_path(state).parent.mkdir(parents=True, exist_ok=True)
     import fcntl as _fcntl
     _lk = open(_epoch_path(state).with_suffix(".lock"), "a+")
     _fcntl.flock(_lk, _fcntl.LOCK_EX)
     try:
+        # budget read/check/commit is atomic against publication (t10#8)
+        limit0 = act.get("max_swaps_per_incident")
+        limit0 = 1 if limit0 is None else int(limit0)
+        if incident_id:
+            inc_dir0 = _dir(state) / "incidents"
+            try:
+                swaps0 = len(json.loads((inc_dir0 / f"{incident_id}.json").read_text()).get("swaps", []))
+            except Exception:
+                swaps0 = 0
+            if swaps0 >= limit0:
+                return {"decision": "swap_budget_exhausted", "scenario": scenario_id,
+                        "swaps_so_far": swaps0, "limit": limit0}
+        elif limit0 <= 0:
+            return {"decision": "swap_budget_exhausted", "scenario": scenario_id,
+                    "swaps_so_far": 0, "limit": 0}
         epoch = current_epoch(state) + 1
         sc.atomic_write(_epoch_path(state), str(epoch).encode())
         # selection publication + incident accounting share the epoch lock so

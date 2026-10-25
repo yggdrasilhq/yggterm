@@ -529,7 +529,9 @@ def _ack_audit_timer():
         import sys as _sys
         _sys.path.insert(0, str(Path(__file__).resolve().parent / "swarmharness"))
         from swarmharness import swarmconfig as _sc
-        _sc.ack("audit-timer")
+        _res = _sc.load()
+        if _res.get("revision"):
+            _sc.ack("audit-timer", revision_hash=_res["revision"]["content_hash"])
     except Exception:
         pass
 
