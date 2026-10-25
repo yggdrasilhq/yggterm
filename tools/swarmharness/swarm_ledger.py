@@ -513,16 +513,19 @@ def journal_records(state=DEFAULT_STATE, area="config"):
         return []
 
 
-def verify_ancestry(state=DEFAULT_STATE, area="config"):
-    """Replica-side chain verification: recompute every event_hash. -> (ok, bad_index)."""
+def verify_ancestry(state=DEFAULT_STATE, area="config", records=None):
+    """Chain verification: recompute every event_hash. -> (ok, bad_index).
+    records=None verifies the local journal; a list verifies that list."""
     prev = GENESIS_HASH
-    for i, rec in enumerate(journal_records(state, area)):
+    recs = journal_records(state, area) if records is None else records
+    for i, rec in enumerate(recs):
         if rec["previous_event_hash"] != prev:
             return False, i
         if rec["event_hash"] != _event_hash(rec, prev):
             return False, i
         prev = rec["event_hash"]
     return True, None
+
 
 
 def _refresh_current_yaml(state):
@@ -547,10 +550,18 @@ def _refresh_current_yaml(state):
 # ------------------------------------------------------- install transaction
 
 def install_accepted(state, release_hash, origin_bytes=None, area="config",
-                     workspace=DEFAULT_YAML):
+                     workspace=DEFAULT_YAML, shipped_journal=None):
     """Replica-side installation: durable intent -> atomic writes -> manifest
     completion. NEVER touches the workspace; workspace_base does NOT advance
-    (a dirty workspace stays dirty; current.yaml exposes accepted truth)."""
+    (a dirty workspace stays dirty; current.yaml exposes accepted truth).
+
+    INSTALL GATE (sol turn-7 #5): schema validation must pass (a
+    schema_version:999 body is rejected, not self-hash-trusted), and the
+    release must be vouched by ancestry — either shipped journal records
+    whose event chain verifies and whose head names this hash, or the local
+    journal already containing the hash. Bundle identity alone proves
+    nothing."""
+    from swarmconfig import validate as _validate
     st = Path(state).expanduser()
     rel_dir = _paths(st)["releases"] / release_hash
     rel_yaml = rel_dir / "release.yaml"
@@ -560,8 +571,37 @@ def install_accepted(state, release_hash, origin_bytes=None, area="config",
     body = json.loads(rel_json.read_text())
     if content_hash(body) != release_hash:
         return {"installed": False, "detail": "release bundle hash mismatch"}
+    vf = _validate(body)
+    if vf:
+        return {"installed": False, "detail": f"release fails schema validation: {vf[0]['code']}"}
     if origin_bytes is not None and _sha256(origin_bytes) != _sha256(rel_yaml.read_bytes()):
         return {"installed": False, "detail": "origin bytes differ from sealed release"}
+    # ancestry: shipped records with a verifying chain naming this hash...
+    vouched = False
+    local = journal_records(state, area)
+    if shipped_journal:
+        ok, bad = verify_ancestry(records=shipped_journal)
+        if not ok:
+            return {"installed": False, "detail": f"shipped journal chain broken at record {bad}"}
+        if shipped_journal[-1].get("canonical_hash") != release_hash:
+            return {"installed": False, "detail": "shipped journal head does not name this release"}
+        # ...AND continuous with the replica's own accepted history
+        if local:
+            if shipped_journal[0].get("previous_event_hash") != local[-1]["event_hash"]:
+                return {"installed": False, "detail": "shipped journal does not continue local ancestry"}
+        vouched = True
+    else:
+        # no shipped records: the LOCAL journal must already vouch the hash
+        # (strict: the journal append IS the commit point — a sealed-but-
+        # unjournaled release is never operational truth; bootstrap happens
+        # through a shipped chain, which the controller always includes)
+        if any(r.get("canonical_hash") == release_hash for r in local):
+            vouched = True
+        else:
+            return {"installed": False,
+                    "detail": "unvouched: no local journal record and none shipped"}
+    if not vouched:
+        return {"installed": False, "detail": "unvouched install refused"}
 
     ident = body.get("identity") or {}
     target = {"canonical_hash": release_hash, "epoch": ident.get("authority_epoch"),
@@ -605,7 +645,8 @@ def recover_install(state, area="config"):
         rel_dir = _paths(Path(state).expanduser())["releases"] / h
         if (rel_dir / "release.json").exists():
             body = json.loads((rel_dir / "release.json").read_text())
-            if content_hash(body) == h:
+            from swarmconfig import validate as _validate
+            if content_hash(body) == h and not _validate(body):
                 st = Path(state).expanduser()
                 atomic_write_json(_paths(st)["active"], {
                     "content_hash": h, "epoch": target.get("epoch"),
@@ -638,12 +679,29 @@ def classification_manifest():
              "writer_api": "proposal-workspace", "replication_driver": "swarm-ledger-v1"},
             {"path": "swarm/config/releases/", "tier": "T3", "area": "config",
              "writer_api": "protocol-managed", "replication_driver": "swarm-ledger-v1"},
+            {"path": "swarm/config/acks/", "tier": "T2", "area": "config",
+             "writer_api": "ack-verb", "replication_driver": "report-only",
+             "purpose": "per-consumer activation acknowledgements; reported up, never merged"},
             {"path": "swarm/config/", "tier": "T3", "area": "config",
              "writer_api": "protocol-managed", "replication_driver": "swarm-ledger-v1"},
             {"path": "swarm/registry/", "tier": "T1", "area": "registry",
-             "writer_api": "record-api", "replication_driver": "swarm-ledger-v1"},
-            {"path": "dream/policy/", "tier": "T1", "area": "policy",
-             "writer_api": "learned-patch-contract", "replication_driver": "swarm-ledger-v1"},
+             "writer_api": "record-api",
+             "replication_driver": "planned-swarm-ledger-v1",
+             "purpose": "registry records replicate through their record APIs once the registry area ships (honest label: not yet replicating)"},
+            {"path": "dream/policy/overlays.json", "tier": "T1", "area": "policy",
+             "writer_api": "learned-patch-contract",
+             "replication_driver": "planned-swarm-ledger-v1",
+             "purpose": "overlay definitions T1; receipts below are T2"},
+            {"path": "dream/policy/receipts.jsonl", "tier": "T2", "area": "policy",
+             "writer_api": "append-only-producer",
+             "replication_driver": "report-only",
+             "purpose": "activation/evaluation receipts: immutable producer records reported upward, never merged"},
+            {"path": "dream/policy/claims.jsonl", "tier": "T1", "area": "policy",
+             "writer_api": "falsify-claim-api", "replication_driver": "planned-swarm-ledger-v1"},
+            {"path": "dream/policy/evaluations.jsonl", "tier": "T2", "area": "policy",
+             "writer_api": "append-only-producer", "replication_driver": "report-only"},
+            {"path": "dream/audit-feedback.json", "tier": "T2", "area": "audit",
+             "writer_api": "audit-wire", "replication_driver": "report-only"},
             {"path": "dream/", "tier": "T3", "area": "runtime",
              "writer_api": "local", "replication_driver": "none"},
             {"path": "config/", "tier": "T3", "area": "runtime",

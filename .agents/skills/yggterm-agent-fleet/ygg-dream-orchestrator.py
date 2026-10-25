@@ -718,6 +718,11 @@ def falsify_pass():
 
 def cmd_supervise(cfg):
     ledger = {"t": int(time.time()), "audited": 0, "revoked": [], "rerouted": [], "held": [], "notes": []}
+    try:  # consumer acknowledgement of the active revision (sol turn-7 #5)
+        from swarmharness import swarmconfig as _sc2
+        _sc2.ack("dream-orchestrator")
+    except Exception:
+        pass
     for fnote in falsify_pass():
         ledger["notes"].append(fnote)
         print(f"orchestrator: falsify — {fnote}")

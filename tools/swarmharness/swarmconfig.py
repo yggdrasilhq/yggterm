@@ -849,6 +849,34 @@ def accept(cfg_or_bytes, *, proposed_by, authority_class="owner",
         "content_hash": h, "change_id": cid}})
 
 
+def ack(consumer, state_dir=DEFAULT_STATE):
+    """A consumer acknowledges the ACTIVE revision (distinct from accepted/
+    installed: the consumer has loaded and is operating on it)."""
+    head = active_head(state_dir)
+    if not head:
+        return {"ok": False, "detail": "no active revision to acknowledge"}
+    d = Path(state_dir).expanduser() / "config" / "acks"
+    d.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(d / f"{consumer}.json",
+                      {"consumer": consumer, "content_hash": head["content_hash"],
+                       "revision": head.get("revision"), "at": _now()})
+    return {"ok": True, "revision": head.get("revision")}
+
+
+def acks(state_dir=DEFAULT_STATE):
+    """-> {consumer: content_hash or None} for every ack file present."""
+    d = Path(state_dir).expanduser() / "config" / "acks"
+    out = {}
+    if d.is_dir():
+        for p_ in sorted(d.glob("*.json")):
+            try:
+                rec = json.loads(p_.read_text())
+                out[p_.stem] = rec.get("content_hash")
+            except Exception:
+                out[p_.stem] = None
+    return out
+
+
 def status(state_dir=DEFAULT_STATE):
     r = load(state_dir)
     head = active_head(state_dir)
@@ -856,7 +884,7 @@ def status(state_dir=DEFAULT_STATE):
                  ) if (_paths(state_dir)["releases"]).is_dir() else []
     return {"mode": r["mode"], "revision": r["revision"], "head": head,
             "releases": rel, "denials": list(r["denials"]),
-            "faults": r["faults"]}
+            "faults": r["faults"], "acks": acks(state_dir)}
 
 
 # -------------------------------------------------------------- CLI surface

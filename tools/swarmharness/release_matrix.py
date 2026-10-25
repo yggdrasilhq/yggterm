@@ -50,9 +50,29 @@ def transfer_outbox(src_state, src_host, dst_state):
     return n
 
 
+def seed_journal(state):
+    """Record the genesis acceptance in the ledger (the demo's direct accept
+    bypassed the protocol; the journal append IS the commit point, so the
+    record is created through the real recorder before any distribution)."""
+    head = sc.active_head(state)
+    if head is None or sl.journal_records(state):
+        return
+    rel = sc._paths(Path(state).expanduser())["releases"] / head["content_hash"]
+    env = {"parent": {"canonical_hash": sc.GENESIS_HASH},
+           "candidate_bytes_hash": hashlib.sha256(GENESIS).hexdigest(),
+           "authority_ref": {"scheme": "hmac-sha256"}}
+    rec = sl._journal_record(state, "config", {
+        "change_id": head["change_id"], "revision": head,
+    }, env, "owner",
+        release_bytes_hash=hashlib.sha256((rel / "release.yaml").read_bytes()).hexdigest())
+    sl._journal_append(state, "config", rec)
+
+
 def transfer_release(src_state, dst_state):
     """Mock of the ssh push + remote install: copy the sealed bundle and
-    install it through the verified path."""
+    install it through the verified path, SHIPPING the journal chain so the
+    replica verifies ancestry (never bundle identity alone)."""
+    seed_journal(src_state)
     head = sc.active_head(src_state)
     rel = sc._paths(Path(src_state).expanduser())["releases"] / head["content_hash"]
     rd = sc._paths(Path(dst_state).expanduser())["releases"] / head["content_hash"]
@@ -60,7 +80,8 @@ def transfer_release(src_state, dst_state):
     shutil.copy(rel / "release.yaml", rd / "release.yaml")
     shutil.copy(rel / "release.json", rd / "release.json")
     return sl.install_accepted(dst_state, head["content_hash"],
-                               origin_bytes=(rel / "release.yaml").read_bytes())
+                               origin_bytes=(rel / "release.yaml").read_bytes(),
+                               shipped_journal=sl.journal_records(src_state))
 
 
 def scenario_10():

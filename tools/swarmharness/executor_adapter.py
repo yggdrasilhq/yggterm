@@ -42,6 +42,10 @@ def main():
     if not argv:
         print("executor-adapter: empty transport command", file=sys.stderr)
         return 2
+    try:
+        sc.ack("executor-adapter")   # consumer acknowledgement (distinct state)
+    except Exception:
+        pass
     print(f"executor-adapter: config {res['revision']['content_hash'][:12]} "
           f"rev {res['revision']['revision']} — exec {argv[0]}", file=sys.stderr)
     os.execvp(argv[0], argv)

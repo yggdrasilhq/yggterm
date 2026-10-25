@@ -468,6 +468,104 @@ def main():
     check("P7 uncommitted seal not recoverable", lr4["mode"] == "containment_only",
           lr4["mode"])
 
+    # =====================================================================
+    # 30+. GRADUATION PIPELINE + ANCESTRY GATE + ACKS (owner directive + sol #5)
+    # =====================================================================
+    import graduate as gr
+
+    # G1: full lifecycle — stage (retained reference) -> trial -> promote
+    stray = temp_state() / "stray-helper.py"
+    stray.write_text("def helper():\n    return 42\n")
+    fx = temp_state() / "fixture_helper.py"
+    fx.write_text(
+        "import sys\n"
+        "def run(script_path):\n"
+        "    import importlib.util\n"
+        "    spec = importlib.util.spec_from_file_location('h', str(script_path))\n"
+        "    m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)\n"
+        "    return {'pass': m.helper() == 42, 'detail': 'helper()==42'}\n")
+    fbase = temp_state()
+    s = gr.stage(str(stray), "helper returns 42", evidence_refs=["/tmp/dreamer"],
+                 base=fbase, retained=True)
+    check("G1 stage retains provenance", s["ok"] and Path(s["dir"], "manifest.json").exists())
+    t = gr.trial(s["id"], str(fx), base=fbase)
+    check("G1 trial passes and journals", t["ok"] and t["passing"])
+    pr = gr.promote(s["id"], procedure_id="proc-grad-test", title="Helper forty-two",
+                    scope="test", actor="test-seat", base=fbase)
+    check("G1 promote writes verified ProcedureRecord", pr.get("ok"), json.dumps(pr)[:200])
+    got = gr.status(s["id"], fbase)
+    check("G1 staging marked promoted", got.get("state") == "promoted"
+          and got.get("procedure_id") == "proc-grad-test")
+
+    # G2: promote without a passing trial is refused (sol: no fixture, no promotion)
+    s2 = gr.stage(str(stray), "no trial yet", base=fbase)
+    pr2 = gr.promote(s2["id"], procedure_id="proc-never", title="x", scope="t",
+                     actor="t", base=fbase)
+    check("G2 promote without passing trial refused",
+          pr2.get("ok") is False and "no passing trial" in pr2["faults"][0])
+
+    # A1: schema_version 999 bundle is rejected at INSTALL (sol repro #5)
+    import swarm_ledger as sl
+    sdA = temp_state()
+    bad = json.loads(json.dumps(cfg))
+    bad["schema_version"] = 999
+    hb = sc.content_hash(bad)
+    rbad = sc._paths(sdA)["releases"] / hb
+    rbad.mkdir(parents=True)
+    (rbad / "release.json").write_bytes(sc.canonical_json(bad))
+    inst = sl.install_accepted(sdA, hb)
+    check("A1 schema-999 install rejected", inst["installed"] is False
+          and "schema" in inst["detail"], json.dumps(inst)[:140])
+
+    # A2: unvouched install (no journal, none shipped, local journal exists)
+    sdA2 = temp_state()
+    sc.accept(GENESIS, proposed_by="owner", authority_class="owner", state_dir=sdA2)
+    # craft a SECOND sealed release with no journal record (direct accept path)
+    other = json.loads(json.dumps(cfg))
+    other["supply"]["schedules"] = {"wake_interval_min": 33}  # valid body, no journal record
+    ho = sc.content_hash(other)
+    ro = sc._paths(sdA2)["releases"] / ho
+    ro.mkdir(parents=True)
+    (ro / "release.json").write_bytes(sc.canonical_json(other))
+    inst2 = sl.install_accepted(sdA2, ho)
+    check("A2 unvouched install refused", inst2["installed"] is False
+          and "unvouched" in inst2["detail"], json.dumps(inst2)[:140])
+
+    # A3: shipped journal chain verifies; a broken chain is refused
+    jr = sl.journal_records(sdL) if "sdL" in dir() else []
+    if jr:
+        tampered = [dict(x) for x in jr]
+        tampered[0] = dict(tampered[0])
+        tampered[0]["principal"] = "forged"
+        okT, badT = sl.verify_ancestry(records=tampered)
+        check("A3 shipped-chain tamper detected", okT is False and badT == 0)
+
+    # K1: consumer acks — distinct state, reported in status
+    sdK = temp_state()
+    sc.accept(GENESIS, proposed_by="owner", authority_class="owner", state_dir=sdK)
+    a1 = sc.ack("dream-orchestrator", sdK)
+    check("K1 ack records active revision", a1["ok"] and a1["revision"] == 1)
+    stK = sc.status(sdK)
+    check("K1 status reports acks", stK["acks"].get("dream-orchestrator") is not None)
+    # a new activation moves the head; the old ack no longer matches (unacked)
+    v2k = json.loads(json.dumps(cfg))
+    hk = sc.active_head(sdK)["content_hash"]
+    v2k["identity"].update(revision=2, parent_hash=hk, change_id=str(uuid.uuid4()))
+    sc.accept(sc.canonical_json(v2k), proposed_by="owner", authority_class="owner",
+              parent_expected=hk, state_dir=sdK)
+    stK2 = sc.status(sdK)
+    check("K1 stale ack detectable", stK2["acks"].get("dream-orchestrator") != stK2["head"]["content_hash"])
+
+    # M1: T2 classification rows exist (receipts/acks/evaluations reported, not merged)
+    man = sl.classification_manifest()
+    tiers = {r["path"]: r["tier"] for r in man["rules"]}
+    check("M1 T2 rows present", tiers.get("dream/policy/receipts.jsonl") == "T2"
+          and tiers.get("swarm/config/acks/") == "T2"
+          and tiers.get("dream/policy/evaluations.jsonl") == "T2")
+    check("M1 registry honestly labeled not-yet-replicating",
+          any(r.get("replication_driver") == "planned-swarm-ledger-v1"
+              for r in man["rules"]))
+
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
     if FAIL:
         print("FAILED:", *FAIL, sep="\n  - ")
