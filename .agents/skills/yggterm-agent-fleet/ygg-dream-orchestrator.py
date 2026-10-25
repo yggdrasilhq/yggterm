@@ -311,7 +311,9 @@ def load_feedback(cfg):
             return None, "finding row not a mapping"
         if not f.get("code") or not f.get("status") or not f.get("finding_id"):
             return None, f"finding missing code/status/finding_id: {str(f)[:80]}"
-        if f.get("status") not in ("confirmed", "suspected", "cleared", "watch"):
+        # the audit wire's full vocabulary: 'unknown' is a legitimate honest
+        # grade (e.g. starvation UNKNOWN) — only STRUCTURAL absence faults
+        if f.get("status") not in ("confirmed", "suspected", "cleared", "watch", "unknown"):
             return None, f"unknown finding status {f.get('status')!r}"
         gen = fb.get("generated_at") or ""
         vu = fb.get("valid_until") or ""
