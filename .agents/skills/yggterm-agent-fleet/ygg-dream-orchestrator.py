@@ -783,11 +783,14 @@ def cmd_supervise(cfg):
     # must see the same route or the gate is bypassable (sol t13)
     _watch_cfg = cfg.get("ux_parity_watch") if isinstance(cfg.get("ux_parity_watch"), dict) else {}
     _watch_route = _watch_cfg.get("route")
-    # an EXPLICIT watch route is honored whenever it is a known ROUTE_TO_PLANE
-    # key (independent watch routes are legitimate — the top-up route list is
-    # NOT the watch route catalog, sol t14); the fallback fires only for
-    # absent/invalid selections
-    if not _watch_route or (_watch_route not in cfg["routes"] and _watch_route not in ROUTE_TO_PLANE):
+    # an EXPLICIT watch route is honored whenever it is a nonempty STRING that
+    # is a known route (top-up member or ROUTE_TO_PLANE key) — JSON route
+    # values of any other type (list/dict/int) fall back; dict membership on
+    # unvalidated JSON crashed all supervision (sol t15)
+    if not isinstance(_watch_route, str) or not _watch_route.strip():
+        _watch_route = None
+    if _watch_route is None or (_watch_route not in cfg["routes"]
+                                and _watch_route not in ROUTE_TO_PLANE):
         _watch_route = "autoclaw"
     _gate_routes = list(cfg["routes"]) + ([_watch_route] if _watch_route not in cfg["routes"] else [])
     v2_blocked_sup, v2_note_sup = v2_blocked_routes(_gate_routes)
