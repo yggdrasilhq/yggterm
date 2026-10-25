@@ -752,6 +752,88 @@ def main():
     v16 = ls2.verify_generated(b"{broken", cfg)
     check("R16 broken cutover artifact never ok", v16["ok"] is False)
 
+    # =====================================================================
+    # 50+. SESSION-REVIEW CONTRACT (sol turn-17 traps)
+    # =====================================================================
+    import session_review as sr
+    from hashlib import sha256 as _sha256
+
+    def mk_review(tier="full"):
+        return sr.SessionReview.create(
+            worker={"session_uuid": str(uuid.uuid4()), "harness": "zcode"},
+            acceptance_criteria=["no regressions", "gates green"],
+            tier=tier, base=temp_state())
+
+    # S1: full loop to COMPLETE
+    rv = mk_review()
+    snap = rv.stage_snapshot(subject="work-v1", completion_claim="done")
+    ed = {"identity": "sol", "invocation_ref": "codex-session-xyz"}
+    r1 = rv.ingest_verdict(snapshot_digest=snap["subject_digest"], editor=ed,
+                           findings=[{"id": "f1", "criterion": "gates green",
+                                      "blocking": True, "evidence": "probe"}],
+                           overall="revise")
+    check("S1 verdict with provenance accepted", r1["ok"])
+    rv.disposition("f1", "repair", evidence_refs=["commit-abc"])
+    snap2 = rv.stage_snapshot(subject="work-v2", completion_claim="done-v2")
+    rv.ingest_verdict(snapshot_digest=snap2["subject_digest"], editor=ed,
+                      findings=[],
+                      prior_dispositions=[{"id": "f1", "closed": True}],
+                      overall="accept", checks_evidence="conformance.log")
+    res = rv.resolve(current_subject_digest=snap2["subject_digest"])
+    check("S1 full loop -> COMPLETE", res["outcome"] == "COMPLETE", json.dumps(res)[:160])
+
+    # S2: worker-authored verdict without provenance rejected
+    rv2 = mk_review()
+    sn2 = rv2.stage_snapshot(subject="x", completion_claim="done")
+    rbad = rv2.ingest_verdict(snapshot_digest=sn2["subject_digest"], editor=None,
+                              findings=[], overall="accept")
+    check("S2 worker-authored verdict rejected", rbad["ok"] is False)
+
+    # S3: stale-snapshot approval refused
+    rbad2 = rv2.ingest_verdict(snapshot_digest="stale-digest", editor=ed,
+                               findings=[], overall="accept")
+    check("S3 stale-snapshot refused", rbad2["ok"] is False)
+
+    # S4: worker 'repair' never closes; omitted findings stay open
+    rv3 = mk_review()
+    sn3 = rv3.stage_snapshot(subject="y", completion_claim="done")
+    rv3.ingest_verdict(snapshot_digest=sn3["subject_digest"], editor=ed,
+                       findings=[{"id": "f9", "criterion": "c", "blocking": True}],
+                       overall="revise")
+    rv3.disposition("f9", "repair")
+    res3 = rv3.resolve()
+    check("S4 worker repair never closes", res3["outcome"] == "REVISE"
+          and "f9" in res3["unresolved"], json.dumps(res3)[:160])
+
+    # S5: quota exhaustion -> SUSPENDED, never COMPLETE
+    rv4 = mk_review()
+    rv4.stage_snapshot(subject="z", completion_claim="done")
+    rv4.suspend("consult budget exhausted")
+    res4 = rv4.resolve()
+    check("S5 suspension never implies acceptance", res4["outcome"] == "SUSPENDED")
+
+    # S6: unilateral self-deferral cannot waive a criterion
+    rv5 = mk_review()
+    sn5 = rv5.stage_snapshot(subject="w", completion_claim="done")
+    rv5.ingest_verdict(snapshot_digest=sn5["subject_digest"], editor=ed,
+                       findings=[{"id": "fW", "criterion": "gates green",
+                                  "blocking": True}], overall="revise")
+    rv5.defer_accepted("fW", owner="worker", tracking_ref="self",
+                       revisit="never", authority="self", waives_criterion=True)
+    res5 = rv5.resolve()
+    check("S6 self-deferral cannot complete", res5["outcome"] == "REVISE"
+          and any("criterion" in r for r in res5["reasons"]),
+          json.dumps(res5)[:200])
+
+    # S7: subject drift after acceptance -> REVISE
+    rv6 = mk_review()
+    sn6 = rv6.stage_snapshot(subject="v1", completion_claim="done")
+    rv6.ingest_verdict(snapshot_digest=sn6["subject_digest"], editor=ed,
+                       findings=[], overall="accept", checks_evidence="log")
+    drift = _sha256(b"v2-drift").hexdigest()
+    res6 = rv6.resolve(current_subject_digest=drift)
+    check("S7 drift after acceptance -> REVISE", res6["outcome"] == "REVISE")
+
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
     if FAIL:
         print("FAILED:", *FAIL, sep="\n  - ")
