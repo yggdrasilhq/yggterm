@@ -541,6 +541,11 @@ def enqueue(cfg, route, ns, kind, moderate, prompt):
 
 
 def cmd_topup(cfg):
+    try:  # the spawner timer's consumer code acks the active revision here
+        from swarmharness import swarmconfig as _sc3
+        _sc3.ack("spawner-timer")
+    except Exception:
+        pass
     st = load_state()
     today = datetime.now(IST).strftime("%F")
     if st.get("day") != today:

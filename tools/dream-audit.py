@@ -523,5 +523,17 @@ def _sha8_file(path):
     import hashlib
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
+def _ack_audit_timer():
+    """Consumer acknowledgement of the active swarm-config revision."""
+    try:
+        import sys as _sys
+        _sys.path.insert(0, str(Path(__file__).resolve().parent / "swarmharness"))
+        from swarmharness import swarmconfig as _sc
+        _sc.ack("audit-timer")
+    except Exception:
+        pass
+
+
 if __name__ == "__main__":
+    _ack_audit_timer()
     main()
