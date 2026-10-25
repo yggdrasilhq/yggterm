@@ -109,7 +109,12 @@ def init_state(state=DEFAULT_STATE, workspace=DEFAULT_YAML, host=None):
 
 
 def owner_key(state=DEFAULT_STATE):
+    """The owner authority token. Distributed to replicas at bootstrap
+    (a local authority token, never an external credential); dev verifies.
+    Bootstraps its state dir if touched before init."""
     kp = Path(state).expanduser() / "control" / "owner.key"
+    if not kp.exists():
+        init_state(state)
     return kp.read_bytes().strip()
 
 
