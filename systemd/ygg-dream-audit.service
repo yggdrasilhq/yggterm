@@ -2,4 +2,4 @@
 Description=dream-audit wire producer (10%% sample + DreamAuditFeedbackV1 snapshot)
 [Service]
 Type=oneshot
-ExecStart=%h/tools/dream-audit.py audit
+ExecStart=/usr/bin/python3 %h/tools/dream-audit.py audit
