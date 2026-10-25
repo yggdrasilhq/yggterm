@@ -111,7 +111,10 @@ def parse_peak(spec, now):
     def _day(tok):
         tok = tok.strip().lower()[:3]
         if tok.isdigit():
-            return int(tok)
+            d = int(tok)
+            if not 0 <= d <= 6:
+                raise ValueError(f"weekday out of range: {tok!r}")
+            return d
         if tok not in daymap:
             raise ValueError(f"bad day {tok!r}")
         return daymap[tok]
@@ -223,6 +226,13 @@ ROUTE_TO_PLANE = {"zai-coding-plan": "zai-peak", "zai-offpeak": "zai-offpeak",
 _SWRES = None  # bound in main(); LoadResult dict
 
 
+def _parse_iso(s):
+    try:
+        return datetime.fromisoformat(s)
+    except Exception:
+        return datetime.min.replace(tzinfo=IST)
+
+
 def v2_blocked_routes(routes):
     """-> (blocked_set, note). Intersects routes with the v2 activation store:
     containment blocks everything; owner deny latches and disabled/draining
@@ -247,16 +257,19 @@ def v2_blocked_routes(routes):
     denials = _SWRES.get("denials") or {}
     if "__denies_corrupt__" in denials:
         return set(routes), "v2 deny store UNREADABLE — all dispatch held (fail-closed)"
+    # owner deny latches may be spelled plane/<id> or <id> (normalize, t9#10)
+    denied_ids = {str(k).split("/", 1)[-1] for k in denials}
     planes = ((_SWRES.get("config") or {}).get("planes") or {})
     for r in routes:
-        pl = planes.get(ROUTE_TO_PLANE.get(r, r))
+        pl_id = ROUTE_TO_PLANE.get(r, r)
+        pl = planes.get(pl_id)
         if pl is None:
             continue  # route not governed by a v2 plane: floors decides
         pol = pl.get("owner_policy")
         if pol in ("disabled", "draining"):
             blocked.add(r)
             notes.append(f"{r}:{pol}")
-        if r in denials or ROUTE_TO_PLANE.get(r, r) in denials:
+        if r in denied_ids or pl_id in denied_ids:
             blocked.add(r)
             notes.append(f"{r}:owner-denied")
     return blocked, ("; ".join(notes) if notes else "v2 gate clear")
@@ -315,6 +328,10 @@ def load_feedback(cfg):
         # grade (e.g. starvation UNKNOWN) — only STRUCTURAL absence faults
         if f.get("status") not in ("confirmed", "suspected", "cleared", "watch", "unknown"):
             return None, f"unknown finding status {f.get('status')!r}"
+        if not isinstance(f.get("scope") or {}, dict):
+            return None, f"finding scope not a mapping: {str(f.get('scope'))[:60]}"
+        if f.get("allocation") is not None and not isinstance(f.get("allocation"), dict):
+            return None, "finding allocation not a mapping"
         gen = fb.get("generated_at") or ""
         vu = fb.get("valid_until") or ""
         try:
@@ -337,7 +354,10 @@ def build_overlays(cfg):
         existing = json.loads(OVERLAYS.read_text()) if OVERLAYS.exists() else []
     except Exception:
         existing = []
-    by_pid = {o.get("patch_id"): o for o in existing if o.get("expires_at")}
+    # only UNEXPIRED overlays count as active holders (sol t9#11: an expired
+    # patch in by_pid bypassed the seen-findings check and re-armed the hold)
+    by_pid = {o.get("patch_id"): o for o in existing if o.get("expires_at")
+              and _parse_iso(o["expires_at"]) > now}
     # processed-finding identity outlives overlay lifetime (sol turn-7 Q3-2):
     # a finding whose hold EXPIRED never silently re-arms from the same id
     seen_path = POLICY_DIR / "seen-findings.json"
@@ -378,6 +398,8 @@ def build_overlays(cfg):
                                 finding_id=fid)
         elif code == "namespace_prepare_failure" and scope.get("namespace"):
             pid = "nh-" + _sha8(fid)
+            if not by_pid.get(pid) and seen.get(fid):
+                continue
             if pid in by_pid and datetime.fromisoformat(by_pid[pid]["expires_at"]) > now:
                 _receipt("keep_base", patch_id=pid, finding_id=fid, reason="active overlay cites this finding")
                 continue
@@ -396,6 +418,8 @@ def build_overlays(cfg):
                                 finding_id=fid)
         elif code == "route_starved" and scope.get("route") and isinstance(f.get("allocation"), dict):
             pid = "dp-" + _sha8(fid)
+            if not by_pid.get(pid) and seen.get(fid):
+                continue
             if pid in by_pid and datetime.fromisoformat(by_pid[pid]["expires_at"]) > now:
                 _receipt("keep_base", patch_id=pid, finding_id=fid, reason="active overlay cites this finding")
                 continue
@@ -683,7 +707,14 @@ def falsify_pass():
                 continue  # window still open
             route = (c.get("scope") or {}).get("route") or ""
             w_end = now.isoformat(timespec="seconds")
-            rows = [json.loads(x) for x in open(DREAM_LEDGER).read_text().splitlines()] if DREAM_LEDGER.exists() else []
+            try:
+                rows = [json.loads(x) for x in DREAM_LEDGER.read_text().splitlines()] \
+                    if DREAM_LEDGER.exists() else []
+            except Exception as e2:  # per-claim isolation (sol t9#12)
+                _falsify.consume(c["claim_id"], None, action="expire")
+                _falsify.mark_consumed(c["claim_id"])
+                notes.append(f"claim {c['claim_id']} expired (ledger unreadable: {e2!r})")
+                continue
             exposed = [r for r in rows if r.get("route") == route
                        and r.get("created_at", "") >= c["opened_at"]]
             if not exposed:

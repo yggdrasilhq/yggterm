@@ -101,9 +101,25 @@ def init_state(state=DEFAULT_STATE, workspace=DEFAULT_YAML, host=None):
         atomic_write_json(cls, classification_manifest())
     rep = load_replica(state) or {"host": host or socket.gethostname()}
     ws = Path(workspace).expanduser()
-    if "workspace_base" not in rep:
+    # an unset base OR a pre-ledger GENESIS base re-resolves against sealed
+    # releases: after the first accept, the base must track the accepted
+    # release or every later edit is mislabeled stale
+    if "workspace_base" not in rep or rep.get("workspace_base") == GENESIS_HASH:
         rep["workspace_base"] = GENESIS_HASH
-        rep["workspace_base_bytes_hash"] = _sha256(ws.read_bytes()) if ws.exists() else None
+        if ws.exists():
+            rep["workspace_base_bytes_hash"] = _sha256(ws.read_bytes())
+            # if the workspace bytes match a sealed release, the base IS that
+            # release's canonical hash (a genesis-constant base would mislabel
+            # every subsequent edit as stale, sol t9 regression L5)
+            rel_root = Path(state).expanduser() / "config" / "releases"
+            if rel_root.is_dir():
+                for d in rel_root.iterdir():
+                    ry = d / "release.yaml"
+                    if ry.exists() and _sha256(ry.read_bytes()) == rep["workspace_base_bytes_hash"]:
+                        rep["workspace_base"] = d.name
+                        break
+        else:
+            rep["workspace_base_bytes_hash"] = None
     _save_replica(state, "config", rep)
     return rep
 
@@ -190,6 +206,16 @@ def capture(state=DEFAULT_STATE, area="config", workspace=DEFAULT_YAML,
                     "change_id": lc.get("change_id"), "faults": faults}
 
         head = active_head(state) or {}
+        # the proposal parent is the WORKSPACE BASE the edit was made against
+        # (replica manifest hash), NEVER the latest head — an old-base edit
+        # must surface as stale and be re-ratified, not masquerade as fresh
+        # (sol t7#4 / t9#2)
+        base_hash = rep.get("workspace_base") or GENESIS_HASH
+        base_meta = None
+        for r in journal_records(state, area):
+            if r.get("canonical_hash") == base_hash:
+                base_meta = r
+                break
         cid = str(uuid.uuid4())
         ob = _sync_dir(state, area) / "outbox" / cid
         ob.mkdir(parents=True, exist_ok=True)
@@ -199,9 +225,11 @@ def capture(state=DEFAULT_STATE, area="config", workspace=DEFAULT_YAML,
             "area": area,
             "change_id": cid,
             "origin_host": rep.get("host") or socket.gethostname(),
-            "parent": {"authority_epoch": head.get("epoch") or 1,
-                       "revision": head.get("revision") or 0,
-                       "canonical_hash": head.get("content_hash") or GENESIS_HASH},
+            "parent": {"authority_epoch": (base_meta or {}).get("authority_epoch")
+                       or (head or {}).get("epoch") or 1,
+                       "revision": (base_meta or {}).get("revision") or 0,
+                       "canonical_hash": base_hash},
+            "workspace_base_bytes_hash": rep.get("workspace_base_bytes_hash"),
             "candidate_bytes_hash": bh,
             "claimed_principal": None,      # raw edits are unattributed
             "authority_ref": None,
@@ -243,8 +271,12 @@ def endorse_outbox(state=DEFAULT_STATE, area="config", change_id=None):
 # ------------------------------------------------------------- adjudication
 
 def _ingress_append(state, area, rec):
+    """First-receipt record: the durable ingress_seq AND the frozen identity
+    (candidate/envelope hashes) live HERE — replay adjudication compares
+    against this record, never against the mutable bundle (sol t9#3)."""
     j = _sync_dir(state, area) / "ingress.jsonl"
     j.parent.mkdir(parents=True, exist_ok=True)
+    rec["ingress_seq"] = len(_ingress_all(state, area)) + 1  # dev-sequenced
     with open(j, "a") as f:
         f.write(json.dumps(rec, sort_keys=True) + "\n")
         f.flush()
@@ -300,15 +332,23 @@ def adjudicate(state=DEFAULT_STATE, area="config"):
                     if cid.name in known:
                         continue
                     if (cid / "envelope.json").exists():
+                        env_i = json.loads((cid / "envelope.json").read_text())
+                        cand_i = (cid / "candidate.yaml").read_bytes()
                         _ingress_append(state, area, {
                             "change_id": cid.name, "origin_host": hostdir.name,
+                            "candidate_bytes_hash": env_i.get("candidate_bytes_hash"),
+                            "envelope_hash": _sha256(json.dumps(env_i, sort_keys=True).encode()),
                             "received_at": _now()})
         # local outbox proposals too (dev proposes to itself the same way)
         for cid_dir in sorted((base / "outbox").glob("*/")):
             if cid_dir.name in known or not (cid_dir / "envelope.json").exists():
                 continue
+            env_i = json.loads((cid_dir / "envelope.json").read_text())
+            cand_i = (cid_dir / "candidate.yaml").read_bytes()
             _ingress_append(state, area, {"change_id": cid_dir.name,
                                           "origin_host": "dev-local",
+                                          "candidate_bytes_hash": env_i.get("candidate_bytes_hash"),
+                                          "envelope_hash": _sha256(json.dumps(env_i, sort_keys=True).encode()),
                                           "received_at": _now()})
 
         ingress = _ingress_all(state, area)
@@ -359,13 +399,14 @@ def _adjudicate_one(state, area, p):
             prior = d
             break
     if prior is not None:
-        old = load_proposal(state, area, cid, p.get("origin_host"))
-        if old is None:
-            old = load_proposal(state, area, cid)
-        same = old is not None and old["envelope"].get("candidate_bytes_hash") == bh
+        # identity comes from the PERSISTED first-receipt record (immutable),
+        # never from the mutable bundle on disk (sol t9#3)
+        ing = next((r for r in reversed(_ingress_all(state, area))
+                    if r.get("change_id") == cid), None)
+        same = ing is not None and ing.get("candidate_bytes_hash") == bh
         if not same:
             return {**base_detail, "decision": "ID_REUSE",
-                    "detail": "same change_id with different bytes; quarantined"}
+                    "detail": "same change_id with different bytes than first receipt; quarantined"}
         if prior["decision"] not in non_terminal:
             return {**base_detail, "decision": prior["decision"],
                     "detail": "identical replay acknowledged (idempotent)"}
@@ -422,16 +463,22 @@ def _adjudicate_one(state, area, p):
         "reason": env.get("reason") or f"sync batch accept from {p.get('origin_host')}",
     }
     final_bytes = canonical_json(final)  # canonical JSON form is valid YAML
+    # COMMIT ORDER (sol t7#3/t9#1): seal -> journal (fsync = commit point) ->
+    # activate. A journal failure leaves an uncommitted seal, never a moved
+    # pointer; recovery reads committed releases exclusively.
     r = accept(final_bytes, proposed_by=principal, authority_class=authority_class,
                parent_expected=head_hash, state_dir=state, change_id=cid,
-               reason=final["identity"]["reason"])
+               reason=final["identity"]["reason"], commit_point="seal-only")
     if r["decision"] != "accepted":
         return {**base_detail, "decision": r["decision"],
                 "detail": "; ".join(x["detail"] for x in r["faults"])[:200]}
 
     rec = _journal_record(state, area, r, env, principal,
                           release_bytes_hash=_release_bytes_sha(state, r.get("content_hash")))
-    _journal_append(state, area, rec)
+    _journal_append(state, area, rec)  # COMMIT POINT (fsync)
+    r = accept(final_bytes, proposed_by=principal, authority_class=authority_class,
+               parent_expected=head_hash, state_dir=state, change_id=cid,
+               reason=final["identity"]["reason"], commit_point="activate-only")
     _refresh_current_yaml(state)
     return {**base_detail, "decision": "accepted",
             "revision": r.get("revision"), "content_hash": r.get("content_hash")}
@@ -508,16 +555,33 @@ def journal_head(state=DEFAULT_STATE, area="config"):
 def journal_records(state=DEFAULT_STATE, area="config"):
     j = _ledger_dir(state, area) / "journal.jsonl"
     try:
-        return [json.loads(x) for x in j.read_text().splitlines() if x.strip()]
+        rows = []
+        for x in j.read_text().splitlines():
+            if not x.strip():
+                continue
+            try:
+                rows.append(json.loads(x))
+            except Exception:
+                continue  # a corrupt line is skipped for reads; quarantine
+                          # and recovery live in verify_ancestry/load()
+        return rows
     except FileNotFoundError:
+        return []
+    except OSError:
         return []
 
 
 def verify_ancestry(state=DEFAULT_STATE, area="config", records=None):
     """Chain verification: recompute every event_hash. -> (ok, bad_index).
-    records=None verifies the local journal; a list verifies that list."""
-    prev = GENESIS_HASH
+    records=None verifies the local journal from genesis; a list is verified
+    as either a full chain (from genesis) or a continuation of the LOCAL
+    head (sol t9#5)."""
     recs = journal_records(state, area) if records is None else records
+    local = journal_records(state, area)
+    prev = GENESIS_HASH
+    if records is not None and local:
+        if records and records[0].get("previous_event_hash") == local[-1].get("event_hash"):
+            prev = local[-1].get("event_hash")  # continuation suffix
     for i, rec in enumerate(recs):
         if rec["previous_event_hash"] != prev:
             return False, i
@@ -585,10 +649,13 @@ def install_accepted(state, release_hash, origin_bytes=None, area="config",
             return {"installed": False, "detail": f"shipped journal chain broken at record {bad}"}
         if shipped_journal[-1].get("canonical_hash") != release_hash:
             return {"installed": False, "detail": "shipped journal head does not name this release"}
-        # ...AND continuous with the replica's own accepted history
-        if local:
-            if shipped_journal[0].get("previous_event_hash") != local[-1]["event_hash"]:
+        # trim to the suffix the replica lacks, then require continuity
+        known = {r.get("event_hash") for r in local}
+        suffix = [r for r in shipped_journal if r.get("event_hash") not in known]
+        if local and suffix:
+            if suffix[0].get("previous_event_hash") != local[-1]["event_hash"]:
                 return {"installed": False, "detail": "shipped journal does not continue local ancestry"}
+        shipped_journal = suffix
         vouched = True
     else:
         # no shipped records: the LOCAL journal must already vouch the hash
@@ -620,9 +687,36 @@ def install_accepted(state, release_hash, origin_bytes=None, area="config",
     atomic_write_json(_paths(st)["checkpoint"], body)
     _refresh_current_yaml(state)
 
+    # persist the shipped acceptance records into the LOCAL journal so a
+    # later pointer corruption recovers from committed history (sol t9#5)
+    if shipped_journal:
+        j = _ledger_dir(state, area) / "journal.jsonl"
+        j.parent.mkdir(parents=True, exist_ok=True)
+        existing = {r.get("event_hash") for r in journal_records(state, area)}
+        with open(j, "a") as f:
+            for r in shipped_journal:
+                if r.get("event_hash") not in existing:
+                    f.write(json.dumps(r, sort_keys=True) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        headj = journal_records(state, area)
+        if headj:
+            atomic_write_json(_ledger_dir(state, area) / "head.json",
+                              {"revision": headj[-1].get("revision"),
+                               "canonical_hash": headj[-1].get("canonical_hash"),
+                               "event_hash": headj[-1].get("event_hash")})
     rep = load_replica(state, area) or dict(old_rep)
     rep["installed_head"] = target
     rep["active_head"] = target
+    # a CLEAN workspace (bytes == installed release) advances its base with
+    # the install; a dirty workspace keeps its base (never auto-overwritten)
+    try:
+        wsp = Path(str(workspace).replace("~", str(Path.home())))
+        if wsp.exists() and _sha256(wsp.read_bytes()) == _sha256(rel_yaml.read_bytes()):
+            rep["workspace_base"] = release_hash
+            rep["workspace_base_bytes_hash"] = _sha256(wsp.read_bytes())
+    except Exception:
+        pass
     _save_replica(state, area, rep)
     ipath.unlink(missing_ok=True)
     return {"installed": True, "target": target}

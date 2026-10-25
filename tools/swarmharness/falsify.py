@@ -107,6 +107,11 @@ def evaluate(claim_id_, *, window_start, window_end, route, exposed_tasks,
     if held_only:
         verdict, disposition = None, "undetermined"
         reason = "no eligible exposure in window (work held) — unknown, not success"
+    elif confounders:
+        # an explicit confounder poisons support: helped-with-confounder is
+        # the classic overclaim (sol t9#12)
+        verdict, disposition = "confounded", "undetermined"
+        reason = f"confounders present: {confounders[:3]}"
     elif failed_tasks == 0 and outcome_tasks > 0:
         verdict, disposition = "helped", "supported"
         reason = f"{outcome_tasks} post-policy attempts, 0 recurrences of the falsifier"

@@ -62,6 +62,11 @@ def select_editor(scenario_id, trigger, campaign_ref=None, authority_ref="owner"
                 "trigger": trigger, "permitted": permitted}
     scope = scen.get("scope") or {}
     camp_refs = scope.get("campaign_refs") or []
+    # a SCOPED scenario cannot be exercised without naming the campaign —
+    # an omitted campaign_ref must refuse, not silently pass (sol t9#8)
+    if camp_refs and not campaign_ref:
+        return {"decision": "out_of_scope", "scenario": scenario_id,
+                "detail": "scenario declares campaign_refs; campaign_ref required"}
     if campaign_ref and camp_refs and campaign_ref not in camp_refs:
         return {"decision": "out_of_scope", "scenario": scenario_id,
                 "campaign_ref": campaign_ref, "scope": camp_refs}
@@ -83,6 +88,11 @@ def select_editor(scenario_id, trigger, campaign_ref=None, authority_ref="owner"
                 "policy": scen.get("on_no_eligible_editor"),
                 "reasons": reasons}
 
+    # a 0 allowance means NO swaps, ever — refuse before any accounting
+    limit0 = act.get("max_swaps_per_incident")
+    if limit0 is not None and int(limit0) <= 0:
+        return {"decision": "swap_budget_exhausted", "scenario": scenario_id,
+                "swaps_so_far": 0, "limit": 0}
     # swap budget per incident
     if incident_id:
         inc_dir = _dir(state) / "incidents"
@@ -103,6 +113,37 @@ def select_editor(scenario_id, trigger, campaign_ref=None, authority_ref="owner"
     try:
         epoch = current_epoch(state) + 1
         sc.atomic_write(_epoch_path(state), str(epoch).encode())
+        # selection publication + incident accounting share the epoch lock so
+        # a race cannot mint two selections at one epoch (sol t9#8)
+        sel = {
+            "scenario": scenario_id, "trigger": trigger, "campaign_ref": campaign_ref,
+            "selected_binding_ref": chosen, "config_revision": (sc.active_head(state) or {}).get("content_hash"),
+            "editorial_epoch": epoch, "evidence_refs": evidence_refs or [],
+            "authority_ref": authority_ref, "ttl_seconds": act.get("ttl_seconds"),
+            "expires_at": None, "at": sc._now(), "skipped": reasons,
+        }
+        if act.get("ttl_seconds"):
+            from datetime import datetime, timedelta, timezone
+            sel["expires_at"] = (datetime.now(timezone.utc)
+                                 + timedelta(seconds=int(act["ttl_seconds"]))
+                                 ).strftime("%Y-%m-%dT%H:%M:%SZ")
+        d = _dir(state)
+        d.mkdir(parents=True, exist_ok=True)
+        sc.atomic_write_json(d / "current-editor.json", sel)
+        with open(d / "selections.jsonl", "a") as f:
+            f.write(json.dumps(sel, sort_keys=True) + "\n")
+            f.flush()
+            import os as _os
+            _os.fsync(f.fileno())
+        if incident_id:
+            inc_dir = d / "incidents"
+            inc_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                rec = json.loads((inc_dir / f"{incident_id}.json").read_text())
+            except Exception:
+                rec = {"swaps": []}
+            rec["swaps"].append({"at": sel["at"], "to": chosen, "epoch": epoch})
+            sc.atomic_write_json(inc_dir / f"{incident_id}.json", rec)
     finally:
         _fcntl.flock(_lk, _fcntl.LOCK_UN)
         _lk.close()
@@ -118,23 +159,6 @@ def select_editor(scenario_id, trigger, campaign_ref=None, authority_ref="owner"
         sel["expires_at"] = (datetime.now(timezone.utc)
                              + timedelta(seconds=int(act["ttl_seconds"]))
                              ).strftime("%Y-%m-%dT%H:%M:%SZ")
-    d = _dir(state)
-    d.mkdir(parents=True, exist_ok=True)
-    sc.atomic_write_json(d / "current-editor.json", sel)
-    with open(d / "selections.jsonl", "a") as f:
-        f.write(json.dumps(sel, sort_keys=True) + "\n")
-        f.flush()
-        import os
-        os.fsync(f.fileno())
-    if incident_id:
-        inc_dir = d / "incidents"
-        inc_dir.mkdir(parents=True, exist_ok=True)
-        try:
-            rec = json.loads((inc_dir / f"{incident_id}.json").read_text())
-        except Exception:
-            rec = {"swaps": []}
-        rec["swaps"].append({"at": sel["at"], "to": chosen, "epoch": epoch})
-        sc.atomic_write_json(inc_dir / f"{incident_id}.json", rec)
     return {"decision": "selected", **sel}
 
 

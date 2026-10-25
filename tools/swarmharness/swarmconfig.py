@@ -58,6 +58,7 @@ OWNER_ONLY_PREFIXES = (
     "supply.budgets",          # budgets/reserves: never agent-writable (sol t7)
     "supply.maintenance_reserve_ref",
     "campaign_policies",       # authorization + allocation envelopes: owner/delegate only
+    "editor_scenarios",        # swap triggers/authority: owner policy (sol t9#8)
 )
 
 
@@ -285,6 +286,9 @@ def validate(cfg):
             _fault(f, "type_mismatch", f"{sec}: expected mapping, got {type(cfg[sec]).__name__}")
 
     ident = cfg.get("identity") or {}
+    if not isinstance(ident, dict):
+        _fault(f, "type_mismatch", f"identity: expected mapping, got {type(ident).__name__}")
+        ident = {}
     _keys(f, "identity", ident, _IDENTITY_KEYS, _IDENTITY_KEYS)
     for k, spec in _IDENTITY_KEYS.items():
         if k in ident:
@@ -350,7 +354,14 @@ def validate(cfg):
 
     # --- catalog: harnesses/providers/accounts/plans/bindings
     cat = cfg.get("catalog") or {}
+    if not isinstance(cat, dict):
+        _fault(f, "type_mismatch", f"catalog: expected mapping, got {type(cat).__name__}")
+        cat = {}
     _keys(f, "catalog", cat, {"harnesses", "providers", "accounts", "plans", "bindings"})
+    for space in ("harnesses", "providers", "accounts", "plans", "bindings"):
+        if cat.get(space) is not None and not isinstance(cat[space], dict):
+            _fault(f, "type_mismatch", f"catalog.{space}: expected mapping")
+            cat[space] = {}
     harnesses = cat.get("harnesses") or {}
     for hid, h in harnesses.items():
         _keys(f, f"catalog.harnesses.{hid}", h, {"kind", "adapter_ref"}, {"kind"})
@@ -402,7 +413,13 @@ def validate(cfg):
 
     # --- planes: owner policy separated from observed health
     planes = cfg.get("planes") or {}
+    if not isinstance(planes, dict):
+        _fault(f, "type_mismatch", f"planes: expected mapping, got {type(planes).__name__}")
+        planes = {}
     for plid, pl in planes.items():
+        if not isinstance(pl, dict):
+            _fault(f, "type_mismatch", f"planes.{plid}: expected mapping")
+            continue
         _keys(f, f"planes.{plid}", pl,
               {"owner_policy", "binding_refs", "allowed_task_classes",
                "health_contract", "budget_refs", "note"},
@@ -572,6 +589,10 @@ def deny_list(state_dir=DEFAULT_STATE):
     now = _now()
     latches = {}
     for k, v in (data.get("latches") or {}).items():
+        if not isinstance(v, dict):
+            return {"__denies_corrupt__": {
+                "reason": f"deny store has malformed latch {k!r} — containment",
+                "set_by": "kernel", "set_at": None, "expires_at": None}}
         exp = v.get("expires_at")
         if exp and exp <= now:
             continue
@@ -849,18 +870,20 @@ def accept(cfg_or_bytes, *, proposed_by, authority_class="owner",
         "content_hash": h, "change_id": cid}})
 
 
-def ack(consumer, state_dir=DEFAULT_STATE):
-    """A consumer acknowledges the ACTIVE revision (distinct from accepted/
-    installed: the consumer has loaded and is operating on it)."""
-    head = active_head(state_dir)
-    if not head:
-        return {"ok": False, "detail": "no active revision to acknowledge"}
+def ack(consumer, state_dir=DEFAULT_STATE, revision_hash=None):
+    """A consumer acknowledges the revision it has actually LOADED and is
+    operating on — the pointer alone proves nothing (sol t9#6: a recovered
+    last_good must not be acked as the pointer's revision). Callers pass the
+    content_hash from their LoadResult; None refuses (no blind acks)."""
+    if not revision_hash:
+        return {"ok": False, "detail": "ack requires the loaded revision hash "
+                                       "(pointer observation is not consumption)"}
     d = Path(state_dir).expanduser() / "config" / "acks"
     d.mkdir(parents=True, exist_ok=True)
     atomic_write_json(d / f"{consumer}.json",
-                      {"consumer": consumer, "content_hash": head["content_hash"],
-                       "revision": head.get("revision"), "at": _now()})
-    return {"ok": True, "revision": head.get("revision")}
+                      {"consumer": consumer, "content_hash": revision_hash,
+                       "at": _now()})
+    return {"ok": True, "revision": revision_hash[:12]}
 
 
 def acks(state_dir=DEFAULT_STATE):
