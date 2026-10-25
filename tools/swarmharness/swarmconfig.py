@@ -55,6 +55,9 @@ OWNER_ONLY_PREFIXES = (
     "catalog.providers",
     "catalog.plans",
     "catalog.accounts",
+    "supply.budgets",          # budgets/reserves: never agent-writable (sol t7)
+    "supply.maintenance_reserve_ref",
+    "campaign_policies",       # authorization + allocation envelopes: owner/delegate only
 )
 
 
@@ -184,7 +187,11 @@ def parse_yaml_bytes(data: bytes):
         return None, {"code": "size_bound",
                       "detail": f"{len(data)} bytes exceeds {MAX_BYTES}"}
     try:
-        cfg = yaml.load(data.decode("utf-8"), Loader=_DupCheckLoader)
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as e:
+        return None, {"code": "yaml_syntax", "detail": f"invalid UTF-8: {e}"}
+    try:
+        cfg = yaml.load(text, Loader=_DupCheckLoader)
     except yaml.YAMLError as e:
         msg = str(e)
         code = "duplicate_key" if "duplicate key" in msg else "yaml_syntax"
@@ -295,8 +302,13 @@ def validate(cfg):
         _fault(f, "invariant_violation", "identity.change_id must be a UUID")
 
     fleet = cfg.get("fleet") or {}
+    if not isinstance(fleet, dict):
+        _fault(f, "type_mismatch", f"fleet: expected mapping, got {type(fleet).__name__}")
+        fleet = {}
     _keys(f, "fleet", fleet, {"authority_host", "hosts", "dispatch_host", "failover"})
     hosts = fleet.get("hosts")
+    if not isinstance(hosts, list):
+        hosts = []  # fault already recorded; keep later checks type-safe
     if not isinstance(hosts, list) or not hosts or not all(isinstance(h, str) and h for h in hosts):
         _fault(f, "type_mismatch", "fleet.hosts: non-empty string list")
     if len(set(hosts or [])) != len(hosts or []):
@@ -542,13 +554,21 @@ def _deny_path(state_dir):
 
 
 def deny_list(state_dir=DEFAULT_STATE):
+    """-> latches dict. A CORRUPT store returns a deny-everything sentinel:
+    unreadable owner stops must contain, never reopen, stopped work."""
     p = _deny_path(state_dir)
     try:
         data = json.loads(p.read_text())
     except FileNotFoundError:
         return {}
-    except Exception:
-        return {}
+    except Exception as e:
+        return {"__denies_corrupt__": {
+            "reason": f"deny store unreadable — containment until owner repairs: {e!r}"[:180],
+            "set_by": "kernel", "set_at": None, "expires_at": None}}
+    if not isinstance(data, dict) or not isinstance(data.get("latches", {}), dict):
+        return {"__denies_corrupt__": {
+            "reason": "deny store malformed — containment until owner repairs",
+            "set_by": "kernel", "set_at": None, "expires_at": None}}
     now = _now()
     latches = {}
     for k, v in (data.get("latches") or {}).items():
@@ -623,6 +643,19 @@ def _read_release(P, h):
     return obj
 
 
+def _committed_hashes(state_dir):
+    """-> set of canonical_hashes with a journal acceptance record, or None
+    when no journal exists yet (all sealed releases count as committed)."""
+    j = Path(state_dir).expanduser() / "ledger" / "config" / "journal.jsonl"
+    try:
+        rows = [json.loads(x) for x in j.read_text().splitlines() if x.strip()]
+    except FileNotFoundError:
+        return set()  # no journal: nothing is committed (the append IS the commit point)
+    except Exception:
+        return set()  # unreadable journal: trust nothing
+    return {r.get("canonical_hash") for r in rows if r.get("canonical_hash")}
+
+
 def load(state_dir=DEFAULT_STATE, live_yaml=DEFAULT_YAML):
     """Structured LoadResult. Precedence: verified checkpoint (active) ->
     newest re-validating release (last_good) -> containment_only. Deny
@@ -667,11 +700,15 @@ def load(state_dir=DEFAULT_STATE, live_yaml=DEFAULT_YAML):
                                       "change_id": head.get("change_id")}
 
     if result["mode"] != "active":
-        # last_good: newest re-validating release regardless of head pointer
+        # last_good: newest COMMITTED release — a journal record must vouch
+        # for the hash; sealed-but-uncommitted seals are not recoverable state
+        committed = _committed_hashes(state_dir)
         best = None
         if P["releases"].is_dir():
             for d in sorted(P["releases"].iterdir()):
                 if not d.is_dir() or not HEX64.fullmatch(d.name):
+                    continue
+                if committed is not None and d.name not in committed:
                     continue
                 cfg = _read_release(P, d.name)
                 if cfg is None or validate(cfg):
@@ -702,7 +739,7 @@ def load(state_dir=DEFAULT_STATE, live_yaml=DEFAULT_YAML):
 
 def accept(cfg_or_bytes, *, proposed_by, authority_class="owner",
            parent_expected=None, state_dir=DEFAULT_STATE,
-           change_id=None, reason=""):
+           change_id=None, reason="", commit_point="all"):
     """Validation -> authorization -> seal -> CAS activation. Returns a
     receipt dict. NEVER mutates activated state on any rejection."""
     P = _paths(state_dir)
@@ -770,12 +807,20 @@ def accept(cfg_or_bytes, *, proposed_by, authority_class="owner",
                     "detail": f"unauthorized semantic paths for {authority_class}: {bad[:8]}"})
                 return finish("rejected_unauthorized")
 
-    # seal the immutable release, then CAS the activation pointer
+    # seal the immutable release, then CAS the activation pointer.
+    # commit_point: "seal-only" (ledger writes the journal first and re-enters
+    # with "activate-only" — the journal append is the commit point, sol t7 #3);
+    # "all" (default) = seal + activate for direct local activation.
     rdir = P["releases"] / h
     rdir.mkdir(parents=True, exist_ok=True)
     if raw is not None:
         atomic_write(rdir / "release.yaml", raw)
     atomic_write_json(rdir / "release.json", cfg)
+    if commit_point == "seal-only":
+        return finish("accepted", {"sealed": True, "revision": {
+            "epoch": (cfg.get("identity") or {}).get("authority_epoch"),
+            "revision": (cfg.get("identity") or {}).get("revision"),
+            "content_hash": h, "change_id": cid}})
 
     ident = cfg.get("identity") or {}
     pointer = {"content_hash": h,

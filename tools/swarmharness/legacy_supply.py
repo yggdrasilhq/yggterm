@@ -49,9 +49,10 @@ def request_cutover(actor, state=sc.DEFAULT_STATE):
 
 
 def render_floors(cfg_sw):
-    """-> floors-shaped dict projected from the v2 config, tagged with its
-    revision. Deterministic; the generated file is a compatibility artifact,
-    never independently editable post-cutover."""
+    """-> floors-shaped dict projected from the v2 config, tagged with the
+    CURRENT revision (sol t7 #9: the tag binds content to the active head,
+    not the parent). Deterministic; the generated file is a compatibility
+    artifact, never independently editable post-cutover."""
     supply = (cfg_sw or {}).get("supply") or {}
     schedules = supply.get("schedules") or {}
     admission = supply.get("admission") or {}
@@ -60,29 +61,40 @@ def render_floors(cfg_sw):
         "_generated_by": "swarmharness/legacy_supply.render_floors",
         "_config_revision": {"epoch": ident.get("authority_epoch"),
                              "revision": ident.get("revision"),
-                             "canonical_hash": ident.get("parent_hash")},
-        "namespaces": [],
+                             "canonical_hash": ident.get("parent_hash"),
+                             "current_hash": sc.content_hash(cfg_sw or {})},
+        "namespaces": supply.get("namespaces") or [],
         "peak": schedules.get("peak_window"),
+        "wake_interval_min": schedules.get("wake_interval_min"),
         "admission": admission,
+        "retry_policy": supply.get("retry_policy") or {},
+        "budgets_tags": sorted((supply.get("budgets") or {}).keys()),
         "namespaces_ref": supply.get("namespaces_ref"),
         "note": "post-cutover compatibility artifact; edit swarm-config.yaml instead",
     }
 
 
 def verify_generated(floors_bytes, cfg_sw):
-    """Reject independent edits to the generated artifact: its revision tag
-    must match the ACTIVE config revision."""
+    """CONTENT verification (sol t7 #9): the artifact must byte-match a fresh
+    rendering from the active config — a stale tag alone proves nothing."""
+    active = sc.active_head()
+    if not active:
+        return {"ok": True, "note": "no active head; nothing to compare"}
     try:
         f = json.loads(floors_bytes)
     except Exception:
         return {"ok": False, "reason": "unreadable"}
-    active = sc.active_head()
-    tag = f.get("_config_revision") or {}
-    if not active:
-        return {"ok": True, "note": "no active head; nothing to compare"}
-    if tag.get("canonical_hash") != active.get("content_hash"):
+    tag = (f.get("_config_revision") or {})
+    if tag.get("current_hash") != active.get("content_hash"):
         return {"ok": False,
-                "reason": f"generated floors tagged {str(tag.get('canonical_hash'))[:12]} "
-                          f"but active config is {active.get('content_hash')[:12]} — "
-                          f"independent edit detected; regenerate from swarm-config"}
+                "reason": f"generated floors tagged {str(tag.get('current_hash'))[:12]} "
+                          f"but active config is {active.get('content_hash')[:12]} — regenerate"}
+    fresh = render_floors(cfg_sw)
+    f2 = json.loads(json.dumps(f))
+    f2.pop("_generated_by", None)
+    fresh.pop("_generated_by", None)
+    if f2 != fresh:
+        return {"ok": False,
+                "reason": "content differs from the canonical rendering — "
+                          "independent edit detected; regenerate from swarm-config"}
     return {"ok": True}

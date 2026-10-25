@@ -88,12 +88,12 @@ def reconcile(state=sc.DEFAULT_STATE):
     cfg = _cfg(res)
     rep = sl.init_state(state)
     cap = sl.capture(state)
-    verdicts = sl.adjudicate(state)
     head = sc.active_head(state) or {}
 
     out = {"role": "controller", "captured": cap.get("captured"),
-           "verdicts": {v["change_id"]: v["decision"] for v in verdicts},
            "head": head.get("content_hash", "")[:12], "hosts": {}}
+    # NO adjudication before remote collection: the frozen batch must include
+    # every reachable host's proposals or same-batch owner priority is a lie
 
     sync_dir = Path(state).expanduser() / "sync" / "config"
     inbox = sync_dir / "inbox"
@@ -138,11 +138,20 @@ def reconcile(state=sc.DEFAULT_STATE):
     # 4. publish + install on replicas (verified bundles only)
     if head:
         rel_dir = sc._paths(Path(state).expanduser())["releases"] / head["content_hash"]
-        payload = b""
-        for name in ("release.yaml", "release.json"):
-            f = rel_dir / name
-            if f.exists():
-                payload += b"\n===FILE=== " + name.encode() + b"\n" + f.read_bytes()
+        import io as _io, tarfile as _tarfile
+        _buf = _io.BytesIO()
+        with _tarfile.open(fileobj=_buf, mode="w") as _tf:
+            for _name in ("release.yaml", "release.json"):
+                _f = rel_dir / _name
+                if _f.exists():
+                    _data = _f.read_bytes()
+                    _ti = _tarfile.TarInfo(_name)
+                    _ti.size = len(_data)
+                    _tf.addfile(_ti, _io.BytesIO(_data))
+        payload = _buf.getvalue()
+        pub_local = Path(state).expanduser() / "sync" / "config" / "published"
+        pub_local.mkdir(parents=True, exist_ok=True)
+        (pub_local / "bundle.tar").write_bytes(payload)
         for host in out["hosts"]:
             if not out["hosts"][host].get("reachable"):
                 out["hosts"][host]["install"] = "pending"
@@ -238,20 +247,25 @@ def supervise_executor(state, cfg, unit=DEFAULT_EXECUTOR_UNIT):
     sup = ((cfg.get("maintenance") or {}).get("supervisor")) or {}
     rl = sup.get("restart_limit") or {"attempts": 3, "window_seconds": 900}
     r = subprocess.run(["systemctl", "--user", "is-active", unit],
-                       capture_output=True, text=True)
+                       capture_output=True, text=True, timeout=15)
     active = r.returncode == 0 and r.stdout.strip() == "active"
-    now = time.time()
     entry = {"unit": unit, "active": active, "checked_at": sc._now()}
     if not active:
+        # FAILED restart attempts count toward the window too (sol t7 #6):
+        # an unbounded rc=5 loop must escalate, not spin
         recent = _incidents_read(state, unit, window=rl.get("window_seconds", 900))
         if len(recent) >= rl.get("attempts", 3):
             entry["action"] = "escalated"
             _incident_append(state, {"unit": unit, "action": "escalate-to-owner",
                                      "attempts_in_window": len(recent), "at": sc._now()})
         else:
-            r2 = subprocess.run(["systemctl", "--user", "restart", unit],
-                                capture_output=True, text=True)
-            entry["action"] = "restarted" if r2.returncode == 0 else f"restart-failed rc={r2.returncode}"
+            try:
+                r2 = subprocess.run(["systemctl", "--user", "restart", unit],
+                                    capture_output=True, text=True, timeout=20)
+                rc = r2.returncode
+            except subprocess.TimeoutExpired:
+                rc = -1
+            entry["action"] = "restarted" if rc == 0 else f"restart-failed rc={rc}"
             _incident_append(state, {"unit": unit, "action": entry["action"], "at": sc._now()})
     return entry
 
@@ -266,7 +280,7 @@ def _incidents_read(state, unit, window):
             except Exception:
                 continue
             # incident timestamps are ISO; parse just the restarts for this unit
-            if rec.get("unit") == unit and rec.get("action") == "restarted":
+            if rec.get("unit") == unit and rec.get("action") in ("restarted", "restart-failed"):
                 import datetime
                 try:
                     ts = datetime.datetime.strptime(rec["at"], "%Y-%m-%dT%H:%M:%SZ")
@@ -300,11 +314,16 @@ def maintenance_pass(state=sc.DEFAULT_STATE):
     except Exception as e:  # noqa: BLE001 — the supervisor never dies from a sync fault
         out["sync_fault"] = repr(e)[:200]
     if cfg:
-        try:
-            out["executor"] = supervise_executor(state, cfg)
-        except FileNotFoundError:
-            out["executor"] = {"unit": DEFAULT_EXECUTOR_UNIT, "active": None,
-                               "note": "systemctl unavailable"}
+        dispatch = (cfg.get("fleet") or {}).get("dispatch_host")
+        if dispatch and host != dispatch:
+            out["executor"] = {"unit": DEFAULT_EXECUTOR_UNIT, "supervised": False,
+                               "note": f"executor runs on {dispatch}; not supervised here"}
+        else:
+            try:
+                out["executor"] = supervise_executor(state, cfg)
+            except FileNotFoundError:
+                out["executor"] = {"unit": DEFAULT_EXECUTOR_UNIT, "active": None,
+                                   "note": "systemctl unavailable"}
     out["elapsed_s"] = round(time.time() - started, 2)
     hb = Path(state).expanduser() / "supervisor.json"
     sc.atomic_write_json(hb, out)
@@ -318,7 +337,7 @@ def daemon(state, interval=None):
             interval = interval or _poll_seconds(_cfg(res))
             out = maintenance_pass(state)
             print(json.dumps({"at": out["at"], "role": out["role"],
-                              "mode": out["config_mode"]}, flush=True))
+                              "mode": out["config_mode"]}), flush=True)
         except Exception as e:  # noqa: BLE001 — containment posture, never crash
             print(f"maintenance fault (contained): {e!r}", file=sys.stderr, flush=True)
             interval = interval or 30
