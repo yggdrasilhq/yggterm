@@ -203,10 +203,10 @@ def save_state(st):
 POLICY_DIR = HOME / ".yggterm/dream/policy"
 try:
     import falsify as _falsify  # kernel sibling: claim/exposure/evaluation ledger
-except ImportError:  # any run context: find the kernel beside the verb/repo
+except ImportError:  # any run context: find the kernel dir beside the verb/repo
     _here = Path(__file__).resolve()
-    for _kp in (_here.parents[3] / "tools", _here.parent,
-                HOME / "gh" / "yggterm" / "tools",
+    for _kp in (_here.parents[3] / "tools" / "swarmharness", _here.parent,
+                HOME / "gh" / "yggterm" / "tools" / "swarmharness",
                 HOME / ".yggterm" / "swarmkernel"):
         if (_kp / "falsify.py").exists():
             sys.path.insert(0, str(_kp))
