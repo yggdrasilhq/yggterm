@@ -567,11 +567,20 @@ def enqueue(cfg, route, ns, kind, moderate, prompt):
 
 
 def cmd_topup(cfg):
-    try:  # the spawner timer acks the revision it will operate on
+    try:  # the spawner timer acks the revision topup dispatch will consume
         from swarmharness import swarmconfig as _sc3
-        _res3 = _sc3.load()
-        if _res3.get("revision"):
-            _sc3.ack("spawner-timer", revision_hash=_res3["revision"]["content_hash"])
+        global _SWRES
+        if _SWRES is None:
+            here = Path(__file__).resolve()
+            for kpath in [here.parents[3] / "tools", here.parent,
+                          HOME / "gh" / "yggterm" / "tools"]:
+                if (kpath / "swarmharness" / "__init__.py").exists():
+                    sys.path.insert(0, str(kpath))
+                    break
+            from swarmharness import swarmconfig as _scmod
+            _SWRES = _scmod.load()
+        if _SWRES and _SWRES.get("revision"):
+            _sc3.ack("spawner-timer", revision_hash=_SWRES["revision"]["content_hash"])
     except Exception:
         pass
     st = load_state()
@@ -700,23 +709,20 @@ def falsify_pass():
     affected route's audit rows inside the window; one idempotent evaluation;
     then retain (supported) / rollback (falsified) / expire (undetermined)."""
     notes = []
-    try:
-        now = datetime.now(IST)
-        for c in _falsify.open_claims():
+    now = datetime.now(IST)
+    for c in _falsify.open_claims():
+        # FULL per-claim isolation (sol t11#12): claim parsing, ledger
+        # collection, evaluation, consume — every step of claim N is wrapped
+        # so claim N+1 is always evaluated
+        try:
             dl_min = c.get("observation_deadline_min") or 60
             opened = datetime.fromisoformat(c["opened_at"])
             if (now - opened).total_seconds() < dl_min * 60:
                 continue  # window still open
             route = (c.get("scope") or {}).get("route") or ""
             w_end = now.isoformat(timespec="seconds")
-            try:
-                rows = [json.loads(x) for x in DREAM_LEDGER.read_text().splitlines()] \
-                    if DREAM_LEDGER.exists() else []
-            except Exception as e2:  # per-claim isolation (sol t9#12)
-                _falsify.consume(c["claim_id"], None, action="expire")
-                _falsify.mark_consumed(c["claim_id"])
-                notes.append(f"claim {c['claim_id']} expired (ledger unreadable: {e2!r})")
-                continue
+            rows = [json.loads(x) for x in DREAM_LEDGER.read_text().splitlines()] \
+                if DREAM_LEDGER.exists() else []
             exposed = [r for r in rows if r.get("route") == route
                        and r.get("created_at", "") >= c["opened_at"]]
             if not exposed:
@@ -737,7 +743,6 @@ def falsify_pass():
                         outcome += 1
                         if a.get("verdict") in ("FAIL", "UNKNOWN") or a.get("issues"):
                             failed += 1
-            try:
                 ev = _falsify.evaluate(c["claim_id"], window_start=c["opened_at"],
                                        window_end=w_end, route=route,
                                        exposed_tasks=len(exposed), outcome_tasks=outcome,
@@ -752,11 +757,9 @@ def falsify_pass():
                     _falsify.consume(c["claim_id"], ev, action="expire")
                     notes.append(f"claim {c['claim_id']} undetermined — expired")
                 _falsify.mark_consumed(c["claim_id"])
-            except Exception as e3:  # per-claim isolation: claim N's fault
-                # never skips claim N+1 (sol t10#12)
-                notes.append(f"claim {c['claim_id']} evaluation fault: {e3!r}")
-    except Exception as e:  # noqa: BLE001 — falsification failures never stop supervision
-        notes.append(f"falsify_pass fault: {e!r}")
+        except Exception as e3:  # per-claim isolation: EVERY step of claim N
+            # is contained; claim N+1 is always evaluated (sol t11#12)
+            notes.append(f"claim {c['claim_id']} fault: {e3!r}")
     return notes
 
 
@@ -764,15 +767,29 @@ def cmd_supervise(cfg):
     ledger = {"t": int(time.time()), "audited": 0, "revoked": [], "rerouted": [], "held": [], "notes": []}
     # the v2 PERMISSION gate constrains supervise mutations too (sol t10#10):
     # reroutes and watch enqueues on a blocked route are suppressed here
-    v2_blocked_sup, v2_note_sup = v2_blocked_routes(cfg["routes"])
+    _watch_route = ((cfg.get("dreamers") or {}).get("ux_parity") or {}).get("route")         if isinstance(cfg.get("dreamers"), dict) else None
+    _gate_routes = list(cfg["routes"]) + ([_watch_route] if _watch_route and _watch_route not in cfg["routes"] else [])
+    v2_blocked_sup, v2_note_sup = v2_blocked_routes(_gate_routes)
     if v2_blocked_sup:
         print(f"orchestrator: supervise v2 gate — blocked: {sorted(v2_blocked_sup)}"
               + (f" ({v2_note_sup})" if v2_note_sup else ""))
-    try:  # consumer acknowledgement binds to the LOADED revision (sol t10#6)
+    # consumer acknowledgement binds to THE SAME LoadResult dispatch used
+    # (sol t11#6): SWRES is what v2_blocked_routes consumed, so it is what
+    # the ack certifies. Deferred: the module global is bound lazily there.
+    try:
         from swarmharness import swarmconfig as _sc2
-        _res = _sc2.load()
-        if _res.get("revision"):
-            _sc2.ack("dream-orchestrator", revision_hash=_res["revision"]["content_hash"])
+        global _SWRES
+        if _SWRES is None:
+            here = Path(__file__).resolve()
+            for kpath in [here.parents[3] / "tools", here.parent,
+                          HOME / "gh" / "yggterm" / "tools"]:
+                if (kpath / "swarmharness" / "__init__.py").exists():
+                    sys.path.insert(0, str(kpath))
+                    break
+            from swarmharness import swarmconfig as _scmod
+            _SWRES = _scmod.load()
+        if _SWRES and _SWRES.get("revision"):
+            _sc2.ack("dream-orchestrator", revision_hash=_SWRES["revision"]["content_hash"])
     except Exception:
         pass
     for fnote in falsify_pass():

@@ -583,10 +583,15 @@ def verify_ancestry(state=DEFAULT_STATE, area="config", records=None):
         if records and records[0].get("previous_event_hash") == local[-1].get("event_hash"):
             prev = local[-1].get("event_hash")  # continuation suffix
     for i, rec in enumerate(recs):
-        if rec["previous_event_hash"] != prev:
+        if not isinstance(rec, dict):
             return False, i
-        if rec["event_hash"] != _event_hash(rec, prev):
-            return False, i
+        try:
+            if rec.get("previous_event_hash") != prev:
+                return False, i
+            if rec.get("event_hash") != _event_hash(rec, prev):
+                return False, i
+        except (KeyError, TypeError):
+            return False, i  # malformed record: structural fault, never a crash
         prev = rec["event_hash"]
     return True, None
 
