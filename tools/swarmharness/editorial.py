@@ -54,14 +54,27 @@ def select_editor(scenario_id, trigger, campaign_ref=None, authority_ref="owner"
     scen = scenarios.get(scenario_id)
     if scen is None:
         return {"decision": "no_such_scenario", "scenario": scenario_id}
+    # TRIGGER + SCOPE enforcement (sol turn-7 #8): an unlisted trigger or an
+    # out-of-scope campaign can never drive a swap
+    permitted = scen.get("permitted_trigger_classes") or []
+    if permitted and trigger not in permitted:
+        return {"decision": "trigger_not_permitted", "scenario": scenario_id,
+                "trigger": trigger, "permitted": permitted}
+    scope = scen.get("scope") or {}
+    camp_refs = scope.get("campaign_refs") or []
+    if campaign_ref and camp_refs and campaign_ref not in camp_refs:
+        return {"decision": "out_of_scope", "scenario": scenario_id,
+                "campaign_ref": campaign_ref, "scope": camp_refs}
     act = scen.get("activation") or {}
     order = scen.get("binding_order") or []
     reasons = []
     chosen = None
     for ref in order:
         b = bindings.get(ref) or {}
-        if act.get("requires_admitted_target", True) and b.get("status") != "admitted":
-            reasons.append(f"{ref}: declared (not admitted) — skipped")
+        # UNCONDITIONAL admission check: a declared binding is never
+        # activatable, whatever the scenario's activation block says
+        if b.get("status") != "admitted":
+            reasons.append(f"{ref}: {b.get('status') or 'unresolved'} (not admitted) — skipped")
             continue
         chosen = ref
         break
@@ -77,13 +90,22 @@ def select_editor(scenario_id, trigger, campaign_ref=None, authority_ref="owner"
             swaps = len(json.loads((inc_dir / f"{incident_id}.json").read_text()).get("swaps", []))
         except Exception:
             swaps = 0
-        if swaps >= (act.get("max_swaps_per_incident") or 1):
+        limit = act.get("max_swaps_per_incident")
+        limit = 1 if limit is None else int(limit)
+        if swaps >= limit:  # a 0 allowance is honored, not defaulted
             return {"decision": "swap_budget_exhausted", "scenario": scenario_id,
                     "swaps_so_far": swaps}
 
-    epoch = current_epoch(state) + 1
     _epoch_path(state).parent.mkdir(parents=True, exist_ok=True)
-    sc.atomic_write(_epoch_path(state), str(epoch).encode())
+    import fcntl as _fcntl
+    _lk = open(_epoch_path(state).with_suffix(".lock"), "a+")
+    _fcntl.flock(_lk, _fcntl.LOCK_EX)
+    try:
+        epoch = current_epoch(state) + 1
+        sc.atomic_write(_epoch_path(state), str(epoch).encode())
+    finally:
+        _fcntl.flock(_lk, _fcntl.LOCK_UN)
+        _lk.close()
     sel = {
         "scenario": scenario_id, "trigger": trigger, "campaign_ref": campaign_ref,
         "selected_binding_ref": chosen, "config_revision": (sc.active_head(state) or {}).get("content_hash"),

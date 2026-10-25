@@ -120,15 +120,58 @@ def list_records(kind=None, base=DEFAULT_REGISTRY):
     return out
 
 
+_REG_LOCK = None
+
+
+def _registry_lock(base):
+    """Serialize read-compare-write per registry (sol t7 #7: the revision
+    fence must cover read through receipt commitment)."""
+    import fcntl
+    global _REG_LOCK
+    lp = Path(base).expanduser() / ".lock"
+    lp.parent.mkdir(parents=True, exist_ok=True)
+    if _REG_LOCK is None:
+        _REG_LOCK = open(lp, "a+")
+    fcntl.flock(_REG_LOCK, fcntl.LOCK_EX)
+    return _REG_LOCK
+
+
+def _registry_unlock():
+    import fcntl
+    if _REG_LOCK is not None:
+        fcntl.flock(_REG_LOCK, fcntl.LOCK_UN)
+
+
 def put(rec, actor, base=DEFAULT_REGISTRY, expected_revision=None):
     """Revision-checked write with an append-only receipt. A stale write
-    (expected_revision given and mismatched) is refused, never merged."""
+    (expected_revision given and mismatched) is refused, never merged.
+    Completion transitions require outcome evidence (sol t7 #7)."""
     kind = rec.get("kind") or rec.get("_kind")
     if kind not in KINDS:
         return {"ok": False, "faults": [f"unknown kind {kind!r}"]}
     faults = validate_record(rec)
     if faults:
         return {"ok": False, "faults": faults}
+    # completion-proof: a campaign/commitment moving to complete carries evidence
+    if kind == "campaign":
+        prev_status = None
+        prev = get(rec["id"], kind, base)
+        if isinstance(prev, dict):
+            prev_status = prev.get("status")
+        if rec.get("status") == "complete" and prev_status != "complete":
+            for c in rec.get("commitments") or []:
+                if c.get("status") == "complete" and not (c.get("evidence_refs") or []):
+                    return {"ok": False,
+                            "faults": [f"commitment {c.get('id')} -> complete without evidence_refs "
+                                       f"(queue completion alone never completes)"]}
+    _registry_lock(base)
+    try:
+        return _put_locked(rec, actor, base, expected_revision, kind)
+    finally:
+        _registry_unlock()
+
+
+def _put_locked(rec, actor, base, expected_revision, kind):
     rid = rec["id"]
     path = _rec_path(base, kind, rid)
     prev = None

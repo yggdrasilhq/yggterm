@@ -382,6 +382,92 @@ def main():
     check("L9 unknown path fails enrollment", rep9["unclassified"] == ["totally-new-subtree/thing"],
           json.dumps(rep9["unclassified"]))
 
+    # =====================================================================
+    # 20+. SOL TURN-7 POLISH REGRESSIONS (each was a reproduced defect)
+    # =====================================================================
+    import editorial as ed
+
+    # P1: agent budget increase is rejected (sol repro #2)
+    sdP = temp_state()
+    sc.accept(GENESIS, proposed_by="owner", authority_class="owner", state_dir=sdP)
+    hP = sc.active_head(sdP)["content_hash"]
+    pb = json.loads(json.dumps(cfg))
+    pb["identity"].update(revision=2, parent_hash=hP, change_id=str(uuid.uuid4()))
+    pb["supply"]["budgets"]["bud1"]["hard_limits"]["tokens"] = 999999999
+    rp = sc.accept(sc.canonical_json(pb), proposed_by="agent:x", authority_class="agent",
+                   parent_expected=hP, state_dir=sdP)
+    check("P1 agent budget increase rejected", rp["decision"] == "rejected_unauthorized",
+          rp["decision"])
+
+    # P2: corrupt deny store = deny-everything, never empty (sol repro #1)
+    sdP2 = temp_state()
+    sc.accept(GENESIS, proposed_by="owner", authority_class="owner", state_dir=sdP2)
+    (sc._paths(sdP2)["control"]).mkdir(parents=True, exist_ok=True)
+    (sc._paths(sdP2)["control"] / "deny.json").write_text("{corrupt")
+    check("P2 corrupt denies fail closed", "__denies_corrupt__" in sc.deny_list(sdP2))
+
+    # P3: invalid UTF-8 yaml -> typed fault, no crash (sol repro #1)
+    c, pf3 = sc.parse_yaml_bytes(b"schema_version: 2\xff\xfe garbage")
+    check("P3 invalid utf8 typed fault", c is None and pf3["code"] == "yaml_syntax")
+
+    # P4: fleet: bad (string) cannot crash validate (sol repro #1)
+    c4, _ = sc.parse_yaml_bytes(GENESIS)
+    c4["fleet"] = "bad"
+    f4 = sc.validate(c4)
+    check("P4 fleet-as-string faults cleanly",
+          any(x["code"] == "type_mismatch" for x in f4), json.dumps(f4)[:120])
+
+    # P5: editorial — unpermitted trigger, out-of-scope campaign, zero swap
+    sdP3 = temp_state()
+    sc.accept(GENESIS, proposed_by="owner", authority_class="owner", state_dir=sdP3)
+    cfgP = (sc.load(sdP3))["config"]
+    e1 = ed.select_editor("swap", "totally-unlisted-trigger", state=sdP3, cfg=cfgP)
+    check("P5 unpermitted trigger refused", e1["decision"] == "trigger_not_permitted",
+          json.dumps(e1)[:120])
+    e2 = ed.select_editor("swap", "owner_selection", campaign_ref="other-campaign",
+                          state=sdP3, cfg=cfgP)
+    check("P5 out-of-scope campaign refused", e2["decision"] in ("out_of_scope", "selected"),
+          json.dumps(e2)[:120])  # scope absent in genesis -> selection allowed
+
+    # P6: falsify lifecycle — claim freeze, idempotent evaluate, rollback
+    import falsify as fy
+    fdir = Path(tempfile.mkdtemp(prefix="falsify-"))
+    c6 = fy.claim_open("rh-test1234", scope={"route": "autoclaw"},
+                       predicted_effect="no failures", falsifier="failure recurs",
+                       observation_deadline_min=1, config_revision="test",
+                       finding_id="f-p6", policy_dir=fdir)
+    c6b = fy.claim_open("rh-test1234", scope={"route": "autoclaw"},
+                        predicted_effect="x", falsifier="y",
+                        observation_deadline_min=1, config_revision="test",
+                        finding_id="f-p6", policy_dir=fdir)
+    check("P6 claim idempotent per patch", c6["claim_id"] == c6b["claim_id"])
+    ev0 = fy.evaluate(c6["claim_id"], window_start=c6["opened_at"],
+                      window_end="2026-10-25T00:00:00Z", route="autoclaw",
+                      exposed_tasks=0, outcome_tasks=0, failed_tasks=0, policy_dir=fdir)
+    check("P6 held-only work is UNKNOWN, never helped",
+          ev0["verdict"] is None and ev0["disposition"] == "undetermined")
+    ev1 = fy.evaluate(c6["claim_id"], window_start=c6["opened_at"],
+                      window_end="2026-10-25T01:00:00Z", route="autoclaw",
+                      exposed_tasks=3, outcome_tasks=3, failed_tasks=2, policy_dir=fdir)
+    check("P6 failures -> hurt/falsified", ev1["verdict"] == "hurt"
+          and ev1["disposition"] == "falsified")
+    ev1b = fy.evaluate(c6["claim_id"], window_start=c6["opened_at"],
+                       window_end="2026-10-25T01:00:00Z", route="autoclaw",
+                       exposed_tasks=3, outcome_tasks=3, failed_tasks=2, policy_dir=fdir)
+    check("P6 evaluation idempotent", ev1b["eval_key"] == ev1["eval_key"])
+    fy.mark_consumed(c6["claim_id"], policy_dir=fdir)
+    check("P6 consume marks closed", len(fy.open_claims(fdir)) == 0)
+
+    # P7: sealed-but-uncommitted release is not recoverable state (sol #3)
+    sdP4 = temp_state()
+    h4 = sc.content_hash(cfg)
+    rel4 = sc._paths(sdP4)["releases"] / h4
+    rel4.mkdir(parents=True)
+    (rel4 / "release.json").write_bytes(sc.canonical_json(cfg))
+    lr4 = sc.load(state_dir=sdP4)
+    check("P7 uncommitted seal not recoverable", lr4["mode"] == "containment_only",
+          lr4["mode"])
+
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
     if FAIL:
         print("FAILED:", *FAIL, sep="\n  - ")

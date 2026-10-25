@@ -15,6 +15,8 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
+from swarmconfig import content_hash
+
 MAX_BYTES = 12 * 1024
 STALE_AFTER_H = 26  # sources older than this are stale (audit wire: 2 wakes)
 
@@ -73,8 +75,10 @@ def build(cfg_sw, floors, queue_rows, state_dir, out_path, now=None,
     ident = (cfg_sw or {}).get("identity") or {}
     lines.append("## config")
     if ident:
+        # the CURRENT hash (content identity), not the parent link (sol t7 #8)
+        cur = content_hash(cfg_sw) if cfg_sw else ident.get("parent_hash")
         lines.append(f"- revision {ident.get('revision')} (epoch {ident.get('authority_epoch')}) "
-                     f"hash {str(ident.get('parent_hash'))[:12]}… by {ident.get('proposed_by')}")
+                     f"current {str(cur)[:12]}… (parent {str(ident.get('parent_hash'))[:12]}…) by {ident.get('proposed_by')}")
         lines.append(f"- reason: {ident.get('reason', '')}")
     else:
         lines.append("- v1 config (no identity chain) — phase-5 cutover pending")
@@ -96,8 +100,12 @@ def build(cfg_sw, floors, queue_rows, state_dir, out_path, now=None,
                     continue
                 campaigns.append(obj)
         if not campaigns:
-            src("registry:campaign", "ok", "empty")
-            lines.append("- none registered")
+            if cd.is_dir():
+                src("registry:campaign", "ok", "empty")
+                lines.append("- none registered")
+            else:
+                src("registry:campaign", "missing")
+                lines.append("- registry dir absent (missing — seed before editorial review)")
         for c in campaigns:
             blocked = len(c.get("blockers") or [])
             lines.append(f"- {c.get('id')}: {c.get('status')} — {str(c.get('objective'))[:80]}"
@@ -152,10 +160,10 @@ def build(cfg_sw, floors, queue_rows, state_dir, out_path, now=None,
         src("audit-feedback", st)
         lines.append(f"- {st} (audit has never run or is unreadable)")
     else:
-        st = _age_state(fb.get("generated_at"))
-        src("audit-feedback", st if st != "unknown" else "ok",
-            f"generated {fb.get('generated_at')}")
-        lines.append(f"- generated {fb.get('generated_at')} [{st}], "
+        gen = fb.get("generated_at")
+        st = _age_state(gen) if gen else "invalid"
+        src("audit-feedback", st, f"generated {gen}")
+        lines.append(f"- generated {gen} [{st}], "
                      f"evaluator {fb.get('evaluator_version')}")
         for f in fb.get("findings", []):
             scope = f.get("scope") or {}
@@ -172,10 +180,15 @@ def build(cfg_sw, floors, queue_rows, state_dir, out_path, now=None,
         src("overlays", st if st != "ok" else "ok", "empty" if st == "ok" else "")
         lines.append(f"- none active ({st})")
     else:
-        src("overlays", "ok", f"{len(ov)} active")
-        for o in ov:
+        now_iso = now.astimezone().isoformat()
+        live = [o for o in ov if str(o.get("expires_at") or "9999") > now_iso]
+        expired = len(ov) - len(live)
+        src("overlays", "ok", f"{len(live)} active, {expired} expired")
+        for o in live:
             lines.append(f"- {o.get('type')} {o.get('route') or o.get('namespace')} "
                          f"until {o.get('expires_at')} ({o.get('reason_code')})")
+        if expired:
+            lines.append(f"- ({expired} expired overlay(s) hidden — see receipts)")
     lines.append("")
 
     # ---- intelligence roles (v2 shape; v1 fallback)

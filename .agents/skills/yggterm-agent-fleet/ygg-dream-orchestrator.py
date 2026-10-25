@@ -35,6 +35,8 @@ ENABLED = CFG_DIR / "enabled"
 STATE_DIR = HOME / ".yggterm/dream"
 STATE = STATE_DIR / "state.json"
 LEDGER = STATE_DIR / "wake-ledger.jsonl"
+DREAM_LEDGER = Path("/tmp/dreamer/dream-ledger.jsonl")
+AUDIT_LEDGER = Path("/tmp/dreamer/audit-ledger.jsonl")
 LOCK = Path("/tmp/ygg-dream-orchestrator.lock")
 IST = timezone(timedelta(hours=5, minutes=30))
 
@@ -127,6 +129,12 @@ def parse_peak(spec, now):
         start, end = win.split("-")
         sh, sm = map(int, start.split(":"))
         eh, em = map(int, end.split(":"))
+        # range validation (sol turn-7 Q3-7): nonsense hours or an overnight
+        # window are UNKNOWN (hold), never silently unrestricted
+        if not (0 <= sh <= 23 and 0 <= eh <= 23 and 0 <= sm <= 59 and 0 <= em <= 59):
+            return None, 0
+        if (eh, em) <= (sh, sm):
+            return None, 0  # cross-midnight semantics unsupported -> UNKNOWN
         cur = now.hour * 60 + now.minute
         return in_days and (sh * 60 + sm) <= cur < (eh * 60 + em), (eh * 60 + em) - cur
     except Exception:
@@ -193,6 +201,65 @@ def save_state(st):
 # same finding never creates a patch nor renews a TTL; no model, credential,
 # budget, or doctrine changes ride this layer.
 POLICY_DIR = HOME / ".yggterm/dream/policy"
+try:
+    import falsify as _falsify  # kernel sibling: claim/exposure/evaluation ledger
+except ImportError:  # any run context: find the kernel beside the verb/repo
+    _here = Path(__file__).resolve()
+    for _kp in (_here.parents[3] / "tools", _here.parent,
+                HOME / "gh" / "yggterm" / "tools",
+                HOME / ".yggterm" / "swarmkernel"):
+        if (_kp / "falsify.py").exists():
+            sys.path.insert(0, str(_kp))
+            break
+    import falsify as _falsify
+
+# ---- swarm-harness v2 gate (sol turn-7 Q3-1): the LoadResult CONSTRAINS
+# dispatch — containment, owner denials, and plane owner_policy are not
+# advisory. floors.json remains the supply QUANTITY authority; v2 is the
+# PERMISSION authority.
+ROUTE_TO_PLANE = {"zai-coding-plan": "zai-peak", "zai-offpeak": "zai-offpeak",
+                  "opencode-free": "opencode-free", "codex": "intelligence-consult",
+                  "autoclaw": "autoclaw-chat"}
+_SWRES = None  # bound in main(); LoadResult dict
+
+
+def v2_blocked_routes(routes):
+    """-> (blocked_set, note). Intersects routes with the v2 activation store:
+    containment blocks everything; owner deny latches and disabled/draining
+    planes block their routes; an unreadable deny store blocks everything."""
+    global _SWRES
+    blocked, notes = set(), []
+    if _SWRES is None:
+        try:
+            here = Path(__file__).resolve()
+            for kpath in [here.parents[3] / "tools", here.parent,
+                          HOME / "gh" / "yggterm" / "tools"]:
+                if (kpath / "swarmharness" / "__init__.py").exists():
+                    sys.path.insert(0, str(kpath))
+                    break
+            from swarmharness import swarmconfig as _sc
+            _SWRES = _sc.load()
+        except Exception as e:
+            return set(routes), f"v2 gate unavailable ({e!r}) — containment"
+    mode = _SWRES.get("mode")
+    if mode == "containment_only":
+        return set(routes), "v2 CONTAINMENT-ONLY — all dispatch held"
+    denials = _SWRES.get("denials") or {}
+    if "__denies_corrupt__" in denials:
+        return set(routes), "v2 deny store UNREADABLE — all dispatch held (fail-closed)"
+    planes = ((_SWRES.get("config") or {}).get("planes") or {})
+    for r in routes:
+        pl = planes.get(ROUTE_TO_PLANE.get(r, r))
+        if pl is None:
+            continue  # route not governed by a v2 plane: floors decides
+        pol = pl.get("owner_policy")
+        if pol in ("disabled", "draining"):
+            blocked.add(r)
+            notes.append(f"{r}:{pol}")
+        if r in denials or ROUTE_TO_PLANE.get(r, r) in denials:
+            blocked.add(r)
+            notes.append(f"{r}:owner-denied")
+    return blocked, ("; ".join(notes) if notes else "v2 gate clear")
 OVERLAYS = POLICY_DIR / "overlays.json"
 RECEIPTS = POLICY_DIR / "receipts.jsonl"
 FEEDBACK = HOME / ".yggterm/dream/audit-feedback.json"
@@ -239,6 +306,20 @@ def load_feedback(cfg):
         return None, "invalid valid_until"
     if not isinstance(fb.get("findings"), list):
         return None, "findings missing"
+    for f in fb.get("findings", []):
+        if not isinstance(f, dict):
+            return None, "finding row not a mapping"
+        if not f.get("code") or not f.get("status") or not f.get("finding_id"):
+            return None, f"finding missing code/status/finding_id: {str(f)[:80]}"
+        if f.get("status") not in ("confirmed", "suspected", "cleared", "watch"):
+            return None, f"unknown finding status {f.get('status')!r}"
+        gen = fb.get("generated_at") or ""
+        vu = fb.get("valid_until") or ""
+        try:
+            if datetime.fromisoformat(gen) > datetime.fromisoformat(vu):
+                return None, "reversed window (generated after valid_until)"
+        except Exception:
+            return None, "unparseable window stamps"
     return fb, "ok"
 
 
@@ -255,6 +336,13 @@ def build_overlays(cfg):
     except Exception:
         existing = []
     by_pid = {o.get("patch_id"): o for o in existing if o.get("expires_at")}
+    # processed-finding identity outlives overlay lifetime (sol turn-7 Q3-2):
+    # a finding whose hold EXPIRED never silently re-arms from the same id
+    seen_path = POLICY_DIR / "seen-findings.json"
+    try:
+        seen = json.loads(seen_path.read_text()) if seen_path.exists() else {}
+    except Exception:
+        seen = {}
     summary = []
     for f in fb.get("findings", []):
         code, status, scope = f.get("code"), f.get("status"), (f.get("scope") or {})
@@ -267,6 +355,8 @@ def build_overlays(cfg):
             if pid in by_pid and datetime.fromisoformat(by_pid[pid]["expires_at"]) > now:
                 _receipt("keep_base", patch_id=pid, finding_id=fid, reason="active overlay cites this finding")
                 continue
+            if not by_pid.get(pid) and seen.get(fid):
+                continue  # expired hold for this finding: ratification needed, not renewal
             ov = {"patch_id": pid, "type": "route_hold", "finding_ids": [fid],
                   "route": scope["route"],
                   # family-scoped when the evidence only indicts one family
@@ -278,6 +368,12 @@ def build_overlays(cfg):
                   "policy_version": POLICY_VERSION,
                   "rollback": "deactivate_this_patch"}
             active.append(ov); summary.append(f"route_hold {scope['route']}" + (f" [{scope.get('family')}]" if ov["family"] else ""))
+            _falsify.claim_open(pid, scope={"route": scope["route"], "family": ov.get("family") or ""},
+                                predicted_effect=f"no new {code} failures on {scope['route']} while held",
+                                falsifier=f"post-policy attempt on {scope['route']} fails again with {code}",
+                                observation_deadline_min=HOLD_TTL_MIN["route_hold"] + 20,
+                                config_revision=str((_SWRES or {}).get("revision") or ""),
+                                finding_id=fid)
         elif code == "namespace_prepare_failure" and scope.get("namespace"):
             pid = "nh-" + _sha8(fid)
             if pid in by_pid and datetime.fromisoformat(by_pid[pid]["expires_at"]) > now:
@@ -290,6 +386,12 @@ def build_overlays(cfg):
                   "policy_version": POLICY_VERSION,
                   "rollback": "deactivate_this_patch"}
             active.append(ov); summary.append(f"namespace_hold {scope['namespace']}")
+            _falsify.claim_open(pid, scope={"namespace": scope["namespace"]},
+                                predicted_effect=f"no new {code} on {scope['namespace']} while held",
+                                falsifier=f"post-policy prepare failure recurs on {scope['namespace']}",
+                                observation_deadline_min=HOLD_TTL_MIN["namespace_hold"] + 20,
+                                config_revision=str((_SWRES or {}).get("revision") or ""),
+                                finding_id=fid)
         elif code == "route_starved" and scope.get("route") and isinstance(f.get("allocation"), dict):
             pid = "dp-" + _sha8(fid)
             if pid in by_pid and datetime.fromisoformat(by_pid[pid]["expires_at"]) > now:
@@ -304,6 +406,12 @@ def build_overlays(cfg):
                   "policy_version": POLICY_VERSION,
                   "rollback": "deactivate_this_patch"}
             active.append(ov); summary.append(f"route_debt_preference {scope['route']}")
+            _falsify.claim_open(pid, scope={"route": scope["route"]},
+                                predicted_effect=f"{scope['route']} share recovers toward its expected share",
+                                falsifier=f"share still below expected after the preferred selection",
+                                observation_deadline_min=50,
+                                config_revision=str((_SWRES or {}).get("revision") or ""),
+                                finding_id=fid)
     # carry forward still-active prior overlays (expiry pruning with receipts)
     for o in existing:
         try:
@@ -314,6 +422,14 @@ def build_overlays(cfg):
                 pass  # expiry receipt only on the pass that prunes it
         except Exception:
             continue
+    for f in fb.get("findings", []):
+        if f.get("status") == "confirmed" and f.get("finding_id"):
+            seen[f["finding_id"]] = now.isoformat(timespec="seconds")
+    try:
+        seen_path.parent.mkdir(parents=True, exist_ok=True)
+        seen_path.write_text(json.dumps(seen, indent=1, sort_keys=True))
+    except Exception:
+        pass
     _write_overlays(active)
     if summary:
         for s_ in summary:
@@ -362,11 +478,17 @@ def consume_debt_preference(route):
         active = json.loads(OVERLAYS.read_text()) if OVERLAYS.exists() else []
     except Exception:
         return
-    keep = [o for o in active if not (o.get("type") == "route_debt_preference" and o.get("route") == route)]
-    if len(keep) != len(active):
-        _write_overlays(keep)
-        _receipt("applied", type="route_debt_preference", route=route,
-                 reason="one preferred selection consumed")
+    cands = sorted((o for o in active
+                    if o.get("type") == "route_debt_preference" and o.get("route") == route),
+                   key=lambda o: o.get("expires_at") or "")
+    if not cands:
+        return
+    used = cands[0]  # consume ONE identified preference, not every one
+    keep = [o for o in active if o is not used and o.get("patch_id") != used.get("patch_id")]
+    _write_overlays(keep)
+    _receipt("applied", type="route_debt_preference", route=route,
+             patch_id=used.get("patch_id"),
+             reason="one preferred selection consumed (identified patch)")
 
 # ---------------------------------------------------------------- topup ----
 
@@ -433,16 +555,27 @@ def cmd_topup(cfg):
     pol_note = build_overlays(cfg)
     print(f"orchestrator: policy — {pol_note}")
     livable = [r for r in cfg["routes"] if gates[r]["ok"]]
+    # v2 PERMISSION gate (sol turn-7 Q3-1): containment/denials/disabled
+    # planes block dispatch regardless of floors supply arithmetic
+    v2_blocked, v2_note = v2_blocked_routes(cfg["routes"])
+    if v2_blocked:
+        livable = [r for r in livable if r not in v2_blocked]
+    print(f"orchestrator: v2 gate — {v2_note or 'clear'}")
     if not livable:
         print("orchestrator: all planes gated — holding supply (" +
-              ", ".join(f"{r}:{gates[r]['why']}" for r in cfg["routes"]) + ")")
+              ", ".join(f"{r}:{gates[r]['why']}" for r in cfg["routes"]) +
+              ("; v2: " + v2_note if v2_note else "") + ")")
         return
     enq, t0 = 0, time.time()
+    tried_ns = set()  # in-pass exclusions: held/failed/duplicate namespaces do
+    # not stay the minimum-count pick and starve the others (sol t7 Q3-4)
     while (sum(st["counts"].values()) + backlog < cfg["targets"]["day"]
            and backlog < cfg["targets"]["backlog_cap"]
            and enq < cfg["supply"]["pass_max_enqueues"]
            and time.time() - t0 < cfg["supply"]["pass_wall_budget_s"]):
-        pick = min((n for n in cfg["namespaces"] if st["counts"].get(n["ns"], 0) < n["per_day"]),
+        pick = min((n for n in cfg["namespaces"]
+                    if n["ns"] not in tried_ns
+                    and st["counts"].get(n["ns"], 0) < n["per_day"]),
                    key=lambda n: st["counts"].get(n["ns"], 0), default=None)
         if not pick:
             break
@@ -452,11 +585,18 @@ def cmd_topup(cfg):
         if pol["blocked_ns"]:
             print(f"orchestrator: policy — namespace {pick['ns']} held, skipping")
             st["dry"][pick["ns"]] = st["dry"].get(pick["ns"], 0) + 1
+            tried_ns.add(pick["ns"])
+            for o in pol.get("overlays") or []:
+                _falsify.exposure(_falsify.claim_id(o.get("patch_id")),
+                                  decision="skip-ns-held", task_id=None,
+                                  policy_changed=True,
+                                  detail=f"namespace {pick['ns']} held")
             save_state(st)
             continue
         staged = stage_brief(cfg, pick["ns"], pick["budget"])
         if not staged:
             st["dry"][pick["ns"]] = st["dry"].get(pick["ns"], 0) + 1
+            tried_ns.add(pick["ns"])
             save_state(st)
             continue
         # the brief stays in pending until the executor consumes it — without a
@@ -467,6 +607,7 @@ def cmd_topup(cfg):
         brief_sha = (sha_out or "").strip()
         if brief_sha and st.get("staged_shas", {}).get(pick["ns"]) == brief_sha:
             st["dry"][pick["ns"]] = st["dry"].get(pick["ns"], 0) + 1
+            tried_ns.add(pick["ns"])
             save_state(st)
             continue
         n_done = st["counts"].get(pick["ns"], 0)
@@ -506,7 +647,8 @@ def cmd_topup(cfg):
             print(f"orchestrator: enqueue failed: {line}", file=sys.stderr)
             break
         rows = qjson(cfg, ["list"])
-        backlog = len([r for r in rows if r.get("status") in ("queued", "retry_wait", "cooldown_wait")])
+        if rows is not None:
+            backlog = len([r for r in rows if isinstance(r, dict) and r.get("status") in ("queued", "retry_wait", "cooldown_wait")])
     print(f"orchestrator: topup staged={sum(st['counts'].values())} moderate={st['moderate']} backlog={backlog}")
 
 
@@ -519,8 +661,66 @@ AUTH_SIGNS = ("auth", "unauthorized", "401", "refresh token", "login")
 EXPERIMENT_MARKS = ("CANARY", "FALSIFIER", "PROBE", "TEST", "SMOKE")
 
 
+def falsify_pass():
+    """The claim->evaluation->disposition consumer (sol turn-7 Q2c, minimal
+    increment). For every OPEN claim past its observation deadline: pull the
+    affected route's audit rows inside the window; one idempotent evaluation;
+    then retain (supported) / rollback (falsified) / expire (undetermined)."""
+    notes = []
+    try:
+        now = datetime.now(IST)
+        for c in _falsify.open_claims():
+            dl_min = c.get("observation_deadline_min") or 60
+            opened = datetime.fromisoformat(c["opened_at"])
+            if (now - opened).total_seconds() < dl_min * 60:
+                continue  # window still open
+            route = (c.get("scope") or {}).get("route") or ""
+            w_end = now.isoformat(timespec="seconds")
+            rows = [json.loads(x) for x in open(DREAM_LEDGER).read_text().splitlines()] if DREAM_LEDGER.exists() else []
+            exposed = [r for r in rows if r.get("route") == route
+                       and r.get("created_at", "") >= c["opened_at"]]
+            if not exposed:
+                _falsify.consume(c["claim_id"], None, action="expire")
+                _falsify.mark_consumed(c["claim_id"])
+                notes.append(f"claim {c['claim_id']} expired (no exposure)")
+                continue
+            # outcomes from the audit ledger for those task ids
+            tasks = {r.get("id") for r in exposed}
+            failed = outcome = 0
+            if AUDIT_LEDGER.exists():
+                for x in AUDIT_LEDGER.read_text().splitlines():
+                    try:
+                        a = json.loads(x)
+                    except Exception:
+                        continue
+                    if a.get("id") in tasks and a.get("terminal"):
+                        outcome += 1
+                        if a.get("verdict") in ("FAIL", "UNKNOWN") or a.get("issues"):
+                            failed += 1
+            ev = _falsify.evaluate(c["claim_id"], window_start=c["opened_at"],
+                                   window_end=w_end, route=route,
+                                   exposed_tasks=len(exposed), outcome_tasks=outcome,
+                                   failed_tasks=failed)
+            if ev["disposition"] == "falsified":
+                _falsify.consume(c["claim_id"], ev, action="rollback")
+                notes.append(f"claim {c['claim_id']} FALSIFIED ({ev['verdict']}) — patch rolled back")
+            elif ev["disposition"] == "supported":
+                _falsify.consume(c["claim_id"], ev, action="retain")
+                notes.append(f"claim {c['claim_id']} supported ({ev['verdict']}) — retained")
+            else:
+                _falsify.consume(c["claim_id"], ev, action="expire")
+                notes.append(f"claim {c['claim_id']} undetermined — expired")
+            _falsify.mark_consumed(c["claim_id"])
+    except Exception as e:  # noqa: BLE001 — falsification failures never stop supervision
+        notes.append(f"falsify_pass fault: {e!r}")
+    return notes
+
+
 def cmd_supervise(cfg):
     ledger = {"t": int(time.time()), "audited": 0, "revoked": [], "rerouted": [], "held": [], "notes": []}
+    for fnote in falsify_pass():
+        ledger["notes"].append(fnote)
+        print(f"orchestrator: falsify — {fnote}")
     rows = qjson(cfg, ["list"])
     if rows is None:
         # sol repair 3/6: unknown queue state — take NO mutating action
@@ -650,8 +850,10 @@ def cmd_status(cfg, as_json=False):
     st = load_state()
     gates = plane_gates(cfg)
     rows = qjson(cfg, ["list"])
-    backlog = len([r for r in rows if r.get("status") in ("queued", "retry_wait", "cooldown_wait")])
-    running = len([r for r in rows if r.get("status") == "running"])
+    if rows is None:
+        rows = []  # UNKNOWN renders as zeros + a flag, never a crash
+    backlog = len([r for r in rows if isinstance(r, dict) and r.get("status") in ("queued", "retry_wait", "cooldown_wait")])
+    running = len([r for r in rows if isinstance(r, dict) and r.get("status") == "running"])
     pol = resolve_policy()
     out = {
         "armed": ENABLED.exists(),
