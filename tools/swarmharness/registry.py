@@ -120,26 +120,31 @@ def list_records(kind=None, base=DEFAULT_REGISTRY):
     return out
 
 
-_REG_LOCK = None
+_REG_LOCKS = {}
 
 
 def _registry_lock(base):
-    """Serialize read-compare-write per registry (sol t7 #7: the revision
-    fence must cover read through receipt commitment)."""
+    """Serialize read-compare-write PER BASE (sol t9#9: one global fd bound
+    to the first base let two processes fence different files)."""
     import fcntl
-    global _REG_LOCK
+    key = str(Path(base).expanduser().resolve())
     lp = Path(base).expanduser() / ".lock"
     lp.parent.mkdir(parents=True, exist_ok=True)
-    if _REG_LOCK is None:
-        _REG_LOCK = open(lp, "a+")
-    fcntl.flock(_REG_LOCK, fcntl.LOCK_EX)
-    return _REG_LOCK
+    lk = _REG_LOCKS.get(key)
+    if lk is None:
+        lk = open(lp, "a+")
+        _REG_LOCKS[key] = lk
+    fcntl.flock(lk, fcntl.LOCK_EX)
+    return lk
 
 
 def _registry_unlock():
     import fcntl
-    if _REG_LOCK is not None:
-        fcntl.flock(_REG_LOCK, fcntl.LOCK_UN)
+    for lk in _REG_LOCKS.values():
+        try:
+            fcntl.flock(lk, fcntl.LOCK_UN)
+        except Exception:
+            pass
 
 
 def put(rec, actor, base=DEFAULT_REGISTRY, expected_revision=None):
@@ -152,15 +157,18 @@ def put(rec, actor, base=DEFAULT_REGISTRY, expected_revision=None):
     faults = validate_record(rec)
     if faults:
         return {"ok": False, "faults": faults}
-    # completion-proof: a campaign/commitment moving to complete carries evidence
+    # completion-proof: ANY commitment marked complete carries evidence —
+    # regardless of the campaign's own status (sol t9#9)
     if kind == "campaign":
-        prev_status = None
-        prev = get(rec["id"], kind, base)
-        if isinstance(prev, dict):
-            prev_status = prev.get("status")
-        if rec.get("status") == "complete" and prev_status != "complete":
-            for c in rec.get("commitments") or []:
-                if c.get("status") == "complete" and not (c.get("evidence_refs") or []):
+        for c in rec.get("commitments") or []:
+            if c.get("status") == "complete" and not (c.get("evidence_refs") or []):
+                prev = get(rec["id"], kind, base)
+                was = False
+                if isinstance(prev, dict):
+                    for pc in prev.get("commitments") or []:
+                        if pc.get("id") == c.get("id") and pc.get("status") == "complete":
+                            was = True
+                if not was:
                     return {"ok": False,
                             "faults": [f"commitment {c.get('id')} -> complete without evidence_refs "
                                        f"(queue completion alone never completes)"]}

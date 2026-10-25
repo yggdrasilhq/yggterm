@@ -94,14 +94,25 @@ def trial(gid, fixture_path, *, base=DEFAULT_BASE, timeout=60):
     fx_sha = _sha256_file(fx)
     sandbox = Path(tempfile.mkdtemp(prefix=f"grad-{gid[:8]}-"))
     shutil.copy(d / "script.py", sandbox / "script.py")
-    # import the fixture module and call run(script_path)
-    spec = None
+    shutil.copy(fx, sandbox / "fixture.py")
+    # run the fixture in a SUBPROCESS with a hard timeout — in-process exec
+    # cannot bound a runaway fixture (sol t9#13)
+    runner = (
+        "import importlib.util, json, sys; "
+        "spec = importlib.util.spec_from_file_location('grad_fixture', sys.argv[1]); "
+        "mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod); "
+        "print(json.dumps(mod.run(sys.argv[2]) or {'pass': False, 'detail': 'fixture returned None'}))"
+    )
     try:
-        import importlib.util
-        spec = importlib.util.spec_from_file_location("grad_fixture", fx)
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
-        result = mod.run(sandbox / "script.py")
+        p = subprocess.run([sys.executable, "-c", runner, str(sandbox / "fixture.py"),
+                            str(sandbox / "script.py")],
+                           capture_output=True, text=True, timeout=timeout)
+        if p.returncode != 0:
+            result = {"pass": False, "detail": f"fixture rc={p.returncode}: {p.stderr[-200:]}"}
+        else:
+            result = json.loads((p.stdout or "").strip() or '{"pass": false, "detail": "no output"}')
+    except subprocess.TimeoutExpired:
+        result = {"pass": False, "detail": f"fixture exceeded {timeout}s timeout"}
     except Exception as e:  # noqa: BLE001 — a crashing fixture is a failed trial
         result = {"pass": False, "detail": f"fixture crashed: {e!r}"}
     finally:
@@ -109,15 +120,17 @@ def trial(gid, fixture_path, *, base=DEFAULT_BASE, timeout=60):
     row = {"at": _now(), "fixture": str(fx), "fixture_sha256": fx_sha,
            "pass": bool(result.get("pass")),
            "detail": str(result.get("detail", ""))[:300]}
+    # the fixture is RETAINED with the trial — no fixture, no promotion (t9#13)
+    fkeep = d / "fixtures"
+    fkeep.mkdir(parents=True, exist_ok=True)
+    shutil.copy(fx, fkeep / f"{fx_sha[:12]}-{fx.name}")
     with open(d / "trials.jsonl", "a") as f:
         f.write(json.dumps(row, sort_keys=True) + "\n")
         f.flush()
         import os
         os.fsync(f.fileno())
     trials = [json.loads(x) for x in (d / "trials.jsonl").read_text().splitlines() if x.strip()]
-    man["state"] = "promoted" if any(t["pass"] for t in trials) else "trial-ed"
-    if man["state"] == "trial-ed":
-        man["state"] = "trialed"
+    man["state"] = "trialed"  # only promote() grants 'promoted' (t9#13)
     man["trials"] = len(trials)
     man_p.write_text(json.dumps(man, indent=2, sort_keys=True) + "\n")
     return {"ok": True, "trial": row, "passing": any(t["pass"] for t in trials)}
@@ -138,8 +151,17 @@ def promote(gid, *, procedure_id, title, scope, actor, base=DEFAULT_BASE,
     passing = [t for t in trials if t["pass"]]
     if not passing:
         return {"ok": False, "faults": ["no passing trial; promote refused"]}
-    if not (d / "trials.jsonl").exists():
-        return {"ok": False, "faults": ["no trial journal"]}
+    # STALE-EVIDENCE guard (sol t9#13): the script on disk must still hash to
+    # the staged manifest hash — a post-trial edit invalidates the evidence
+    cur_sha = _sha256_file(d / "script.py")
+    if cur_sha != man["script_sha256"]:
+        return {"ok": False, "faults": [f"script changed after trials "
+                                        f"({man['script_sha256'][:12]} -> {cur_sha[:12]}); re-trial"]}
+    # at least one PASSING trial's fixture must be retained alongside
+    kept = {q.name.split("-", 1)[0] for q in (d / "fixtures").glob("*")} \
+        if (d / "fixtures").exists() else set()
+    if not any(t["fixture_sha256"][:12] in kept for t in passing):
+        return {"ok": False, "faults": ["passing trial's fixture not retained; promote refused"]}
     rec = {
         "kind": "procedure", "id": procedure_id, "revision": 1,
         "title": title, "cue": (man.get("cue") or "") + " " + title.lower(),

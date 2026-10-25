@@ -159,6 +159,9 @@ def build(cfg_sw, floors, queue_rows, state_dir, out_path, now=None,
     if fb is None:
         src("audit-feedback", st)
         lines.append(f"- {st} (audit has never run or is unreadable)")
+    elif not isinstance(fb, dict):
+        src("audit-feedback", "invalid", f"unexpected shape {type(fb).__name__}")
+        lines.append(f"- invalid audit source shape ({type(fb).__name__})")
     else:
         gen = fb.get("generated_at")
         st = _age_state(gen) if gen else "invalid"
@@ -180,8 +183,12 @@ def build(cfg_sw, floors, queue_rows, state_dir, out_path, now=None,
         src("overlays", st if st != "ok" else "ok", "empty" if st == "ok" else "")
         lines.append(f"- none active ({st})")
     else:
-        now_iso = now.astimezone().isoformat()
-        live = [o for o in ov if str(o.get("expires_at") or "9999") > now_iso]
+        def _exp(o):
+            try:
+                return datetime.fromisoformat(str(o.get("expires_at")))
+            except Exception:
+                return datetime.min.replace(tzinfo=now.tzinfo)
+        live = [o for o in ov if _exp(o) > now]
         expired = len(ov) - len(live)
         src("overlays", "ok", f"{len(live)} active, {expired} expired")
         for o in live:

@@ -32,6 +32,7 @@ roles:
 editor_scenarios:
   swap:
     permitted_trigger_classes: [owner_selection]
+    scope: {campaign_refs: [test-campaign]}
     binding_order: [b2, b1]
     activation: {requires_admitted_target: true, ttl_seconds: 600, max_swaps_per_incident: 1}
 campaign_policies:

@@ -202,7 +202,7 @@ def reconcile(state=sc.DEFAULT_STATE):
                 "(rd / 'release.yaml').write_bytes(files['release.yaml']); "
                 "(rd / 'release.json').write_bytes(files['release.json']); "
                 "jr = [json.loads(x) for x in files['journal_tail.jsonl'].decode().splitlines() if x.strip()] if 'journal_tail.jsonl' in files else None; "
-                "print(json.dumps(sl.install_accepted(os.path.expanduser('~/.yggterm/swarm'), h, origin_bytes=files['release.yaml'], journal_records=jr)))"
+                "print(json.dumps(sl.install_accepted(os.path.expanduser('~/.yggterm/swarm'), h, origin_bytes=files['release.yaml'], shipped_journal=jr)))"
             )
             r2 = _ssh(host, ['python3 -c "' + inst_code + '"'], timeout=30)
             try:
@@ -248,7 +248,7 @@ def replica_sync(state=sc.DEFAULT_STATE, dev_host="dev"):
             jr = [json.loads(x) for x in files["journal_tail.jsonl"].decode().splitlines()
                   if x.strip()] if "journal_tail.jsonl" in files else None
             inst = sl.install_accepted(state, h, origin_bytes=files["release.yaml"],
-                                       journal_records=jr)
+                                       shipped_journal=jr)
             out["install"] = inst
         except Exception as e:  # noqa: BLE001
             out["install"] = {"ok": False, "detail": repr(e)[:160]}
@@ -309,7 +309,8 @@ def _incidents_read(state, unit, window):
             except Exception:
                 continue
             # incident timestamps are ISO; parse just the restarts for this unit
-            if rec.get("unit") == unit and rec.get("action") in ("restarted", "restart-failed"):
+            if rec.get("unit") == unit and (rec.get("action") == "restarted"
+                                            or str(rec.get("action", "")).startswith("restart-failed")):
                 import datetime
                 try:
                     ts = datetime.datetime.strptime(rec["at"], "%Y-%m-%dT%H:%M:%SZ")

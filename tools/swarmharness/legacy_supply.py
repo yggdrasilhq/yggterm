@@ -78,12 +78,13 @@ def verify_generated(floors_bytes, cfg_sw):
     """CONTENT verification (sol t7 #9): the artifact must byte-match a fresh
     rendering from the active config — a stale tag alone proves nothing."""
     active = sc.active_head()
-    if not active:
-        return {"ok": True, "note": "no active head; nothing to compare"}
     try:
         f = json.loads(floors_bytes)
     except Exception:
         return {"ok": False, "reason": "unreadable"}
+    if not active:
+        # a broken artifact is never ok, active head or not (sol t9#16)
+        return {"ok": False, "reason": "no active head to compare against; artifact unverifiable"}
     tag = (f.get("_config_revision") or {})
     if tag.get("current_hash") != active.get("content_hash"):
         return {"ok": False,

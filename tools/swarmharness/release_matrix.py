@@ -81,6 +81,7 @@ def transfer_release(src_state, dst_state):
     shutil.copy(rel / "release.json", rd / "release.json")
     return sl.install_accepted(dst_state, head["content_hash"],
                                origin_bytes=(rel / "release.yaml").read_bytes(),
+                               workspace=dst_state / "workspace.yaml",
                                shipped_journal=sl.journal_records(src_state))
 
 
