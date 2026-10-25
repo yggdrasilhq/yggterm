@@ -583,8 +583,11 @@ def cmd_supervise(cfg):
             run(queue_cli(cfg) + ["revoke", r["id"], "--reason", "false-completion: zero-token error turn (terminal event)", "--json"], 60)
             ledger["revoked"].append({"id": r["id"], "evidence": "terminal event"})
             print(f"supervise: REVOKED false completion {r['id'][:16]}")
-        elif verdict == "PARSE-FAIL":
-            ledger["notes"].append({"id": r["id"], "why": "false-completion check: transcript unparseable"})
+        elif i < 0:
+            # no terminal error marker at all — nothing to act on; note only
+            # when the transcript itself is MISSING (a completed task with no
+            # log is the anomaly worth recording)
+            ledger["notes"].append({"id": r["id"], "why": "false-completion check: no transcript found"})
     # UX-parity watch (owner 2026-10-24): the TUI parity dreamer runs 24x7 —
     # if no parity task is alive on any plane, spawn the next one from the
     # standing contract so the work never sleeps.
