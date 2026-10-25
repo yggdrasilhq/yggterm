@@ -710,11 +710,18 @@ def falsify_pass():
     then retain (supported) / rollback (falsified) / expire (undetermined)."""
     notes = []
     now = datetime.now(IST)
-    for c in _falsify.open_claims():
+    try:
+        claims = _falsify.open_claims()
+    except Exception as e0:  # enumeration fault is contained (sol t12 reg-2b)
+        return [f"falsify_pass fault (claims enumeration): {e0!r}"]
+    for c in claims:
         # FULL per-claim isolation (sol t11#12): claim parsing, ledger
         # collection, evaluation, consume — every step of claim N is wrapped
         # so claim N+1 is always evaluated
         try:
+            if not isinstance(c, dict) or not c.get("claim_id"):
+                notes.append("claim row malformed (missing claim_id) — skipped")
+                continue
             dl_min = c.get("observation_deadline_min") or 60
             opened = datetime.fromisoformat(c["opened_at"])
             if (now - opened).total_seconds() < dl_min * 60:
@@ -743,23 +750,27 @@ def falsify_pass():
                         outcome += 1
                         if a.get("verdict") in ("FAIL", "UNKNOWN") or a.get("issues"):
                             failed += 1
-                ev = _falsify.evaluate(c["claim_id"], window_start=c["opened_at"],
-                                       window_end=w_end, route=route,
-                                       exposed_tasks=len(exposed), outcome_tasks=outcome,
-                                       failed_tasks=failed)
-                if ev["disposition"] == "falsified":
-                    _falsify.consume(c["claim_id"], ev, action="rollback")
-                    notes.append(f"claim {c['claim_id']} FALSIFIED ({ev['verdict']}) — patch rolled back")
-                elif ev["disposition"] == "supported":
-                    _falsify.consume(c["claim_id"], ev, action="retain")
-                    notes.append(f"claim {c['claim_id']} supported ({ev['verdict']}) — retained")
-                else:
-                    _falsify.consume(c["claim_id"], ev, action="expire")
-                    notes.append(f"claim {c['claim_id']} undetermined — expired")
-                _falsify.mark_consumed(c["claim_id"])
+            # evaluate/consume/mark ALWAYS run for an overdue exposed claim —
+            # an absent audit ledger means outcome=0 -> undetermined/expire,
+            # never a silently skipped claim (sol t12 reg-1)
+            ev = _falsify.evaluate(c["claim_id"], window_start=c["opened_at"],
+                                   window_end=w_end, route=route,
+                                   exposed_tasks=len(exposed), outcome_tasks=outcome,
+                                   failed_tasks=failed)
+            if ev["disposition"] == "falsified":
+                _falsify.consume(c["claim_id"], ev, action="rollback")
+                notes.append(f"claim {c['claim_id']} FALSIFIED ({ev['verdict']}) — patch rolled back")
+            elif ev["disposition"] == "supported":
+                _falsify.consume(c["claim_id"], ev, action="retain")
+                notes.append(f"claim {c['claim_id']} supported ({ev['verdict']}) — retained")
+            else:
+                _falsify.consume(c["claim_id"], ev, action="expire")
+                notes.append(f"claim {c['claim_id']} undetermined — expired")
+            _falsify.mark_consumed(c["claim_id"])
         except Exception as e3:  # per-claim isolation: EVERY step of claim N
             # is contained; claim N+1 is always evaluated (sol t11#12)
-            notes.append(f"claim {c['claim_id']} fault: {e3!r}")
+            cid = c.get("claim_id") if isinstance(c, dict) else None
+            notes.append(f"claim {cid or '<malformed>'} fault: {e3!r}")
     return notes
 
 
@@ -767,7 +778,8 @@ def cmd_supervise(cfg):
     ledger = {"t": int(time.time()), "audited": 0, "revoked": [], "rerouted": [], "held": [], "notes": []}
     # the v2 PERMISSION gate constrains supervise mutations too (sol t10#10):
     # reroutes and watch enqueues on a blocked route are suppressed here
-    _watch_route = ((cfg.get("dreamers") or {}).get("ux_parity") or {}).get("route")         if isinstance(cfg.get("dreamers"), dict) else None
+    _watch_route = (cfg.get("ux_parity_watch") or {}).get("route") \
+        if isinstance(cfg.get("ux_parity_watch"), dict) else None
     _gate_routes = list(cfg["routes"]) + ([_watch_route] if _watch_route and _watch_route not in cfg["routes"] else [])
     v2_blocked_sup, v2_note_sup = v2_blocked_routes(_gate_routes)
     if v2_blocked_sup:
