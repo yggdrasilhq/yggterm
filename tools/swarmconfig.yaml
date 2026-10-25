@@ -1,0 +1,94 @@
+# ============================================================================
+# swarmconfig.yaml — THE SWARM SURVIVAL LEDGER (owner-editable)
+# ============================================================================
+# Purpose: one file lists every orchestrator, dreamer, and intelligence role
+# in the fleet — which model and harness each runs on. In catastrophe (quota
+# death, account loss, provider outage) the OWNER edits the values here and
+# restarts the timers; the deterministic core reboots from this file and then
+# self-heals (holds expire, reroutes rebalance, the intelligence layer
+# recovers when its plan does).
+#
+# LAWS:
+#  - The deterministic core (queue serve, orchestrator timers, audit) MUST
+#    run with ZERO model calls. If the intelligence section is dead, the
+#    core contains (holds, expiries, reroutes) and DEFERS novel decisions.
+#  - Any harness-organization change starts FROM this repo seed (never as a
+#    bolt-on addon elsewhere) — owner directive 2026-10-25.
+#  - The orchestrator keeps a .last-good copy of the parsed config; a broken
+#    owner edit falls back to it with a loud fault line, never a crash.
+#
+# schema_version: bump on breaking shape changes; the validator refuses
+# unknown major versions (fail-closed, loud).
+# ============================================================================
+
+schema_version: 1
+
+kernel:
+  # The portable swarm-harness kernel (contracts, wire schema, policy
+  # vocabulary, receipts, replay fixtures). Adapters bind it to this infra.
+  repo: "~/gh/yggterm"              # SSOT tree; kernel modules under tools/swarmharness/
+  policy_dir: "~/.yggterm/dream/policy"
+  feedback: "~/.yggterm/dream/audit-feedback.json"   # the audit wire
+  state_dir: "~/.yggterm/dream"
+  wake_interval_min: 20             # the spawner cadence; snapshot validity derives from it
+
+intelligence:
+  # The editorial layer (swarm-harness2 P1): standing ROLE, episodic compute.
+  # Three rhythms: deterministic ticks (no model), decision-point consults,
+  # periodic editorial reviews. The core never WAITS on these.
+  primary: {model: "gpt-6.1-sol", reasoning: "high", harness: "codex", plan: "openai-paid"}
+  fallback: {model: "gemini-3.8-flash", reasoning: "high", harness: "agy", plan: "gemini-bundled"}
+  degraded_mode: deterministic-only   # when primary AND fallback are unavailable
+  rhythms:
+    decision_consults: on-novel-evidence   # repeated unchanged evidence never re-consults
+    editorial_review: daily-when-material  # + one urgent slot
+  empire_index: "~/.yggterm/dream/empire-index.md"   # the bounded view consults receive
+
+orchestrators:
+  level0:
+    name: dream-orchestrator
+    host: dev
+    harness: yggterm-timer           # systemd user timers (deterministic python)
+    model: none                      # deterministic core: zero model calls
+    unit: yggterm-dream-spawner.timer
+    config: "~/.yggterm/config/dream/floors.json"
+  sub_orchestrators: []
+    # spawned on MEASURED coordination burden only (sol turn-3 contract):
+    # proposed -> admitted -> active -> draining -> handed_back -> retired
+    # one child, one level deep, 24h renewable lease, budgeted from kernel.
+
+dreamers:
+  # standing dream lines (the queue routes carry the model assignments)
+  ux_parity:
+    family: ux_parity
+    route: autoclaw                  # pinned per owner plan; containment holds this family when the plane faults
+    workspace: "~/gh/zcode-tui--ux-sol-2"
+    prompt_file: "~/.yggterm/config/dream/ux-parity-prompt.md"
+    max_attempts: 3
+  supply:
+    config: "~/.yggterm/config/dream/floors.json"   # namespaces, per-day floors, budgets
+
+planes:
+  # load-balancing truth: which plans carry which routes, and their state.
+  # The owner edits THIS in catastrophe (e.g. drain a dead plan, point a
+  # route at another account) then: systemctl --user restart zcode-tui-queue
+  zai-coding-plan: {state: active, note: "GLM-5.3-Flash@max workhorse; peak window Mon-Fri 11:30-15:30 IST"}
+  autoclaw: {state: walled, note: "BUG-005 chat 401 — contained by reroute; capture pending"}
+  opencode-free: {state: quota-exhausted, note: "free tier limit reached 2026-10-23"}
+  codex: {state: active, note: "hourly-limited; consults + spillover"}
+  zai-offpeak: {state: active, note: "free off-peak privilege"}
+
+core_keeper:
+  # the GLM maintenance lane that keeps the swarm core alive (bugs, timers,
+  # load balance). It is a ROLE filled by whatever workhorse seat holds the
+  # yggterm campaign — not a permanently running process.
+  campaign_ns: "-home-pi-gh-yggterm"
+  model: {modelId: "GLM-5.3-Flash", providerId: "zai-api", reasoning: "max"}
+  escalation: "owner"              # dire situations: the owner hand-edits this file
+
+intent:
+  # P4: authority-classed intent, canonical record in private lore
+  canonical: "~/git/journal-papers/swarm-harness2/00-intent.md"
+  hub_door: "owner-model-portfolio-intent"
+  research: "~/git/journal-papers/swarm-harness2"
+  kasten: pending                   # reasoning-history link (open)

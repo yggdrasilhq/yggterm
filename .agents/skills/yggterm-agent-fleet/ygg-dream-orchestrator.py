@@ -635,6 +635,15 @@ def cmd_supervise(cfg):
         f.write(json.dumps(ledger) + "\n")
     print(f"orchestrator: supervise audited={ledger['audited']} revoked={len(ledger['revoked'])} "
           f"rerouted={len(ledger['rerouted'])} held={len(ledger['held'])}")
+    # P1 information system v1: regenerate the empire index (the bounded view
+    # every intelligence consult embeds). Deterministic; never fatal.
+    try:
+        from swarmharness import empire_index  # noqa: E402  # via the kernel package
+        idx_path = ((SWCFG or {}).get("intelligence") or {}).get(
+            "empire_index", "~/.yggterm/dream/empire-index.md")
+        empire_index.build(SWCFG, load_cfg(), rows, None, idx_path)
+    except Exception as e:
+        print(f"orchestrator: empire index write failed: {e}", file=sys.stderr)
 
 
 def cmd_status(cfg, as_json=False):
@@ -667,9 +676,38 @@ def cmd_status(cfg, as_json=False):
         print(f"  {r:16} {state}")
 
 
+def load_swarmconfig():
+    """The survival ledger (owner-editable; last-good fallback). Never fatal:
+    the deterministic core runs floors-only and reports the fault loudly."""
+    here = Path(__file__).resolve()
+    candidates = [
+        here.parents[3] / "tools",                              # repo SSOT run
+        here.parent,                                            # dispersed: kernel beside the verb
+        Path.home() / "gh" / "yggterm" / "tools",               # dispersed, repo present
+    ]
+    for kpath in candidates:
+        if (kpath / "swarmharness" / "__init__.py").exists():
+            sys.path.insert(0, str(kpath))  # parent: the package is swarmharness/
+            break
+    try:
+        from swarmharness import swarmconfig  # noqa: E402
+        cfg, note = swarmconfig.load()
+        if note != "ok":
+            print(f"orchestrator: swarmconfig - {note}", file=sys.stderr)
+        return cfg
+    except Exception as e:
+        print(f"orchestrator: swarmconfig unavailable: {e}", file=sys.stderr)
+        return None
+
+
+SWCFG = None  # bound in main; read by supervise for the empire index
+
+
 def main():
+    global SWCFG
     verb = sys.argv[1] if len(sys.argv) > 1 else "status"
     cfg = load_cfg()
+    SWCFG = load_swarmconfig()
     if verb == "status":
         cmd_status(cfg, "--json" in sys.argv)
     elif verb in ("topup", "supervise"):
