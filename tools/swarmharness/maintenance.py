@@ -1,0 +1,360 @@
+"""ygg-swarm-maintenance-orchestrator — the DETERMINISTIC maintenance
+boundary (sol turn-5/6). No model. No network creativity. It:
+
+  validates/activates the swarm config (activation store, never the workspace),
+  captures workspace edits as proposals (multi-directional ledger),
+  as controller: reconciles every host (capture-before-pull), adjudicates the
+    frozen batch, publishes accepted releases, collects acknowledgements,
+  as replica: pushes its outbox to dev and installs verified accepted chain,
+  supervises the executor adapter (bounded restarts, incident escalation),
+  writes a heartbeat the whole fleet can inspect.
+
+Permitted actions are the allowlist in swarm-config.yaml maintenance.*.
+Violations are defects, not judgment. Serve/DENY latches are never cleared
+here (owner verb only).
+
+Usage:
+  python3 maintenance.py once [--state DIR]     # single maintenance pass
+  python3 maintenance.py daemon [--state DIR]   # poll loop (systemd unit)
+  python3 maintenance.py reconcile [--state DIR]
+  python3 maintenance.py status [--state DIR]
+"""
+import argparse
+import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+
+import swarm_ledger as sl  # noqa: E402
+import swarmconfig as sc   # noqa: E402
+
+DEFAULT_EXECUTOR_UNIT = "ygg-swarm-executor@zcode.service"
+SAFE_HOST = frozenset("abcdefghijklmnopqrstuvwxyz0123456789-.")
+
+
+def _cfg(res):
+    return res.get("config") or {}
+
+
+def _hosts(cfg):
+    hosts = ((cfg.get("fleet") or {}).get("hosts")) or []
+    return [h for h in hosts if h and set(h) <= SAFE_HOST]
+
+
+def _poll_seconds(cfg):
+    ps = (((cfg.get("maintenance") or {}).get("supervisor")) or {}).get("poll_seconds")
+    return ps if isinstance(ps, int) and ps >= 5 else 30
+
+
+def _role(cfg, host):
+    fleet = cfg.get("fleet") or {}
+    sup = ((cfg.get("maintenance") or {}).get("supervisor")) or {}
+    if not fleet:
+        return "controller"  # no config: deterministic defaults keep containment alive
+    if host == (fleet.get("authority_host") or "dev"):
+        return "controller"
+    if host in (sup.get("replica_hosts") or []):
+        return "replica"
+    return "replica"
+
+
+def _ssh(host, argv, timeout=20, input_bytes=None):
+    """Transport adapter (ssh, at-least-once). Host names are pre-validated
+    against SAFE_HOST; argv list form never passes through a shell."""
+    cmd = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", host, "--"] + argv
+    try:
+        p = subprocess.run(cmd, capture_output=True, timeout=timeout,
+                           input=input_bytes)
+        return {"ok": p.returncode == 0, "rc": p.returncode,
+                "stdout": p.stdout, "stderr": p.stderr[:400]}
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "rc": None, "stdout": b"", "stderr": b"timeout"}
+    except FileNotFoundError:
+        return {"ok": False, "rc": None, "stdout": b"", "stderr": b"ssh missing"}
+
+
+# ------------------------------------------------------------ reconcile
+
+def reconcile(state=sc.DEFAULT_STATE):
+    """Controller: capture locally, pull every reachable replica's outbox
+    BEFORE installing anything there, adjudicate the frozen batch, publish,
+    then install on replicas and collect acks."""
+    res = sc.load(state)
+    cfg = _cfg(res)
+    rep = sl.init_state(state)
+    cap = sl.capture(state)
+    verdicts = sl.adjudicate(state)
+    head = sc.active_head(state) or {}
+
+    out = {"role": "controller", "captured": cap.get("captured"),
+           "verdicts": {v["change_id"]: v["decision"] for v in verdicts},
+           "head": head.get("content_hash", "")[:12], "hosts": {}}
+
+    sync_dir = Path(state).expanduser() / "sync" / "config"
+    inbox = sync_dir / "inbox"
+    for host in _hosts(cfg):
+        if host == rep.get("host"):
+            continue
+        entry = {"reachable": False}
+        # 1. capture-before-pull: pull the replica's outbox first
+        r = _ssh(host, ["python3", "-c",
+                        "import sys; sys.path.insert(0,'$HOME/.yggterm/swarmkernel');sys.path.insert(0,'$HOME/gh/yggterm/tools/swarmharness');"
+                        "import swarm_ledger as sl, json;"
+                        f"print(json.dumps(sl.capture('{state}', reason='controller-invoked')))"],
+                 timeout=25)
+        if r["ok"]:
+            entry["reachable"] = True
+            try:
+                entry["remote_capture"] = json.loads(r["stdout"].decode() or "{}")
+            except Exception:
+                entry["remote_capture"] = {"error": "unparseable"}
+        # 2. fetch outbox bundles (at-least-once)
+        r = _ssh(host, ["bash", "-lc",
+                        "cd ~/.yggterm/swarm/sync/config/outbox 2>/dev/null && tar -cf - . || tar -cf - /dev/null"],
+                 timeout=25)
+        if r["ok"] and r["stdout"].strip():
+            dest = inbox / host
+            dest.mkdir(parents=True, exist_ok=True)
+            t = subprocess.run(["tar", "-xf", "-", "-C", str(dest)],
+                               input=r["stdout"], capture_output=True)
+            entry["ingested"] = t.returncode == 0
+        out["hosts"][host] = entry
+
+    # 3. adjudicate the frozen batch (now includes remote proposals)
+    verdicts = sl.adjudicate(state)
+    out["verdicts"] = {v["change_id"]: v["decision"] for v in verdicts}
+    head = sc.active_head(state) or {}
+    out["head"] = head.get("content_hash", "")[:12]
+
+    # 4. publish + install on replicas (verified bundles only)
+    if head:
+        rel_dir = sc._paths(Path(state).expanduser())["releases"] / head["content_hash"]
+        payload = b""
+        for name in ("release.yaml", "release.json"):
+            f = rel_dir / name
+            if f.exists():
+                payload += b"\n===FILE=== " + name.encode() + b"\n" + f.read_bytes()
+        for host in out["hosts"]:
+            if not out["hosts"][host].get("reachable"):
+                out["hosts"][host]["install"] = "pending"
+                continue
+            r = _ssh(host, ["bash", "-lc",
+                            "mkdir -p ~/.yggterm/swarm/sync/config/published && cat > ~/.yggterm/swarm/sync/config/published/bundle.tar"],
+                     timeout=30, input_bytes=payload)
+            if not r["ok"]:
+                out["hosts"][host]["install"] = f"push-failed rc={r['rc']}"
+                continue
+            argv = ["python3", "-c",
+                    "import sys; sys.path.insert(0,'$HOME/.yggterm/swarmkernel');sys.path.insert(0,'$HOME/gh/yggterm/tools/swarmharness');"
+                    "import swarm_ledger as sl, json, hashlib, pathlib;"
+                    "b=pathlib.Path('~/.yggterm/swarm/sync/config/published/bundle.tar').expanduser().read_bytes();"
+                    "import io, tarfile;"
+                    "tf=tarfile.open(fileobj=io.BytesIO(b)); files={};"
+                    "[files.__setitem__(m.name.split('/')[-1], tf.extractfile(m).read()) for m in tf.getmembers()];"
+                    "d=pathlib.Path('~/.yggterm/swarm/config/releases').expanduser()/hashlib.sha256(files['release.json']).hexdigest()[:0];"
+                    "import swarmconfig as sc;"
+                    "body=json.loads(files['release.json']);"
+                    "h=sc.content_hash(body);"
+                    "rd=pathlib.Path('~/.yggterm/swarm/config/releases').expanduser()/h;"
+                    "rd.mkdir(parents=True, exist_ok=True);"
+                    "(rd/'release.yaml').write_bytes(files['release.yaml']);"
+                    "(rd/'release.json').write_bytes(files['release.json']);"
+                    "print(json.dumps(sl.install_accepted('~/.yggterm/swarm', h, origin_bytes=files['release.yaml'])))"]
+            r2 = _ssh(host, argv, timeout=30)
+            try:
+                out["hosts"][host]["install"] = json.loads(r2["stdout"].decode() or "{}")
+            except Exception:
+                out["hosts"][host]["install"] = {"ok": False, "stderr": r2["stderr"][:200]}
+    return out
+
+
+def replica_sync(state=sc.DEFAULT_STATE, dev_host="dev"):
+    """Replica: push outbox to dev's inbox, pull + verify + install accepted."""
+    res = sc.load(state)
+    cfg = _cfg(res)
+    authority = (cfg.get("fleet") or {}).get("authority_host") or dev_host
+    sl.init_state(state)
+    cap = sl.capture(state)
+    out = {"role": "replica", "captured": cap.get("captured")}
+    sync_dir = Path(state).expanduser() / "sync" / "config"
+    # push outbox bundles (at-least-once; dev dedupes by change_id)
+    r = _ssh(authority, ["bash", "-lc",
+                         "mkdir -p ~/.yggterm/swarm/sync/config/inbox/$HOSTNAME 2>/dev/null; "
+                         "mkdir -p ~/.yggterm/swarm/sync/config/inbox/$(hostname -s); "
+                         "cat > /dev/null"], timeout=20)
+    bundles = sync_dir / "outbox"
+    if bundles.is_dir() and any(bundles.iterdir()):
+        t = subprocess.run(["tar", "-cf", "-", "."], cwd=bundles, capture_output=True)
+        if t.stdout:
+            host = sl.load_replica(state).get("host") or "unknown"
+            r = _ssh(authority, ["bash", "-lc",
+                                 f"mkdir -p ~/.yggterm/swarm/sync/config/inbox/{host} && "
+                                 f"tar -xf - -C ~/.yggterm/swarm/sync/config/inbox/{host}"],
+                     timeout=25, input_bytes=t.stdout)
+            out["push"] = "ok" if r["ok"] else f"rc={r['rc']}"
+    # pull the published head bundle
+    r = _ssh(authority, ["bash", "-lc",
+                         "cat ~/.yggterm/swarm/sync/config/published/bundle.tar 2>/dev/null | head -c 20000000"],
+             timeout=30)
+    if r["ok"] and r["stdout"].strip():
+        import io, tarfile
+        try:
+            tf = tarfile.open(fileobj=io.BytesIO(r["stdout"]))
+            files = {m.name.split("/")[-1]: tf.extractfile(m).read() for m in tf.getmembers()}
+            body = json.loads(files["release.json"])
+            h = sc.content_hash(body)
+            rd = Path(state).expanduser() / "config" / "releases" / h
+            rd.mkdir(parents=True, exist_ok=True)
+            (rd / "release.yaml").write_bytes(files["release.yaml"])
+            (rd / "release.json").write_bytes(files["release.json"])
+            inst = sl.install_accepted(state, h, origin_bytes=files["release.yaml"])
+            out["install"] = inst
+        except Exception as e:  # noqa: BLE001
+            out["install"] = {"ok": False, "detail": repr(e)[:160]}
+    return out
+
+
+# ------------------------------------------------------------ supervision
+
+def _incidents_path(state):
+    return Path(state).expanduser() / "control" / "incidents.jsonl"
+
+
+def _incident_append(state, rec):
+    p = _incidents_path(state)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with open(p, "a") as f:
+        f.write(json.dumps(rec, sort_keys=True) + "\n")
+        f.flush()
+        os.fsync(f.fileno())
+
+
+def supervise_executor(state, cfg, unit=DEFAULT_EXECUTOR_UNIT):
+    """Bounded dependency supervision: check the executor unit, restart within
+    the configured limits, escalate to the durable incident log beyond them."""
+    sup = ((cfg.get("maintenance") or {}).get("supervisor")) or {}
+    rl = sup.get("restart_limit") or {"attempts": 3, "window_seconds": 900}
+    r = subprocess.run(["systemctl", "--user", "is-active", unit],
+                       capture_output=True, text=True)
+    active = r.returncode == 0 and r.stdout.strip() == "active"
+    now = time.time()
+    entry = {"unit": unit, "active": active, "checked_at": sc._now()}
+    if not active:
+        recent = _incidents_read(state, unit, window=rl.get("window_seconds", 900))
+        if len(recent) >= rl.get("attempts", 3):
+            entry["action"] = "escalated"
+            _incident_append(state, {"unit": unit, "action": "escalate-to-owner",
+                                     "attempts_in_window": len(recent), "at": sc._now()})
+        else:
+            r2 = subprocess.run(["systemctl", "--user", "restart", unit],
+                                capture_output=True, text=True)
+            entry["action"] = "restarted" if r2.returncode == 0 else f"restart-failed rc={r2.returncode}"
+            _incident_append(state, {"unit": unit, "action": entry["action"], "at": sc._now()})
+    return entry
+
+
+def _incidents_read(state, unit, window):
+    cutoff = time.time() - window
+    out = []
+    try:
+        for line in _incidents_path(state).read_text().splitlines():
+            try:
+                rec = json.loads(line)
+            except Exception:
+                continue
+            # incident timestamps are ISO; parse just the restarts for this unit
+            if rec.get("unit") == unit and rec.get("action") == "restarted":
+                import datetime
+                try:
+                    ts = datetime.datetime.strptime(rec["at"], "%Y-%m-%dT%H:%M:%SZ")
+                    ts = ts.replace(tzinfo=datetime.timezone.utc).timestamp()
+                    if ts >= cutoff:
+                        out.append(rec)
+                except Exception:
+                    continue
+    except FileNotFoundError:
+        pass
+    return out
+
+
+# ------------------------------------------------------------ pass + loop
+
+def maintenance_pass(state=sc.DEFAULT_STATE):
+    started = time.time()
+    res = sc.load(state)
+    cfg = _cfg(res)
+    host = sl.load_replica(state) and sl.load_replica(state).get("host") or os.uname().nodename.split(".")[0]
+    role = _role(cfg, host)
+    out = {"at": sc._now(), "role": role, "host": host,
+           "config_mode": res["mode"],
+           "denials": sorted((res.get("denials") or {})),
+           "faults": res.get("faults", [])[:4]}
+    try:
+        if role == "controller":
+            out["reconcile"] = reconcile(state)
+        else:
+            out["replica_sync"] = replica_sync(state)
+    except Exception as e:  # noqa: BLE001 — the supervisor never dies from a sync fault
+        out["sync_fault"] = repr(e)[:200]
+    if cfg:
+        try:
+            out["executor"] = supervise_executor(state, cfg)
+        except FileNotFoundError:
+            out["executor"] = {"unit": DEFAULT_EXECUTOR_UNIT, "active": None,
+                               "note": "systemctl unavailable"}
+    out["elapsed_s"] = round(time.time() - started, 2)
+    hb = Path(state).expanduser() / "supervisor.json"
+    sc.atomic_write_json(hb, out)
+    return out
+
+
+def daemon(state, interval=None):
+    while True:
+        try:
+            res = sc.load(state)
+            interval = interval or _poll_seconds(_cfg(res))
+            out = maintenance_pass(state)
+            print(json.dumps({"at": out["at"], "role": out["role"],
+                              "mode": out["config_mode"]}, flush=True))
+        except Exception as e:  # noqa: BLE001 — containment posture, never crash
+            print(f"maintenance fault (contained): {e!r}", file=sys.stderr, flush=True)
+            interval = interval or 30
+        time.sleep(interval)
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="ygg-swarm-maintenance")
+    ap.add_argument("verb", choices=["once", "daemon", "reconcile", "status", "replica-sync"])
+    ap.add_argument("--state", default=str(sc.DEFAULT_STATE))
+    ap.add_argument("--interval", type=int, default=None)
+    a = ap.parse_args()
+    state = Path(a.state).expanduser()
+    if a.verb == "daemon":
+        daemon(state, a.interval)
+        return 0
+    if a.verb == "once":
+        print(json.dumps(maintenance_pass(state), indent=2, default=str))
+        return 0
+    if a.verb == "reconcile":
+        print(json.dumps(reconcile(state), indent=2, default=str))
+        return 0
+    if a.verb == "replica-sync":
+        print(json.dumps(replica_sync(state), indent=2, default=str))
+        return 0
+    if a.verb == "status":
+        print(json.dumps({"load": sc.status(state),
+                          "replica": sl.load_replica(state),
+                          "journal_ok": sl.verify_ancestry(state)[0],
+                          "supervisor": json.loads((state / "supervisor.json").read_text())
+                          if (state / "supervisor.json").exists() else None}, indent=2, default=str))
+        return 0
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -677,8 +677,9 @@ def cmd_status(cfg, as_json=False):
 
 
 def load_swarmconfig():
-    """The survival ledger (owner-editable; last-good fallback). Never fatal:
-    the deterministic core runs floors-only and reports the fault loudly."""
+    """The survival ledger v2 (activation store; workspace edits are proposals,
+    operational truth is active.json). Never fatal: containment returns None
+    and the deterministic core runs floors-only, reporting the fault loudly."""
     here = Path(__file__).resolve()
     candidates = [
         here.parents[3] / "tools",                              # repo SSOT run
@@ -691,10 +692,18 @@ def load_swarmconfig():
             break
     try:
         from swarmharness import swarmconfig  # noqa: E402
-        cfg, note = swarmconfig.load()
-        if note != "ok":
-            print(f"orchestrator: swarmconfig - {note}", file=sys.stderr)
-        return cfg
+        res = swarmconfig.load()  # LoadResult: mode/config/revision/faults/denials
+        faults = "; ".join(f.get("detail", f["code"]) for f in res.get("faults", [])[:3])
+        if res["mode"] == "containment_only":
+            print(f"orchestrator: swarmconfig CONTAINMENT-ONLY ({faults}) — floors-only",
+                  file=sys.stderr)
+            return None
+        if res["mode"] == "last_good" or faults:
+            print(f"orchestrator: swarmconfig {res['mode']} ({faults})", file=sys.stderr)
+        denials = res.get("denials") or {}
+        if denials:
+            print(f"orchestrator: owner denials active: {sorted(denials)}", file=sys.stderr)
+        return res["config"]
     except Exception as e:
         print(f"orchestrator: swarmconfig unavailable: {e}", file=sys.stderr)
         return None

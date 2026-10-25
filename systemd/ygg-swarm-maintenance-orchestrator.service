@@ -1,0 +1,22 @@
+# ygg-swarm-maintenance-orchestrator — THE DETERMINISTIC MAINTENANCE BOUNDARY
+# (sol turn-5/6). Validates/activates swarm-config, reconciles the
+# multi-directional ledger fleet-wide, supervises the executor adapter.
+# DELIBERATELY no Requires/Wants on the queue, editor, index or any model:
+# this unit must boot with nothing else alive and contain the failure.
+#   Install: cp to ~/.config/systemd/user/ && systemctl --user daemon-reload
+#            systemctl --user enable --now ygg-swarm-maintenance-orchestrator
+#   Status:  ~/.yggterm/swarm/supervisor.json (heartbeat, one row per pass)
+[Unit]
+Description=yggterm swarm maintenance orchestrator (deterministic; zero model dependency)
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 %h/gh/yggterm/tools/swarmharness/maintenance.py daemon
+Restart=on-failure
+RestartSec=10s
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

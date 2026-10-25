@@ -1,0 +1,26 @@
+# ygg-swarm-executor@<plane> — the queue TRANSPORT adapter (replaceable).
+# The maintenance service supervises this unit; it has no dependency on it.
+# The installed serve command is an installation fact below — never read
+# from swarm-config.yaml. The adapter gates on the ACTIVATED config and
+# exits 75 (backoff) under containment or when this host is not the
+# dispatch authority.
+#   Replaces zcode-tui-queue.service at the phase-2 migration:
+#     systemctl --user stop zcode-tui-queue && systemctl --user disable zcode-tui-queue
+#     systemctl --user daemon-reload && systemctl --user enable --now ygg-swarm-executor@zcode
+[Unit]
+Description=yggterm swarm executor adapter (%i queue transport)
+After=ygg-swarm-maintenance-orchestrator.service
+
+[Service]
+Type=simple
+WorkingDirectory=%h/gh/zcode-tui
+ExecStart=/usr/bin/python3 %h/gh/yggterm/tools/swarmharness/executor_adapter.py -- %h/.bun/bin/bun run src/bin/queue.ts serve
+Restart=on-failure
+RestartSec=15s
+Environment=PATH=%h/.bun/bin:%h/.yggterm/ynpm/bin:/usr/local/bin:/usr/bin:/bin
+Environment=BUN_INSTALL=%h/.bun
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
