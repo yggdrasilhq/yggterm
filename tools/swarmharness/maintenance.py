@@ -103,15 +103,14 @@ def reconcile(state=sc.DEFAULT_STATE):
         entry = {"reachable": False}
         # 1. capture-before-pull: pull the replica's outbox first
         remote_code = (
-            "import sys, json; "
-            "sys.path.insert(0,'$HOME/.yggterm/swarmkernel');"
-            "sys.path.insert(0,'$HOME/gh/yggterm/tools/swarmharness');"
+            "import sys, json, os; "
+            "sys.path.insert(0, os.path.expanduser('~/.yggterm/swarmkernel'));"
+            "sys.path.insert(0, os.path.expanduser('~/gh/yggterm/tools/swarmharness'));"
             "import swarm_ledger as sl; "
-            "r = sl.capture('~/.yggterm/swarm', reason='controller-invoked'); "
+            "r = sl.capture(os.path.expanduser('~/.yggterm/swarm'), reason='controller-invoked'); "
             "print(json.dumps(r))"
         )
-        r = _ssh(host, ["python3 -c '" + remote_code.replace("'", '"') + "'"],
-                 timeout=25)
+        r = _ssh(host, ['python3 -c "' + remote_code + '"'], timeout=25)
         if r["ok"]:
             entry["reachable"] = True
             try:
@@ -155,9 +154,9 @@ def reconcile(state=sc.DEFAULT_STATE):
                 out["hosts"][host]["install"] = f"push-failed rc={r['rc']}"
                 continue
             inst_code = (
-                "import sys, json, io, tarfile, pathlib; "
-                "sys.path.insert(0,'$HOME/.yggterm/swarmkernel');"
-                "sys.path.insert(0,'$HOME/gh/yggterm/tools/swarmharness');"
+                "import sys, json, io, tarfile, pathlib, os; "
+                "sys.path.insert(0, os.path.expanduser('~/.yggterm/swarmkernel'));"
+                "sys.path.insert(0, os.path.expanduser('~/gh/yggterm/tools/swarmharness'));"
                 "import swarm_ledger as sl, swarmconfig as sc; "
                 "b = pathlib.Path('~/.yggterm/swarm/sync/config/published/bundle.tar').expanduser().read_bytes(); "
                 "tf = tarfile.open(fileobj=io.BytesIO(b)); "
@@ -168,9 +167,9 @@ def reconcile(state=sc.DEFAULT_STATE):
                 "rd.mkdir(parents=True, exist_ok=True); "
                 "(rd / 'release.yaml').write_bytes(files['release.yaml']); "
                 "(rd / 'release.json').write_bytes(files['release.json']); "
-                "print(json.dumps(sl.install_accepted('~/.yggterm/swarm', h, origin_bytes=files['release.yaml'])))"
+                "print(json.dumps(sl.install_accepted(os.path.expanduser('~/.yggterm/swarm'), h, origin_bytes=files['release.yaml'])))"
             )
-            r2 = _ssh(host, ["python3 -c '" + inst_code.replace("'", '"') + "'"], timeout=30)
+            r2 = _ssh(host, ['python3 -c "' + inst_code + '"'], timeout=30)
             try:
                 out["hosts"][host]["install"] = json.loads(r2["stdout"].decode() or "{}")
             except Exception:
