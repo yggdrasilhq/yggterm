@@ -135,19 +135,44 @@ def reconcile(state=sc.DEFAULT_STATE):
     head = sc.active_head(state) or {}
     out["head"] = head.get("content_hash", "")[:12]
 
+    # consumer acknowledgements (sol turn-7 #5 tail): who has NOT acked the
+    # active revision — distinct accepted/installed/acked states
+    ack_dir = Path(state).expanduser() / "config" / "acks"
+    wanted = ((cfg.get("sync") or {}).get("activation_ack_consumers")) or []
+    acks = {}
+    for c in wanted:
+        try:
+            rec = json.loads((ack_dir / f"{c}.json").read_text())
+            acks[c] = rec.get("content_hash") or ""
+        except Exception:
+            acks[c] = None
+    out["acks"] = {c: (h[:12] if h else None) for c, h in acks.items()}
+    out["unacked"] = sorted(c for c, h in acks.items() if h != head.get("content_hash"))
+
     # 4. publish + install on replicas (verified bundles only)
     if head:
         rel_dir = sc._paths(Path(state).expanduser())["releases"] / head["content_hash"]
         import io as _io, tarfile as _tarfile
         _buf = _io.BytesIO()
         with _tarfile.open(fileobj=_buf, mode="w") as _tf:
-            for _name in ("release.yaml", "release.json"):
-                _f = rel_dir / _name
-                if _f.exists():
+            for _name in ("release.yaml", "release.json", "journal_tail.jsonl"):
+                if _name == "journal_tail.jsonl":
+                    # ship the acceptance chain so replicas verify ANCESTRY,
+                    # not just bundle identity (sol turn-7 #5)
+                    _recs = sl.journal_records(state)
+                    if _recs:
+                        _data = "\n".join(json.dumps(r, sort_keys=True)
+                                          for r in _recs).encode() + b"\n"
+                    else:
+                        continue
+                else:
+                    _f = rel_dir / _name
+                    if not _f.exists():
+                        continue
                     _data = _f.read_bytes()
-                    _ti = _tarfile.TarInfo(_name)
-                    _ti.size = len(_data)
-                    _tf.addfile(_ti, _io.BytesIO(_data))
+                _ti = _tarfile.TarInfo(_name)
+                _ti.size = len(_data)
+                _tf.addfile(_ti, _io.BytesIO(_data))
         payload = _buf.getvalue()
         pub_local = Path(state).expanduser() / "sync" / "config" / "published"
         pub_local.mkdir(parents=True, exist_ok=True)
@@ -176,7 +201,8 @@ def reconcile(state=sc.DEFAULT_STATE):
                 "rd.mkdir(parents=True, exist_ok=True); "
                 "(rd / 'release.yaml').write_bytes(files['release.yaml']); "
                 "(rd / 'release.json').write_bytes(files['release.json']); "
-                "print(json.dumps(sl.install_accepted(os.path.expanduser('~/.yggterm/swarm'), h, origin_bytes=files['release.yaml'])))"
+                "jr = [json.loads(x) for x in files['journal_tail.jsonl'].decode().splitlines() if x.strip()] if 'journal_tail.jsonl' in files else None; "
+                "print(json.dumps(sl.install_accepted(os.path.expanduser('~/.yggterm/swarm'), h, origin_bytes=files['release.yaml'], journal_records=jr)))"
             )
             r2 = _ssh(host, ['python3 -c "' + inst_code + '"'], timeout=30)
             try:
@@ -219,7 +245,10 @@ def replica_sync(state=sc.DEFAULT_STATE, dev_host="dev"):
             rd.mkdir(parents=True, exist_ok=True)
             (rd / "release.yaml").write_bytes(files["release.yaml"])
             (rd / "release.json").write_bytes(files["release.json"])
-            inst = sl.install_accepted(state, h, origin_bytes=files["release.yaml"])
+            jr = [json.loads(x) for x in files["journal_tail.jsonl"].decode().splitlines()
+                  if x.strip()] if "journal_tail.jsonl" in files else None
+            inst = sl.install_accepted(state, h, origin_bytes=files["release.yaml"],
+                                       journal_records=jr)
             out["install"] = inst
         except Exception as e:  # noqa: BLE001
             out["install"] = {"ok": False, "detail": repr(e)[:160]}
@@ -325,6 +354,11 @@ def maintenance_pass(state=sc.DEFAULT_STATE):
                 out["executor"] = {"unit": DEFAULT_EXECUTOR_UNIT, "active": None,
                                    "note": "systemctl unavailable"}
     out["elapsed_s"] = round(time.time() - started, 2)
+    if cfg and res["mode"] == "active":
+        try:
+            sc.ack("ygg-swarm-maintenance-orchestrator", state)
+        except Exception:
+            pass
     hb = Path(state).expanduser() / "supervisor.json"
     sc.atomic_write_json(hb, out)
     return out
