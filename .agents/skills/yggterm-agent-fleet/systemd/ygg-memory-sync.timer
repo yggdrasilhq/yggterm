@@ -2,17 +2,24 @@
 Description=Yggterm memory recovery catch-up (managed CLI startup is immediate)
 
 [Timer]
-# ⛔ OnCalendar, NOT OnBootSec/OnStartupSec/OnUnitActiveSec (owner 2026-10-18,
-# second death same day). Boot/manager-relative elapses get SKIPPED when the
-# user manager arms the timer after boot+15s already passed (boot-skip: one
-# seat's tick ran dead 8 weeks while reporting healthy), and the monotonic
-# OnUnitActiveSec leg decays again on long-lived managers (failed oneshot
-# runs + daemon-reload re-computation left NextElapseUSecMonotonic=infinity
-# within hours of the morning fix — caught by the doctor's dead-shape probe
-# the same afternoon). A wall-clock schedule ALWAYS yields a next elapse;
-# that is the ygg-panic.timer lesson, now applied here too. Every minute at
-# :30, deliberately off the :00/:43/:17 jobs.
-OnCalendar=*-*-* *:*:30
+# ⛔ OnCalendar + RemainAfterElapse=no — the THIRD and final form of this
+# timer (owner 2026-10-18, three deaths in one day):
+#   1. OnBootSec=15s boot-skip: user manager arms after boot+15s, the elapse
+#      is skipped, no anchor ever -> dead 8 weeks while reporting healthy.
+#   2. OnStartupSec/OnUnitActiveSec monotonic decay: failed oneshot runs +
+#      daemon-reload elapse re-computation -> NextElapse=infinity within hours.
+#   3. Per-minute OnCalendar with a 4-7 MIN oneshot: the run spans several
+#      boundaries; under default RemainAfterElapse=yes the timer holds
+#      'elapsed' until the service exits -> effectively continuous
+#      back-to-back syncing (369MB peaks, no idle), still no visible next
+#      elapse while running.
+# Wall-clock schedule ALWAYS yields a next elapse; RemainAfterElapse=no
+# makes an overlapped elapse re-fire as soon as the service exits instead
+# of waiting for another boundary; every-5-minutes matches the real sync
+# duration so runs pace instead of stacking. :30 offset, off the
+# :00/:17/:43 jobs.
+OnCalendar=*-*-* *:0/5:30
+RemainAfterElapse=no
 AccuracySec=5s
 RandomizedDelaySec=5s
 Persistent=true

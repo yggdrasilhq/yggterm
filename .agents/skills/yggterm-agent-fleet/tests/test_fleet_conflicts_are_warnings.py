@@ -132,7 +132,9 @@ def run():
         # to no-next-elapse on long-lived managers (both died silently). A
         # wall-clock schedule always yields a next elapse.
         check("timer uses OnCalendar (wall-clock, always a next elapse)",
-              any(d.startswith("OnCalendar=*-*-* *:*:30") for d in directives))
+              any(d.startswith("OnCalendar=*-*-* *:0/5:30") for d in directives))
+        check("timer sets RemainAfterElapse=no (overlap re-fires after exit)",
+              any(d == "RemainAfterElapse=no" for d in directives))
         check("timer uses no relative elapse directives",
               not any(d.startswith(("OnBootSec", "OnStartupSec", "OnUnitActiveSec")) for d in directives))
     else:
