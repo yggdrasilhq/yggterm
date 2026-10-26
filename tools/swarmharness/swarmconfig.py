@@ -854,6 +854,13 @@ def _validate_pressure(f, cfg):
             if pcs_ok is not None:
                 pool_of.setdefault(b, []).append((pid, pcs_ok))
 
+    # typed local defaults: faulted values never reach comparisons
+    # (F35.10rrr)
+    dpcs = ceilings.get("default_profile_concurrent_slots", 1)
+    dbcs = ceilings.get("default_binding_concurrent_slots", 1)
+    dpcs = dpcs if type(dpcs) is int else 1
+    dbcs = dbcs if type(dbcs) is int else 1
+
     def _ceil_profile(pid):
         # ONE canonical resolver (F35.7rr): an alias resolves to its
         # canonical profile's explicit ceiling before any fallback
@@ -864,12 +871,12 @@ def _validate_pressure(f, cfg):
             b = canon[:-len("/default")]
             if b in bceil:
                 return bceil[b]
-        return ceilings.get("default_profile_concurrent_slots", 1)
+        return dpcs
 
     def _ceil_binding(b):
         if b in bceil:
             return bceil[b]
-        return ceilings.get("default_binding_concurrent_slots", 1)
+        return dbcs
 
     def _target_bounds(where, pid, n):
         if not isinstance(n, int) or isinstance(n, bool) or n < 1:
@@ -969,8 +976,12 @@ def _validate_pressure(f, cfg):
     demand = demand or {}
     _pkeys(f, "supply.pressure.demand", demand, _DEMAND_KEYS, {"level"})
     lvl = demand.get("level")
-    if lvl is not None and lvl not in levels:
-        _fault(f, "PRESSURE_REF", f"supply.pressure.demand.level -> {lvl}")
+    if lvl is not None:
+        if not isinstance(lvl, str):
+            _fault(f, "PRESSURE_REF",
+                   f"supply.pressure.demand.level: string required")
+        elif lvl not in levels:
+            _fault(f, "PRESSURE_REF", f"supply.pressure.demand.level -> {lvl}")
     dem_over = _pmap(f, "supply.pressure.demand.profile_slot_overrides",
                      demand.get("profile_slot_overrides"))
     _canon_conflict("supply.pressure.demand.profile_slot_overrides", dem_over)
@@ -1003,6 +1014,8 @@ def _validate_pressure(f, cfg):
                 _fault(f, "PRESSURE_SCHEMA",
                        f"supply.pressure.control.{lst_key}: non-empty strings")
     for x in (control_ok.get("agent_level_names") or []):
+        if not isinstance(x, str):
+            continue  # faulted above; unhashable never reaches membership
         if x not in levels:
             _fault(f, "PRESSURE_DELEGATION",
                    f"supply.pressure.control.agent_level_names -> {x}")
@@ -1042,6 +1055,8 @@ def _validate_pressure(f, cfg):
                           (control_ok.get("agent_profile_refs") or [])
                           if isinstance(x, str)}
         for lvl_name in (control_ok.get("agent_level_names") or []):
+            if not isinstance(lvl_name, str):
+                continue  # faulted above; unhashable never reaches lookup
             if base_name and base_name != lvl_name:
                 eb = _expanded(base_name)
                 el = _expanded(lvl_name)
@@ -1262,15 +1277,18 @@ def pressure_view(cfg):
 
         def _family_limit(rid, r):
             """Original legacy limits: a direct role-id entry, else the
-            role's single declared profile-family (e.g. dreamers.profiles
-            key ux_parity) when per_family names families, not roles
-            (F35.11rr). No invented limits."""
+            role's declared profile-families (e.g. dreamers.profiles key
+            ux_parity) when per_family names families, not roles. A
+            multi-family role takes the MOST RESTRICTIVE matching limit —
+            all-zero families must deny, never silently drop (F35.11rrr).
+            No invented limits."""
             lim = per_family.get(rid)
             if lim is None:
-                fams = [k for k in per_family
-                        if k in (r.get("profiles") or {})]
-                if len(fams) == 1:
-                    lim = per_family[fams[0]]
+                fams = [per_family[k] for k in per_family
+                        if k in (r.get("profiles") or {})
+                        and isinstance(per_family[k], int)]
+                if fams:
+                    lim = min(fams)
             return lim
         out["global_ceiling"] = g if isinstance(g, int) else None
         lim = out["global_ceiling"]

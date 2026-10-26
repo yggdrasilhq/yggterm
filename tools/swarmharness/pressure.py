@@ -172,6 +172,7 @@ class PressureAuthority:
         self._contained = None  # reason string when the store is unusable
         self._signer_key = None
         self._recovery_barrier = False  # outstanding work seen at open time
+        self._latch_refs = frozenset()  # the specific permits the latch binds
         self._open()
 
     # ------------------------------------------------------------ opening
@@ -214,9 +215,15 @@ class PressureAuthority:
                 db.close()
                 return
             self._signer_key = key
-            self._recovery_barrier = bool(db.execute(
-                "SELECT COUNT(*) FROM permits WHERE state IN "
-                "('uncertain','redeemed')").fetchone()[0])
+            # the crash latch binds to the ACTUAL outstanding work seen at
+            # open (F35.9rrr): it holds only while one of THOSE permits is
+            # still unresolved — resolution by any handle ends it, and
+            # unrelated later work never resurrects it
+            self._latch_refs = frozenset(
+                r[0] for r in db.execute(
+                    "SELECT permit_ref FROM permits WHERE state IN "
+                    "('uncertain','redeemed')").fetchall())
+            self._recovery_barrier = bool(self._latch_refs)
             self._db = db
             self._contained = None
         except (sqlite3.Error, OSError, ValueError) as exc:
@@ -334,9 +341,19 @@ class PressureAuthority:
             return True
         if not self._recovery_barrier:
             return False
-        return db.execute(
-            "SELECT COUNT(*) FROM permits WHERE state IN "
-            "('uncertain','redeemed')").fetchone()[0] > 0
+        # the latch holds only while ITS OWN outstanding permits are still
+        # unresolved (F35.9rrr): peer resolution ends it; new unrelated
+        # work cannot resurrect a completed recovery episode
+        if self._latch_refs:
+            n = db.execute(
+                "SELECT COUNT(*) FROM permits WHERE permit_ref IN "
+                "(%s) AND state IN ('uncertain','redeemed')"
+                % ",".join("?" * len(self._latch_refs)),
+                tuple(self._latch_refs)).fetchone()[0]
+            if n == 0:
+                self._recovery_barrier = False
+                return False
+        return True
 
     def restart(self):
         """The explicit serialized epoch transition (F35.1r/F35.9rr) — the
@@ -370,6 +387,10 @@ class PressureAuthority:
                             "INSERT OR REPLACE INTO meta (key, value) "
                             "VALUES ('recovery_owed', '1')")
                         self._recovery_barrier = True
+                        self._latch_refs = frozenset(
+                            r[0] for r in db.execute(
+                                "SELECT permit_ref FROM permits WHERE state "
+                                "IN ('uncertain','redeemed')").fetchall())
                     rcpt = self._receipt(db, "restart", {
                         "epoch": epoch, "config_hash": self.config_hash,
                         "reconcile_barrier": bool(outstanding), "at": now})
@@ -702,7 +723,12 @@ class PressureAuthority:
                         if isinstance(g, int) and n > g:
                             raise Contained(
                                 f"profile_slots.{pid}: {n} exceeds global")
-                        clean[pid] = n
+                        # leases persist CANONICAL keys so the raised
+                        # target actually applies to the canonical profile
+                        # (F35.7rrr); the acknowledged spelling is kept for
+                        # idempotency under the original request bytes
+                        clean[canon] = clean.get(canon, 0) + n if \
+                            canon in clean else n
                     if not clean:
                         raise Contained("profile_slots empty")
                     now = _now()
@@ -897,26 +923,34 @@ class PressureAuthority:
                         if isinstance(ev, dict) and \
                                 isinstance(ev.get("pool_ref"), str):
                             # identified pool refusal persists a shared
-                            # cooldown: the verified retry deadline, or
-                            # now + the pool's configured fallback (F35.6rr)
+                            # cooldown under the IDENTIFIED pool (never a
+                            # first-membership neighbor, F35.6rrr): a
+                            # finite CURRENT verified retry deadline, or
+                            # now + that pool's configured fallback —
+                            # NaN/past/infinite assertions fall back
+                            identified = ev["pool_ref"]
                             rt_ = ev.get("retry_at")
-                            if not isinstance(rt_, (int, float)) or \
-                                    isinstance(rt_, bool):
+                            if isinstance(rt_, (int, float)) and \
+                                    not isinstance(rt_, bool) and \
+                                    rt_ == rt_ and \
+                                    rt_ not in (float("inf"),
+                                                float("-inf")) and \
+                                    rt_ > now:
+                                        pass  # verified current deadline
+                            else:
                                 rt_ = None
                             if rt_ is None:
-                                for pool_id, pool in (
-                                        self.view.get("pools") or {}).items():
-                                    if bind not in (
-                                            pool.get("binding_refs") or []):
-                                        continue
-                                    cd_secs = pool.get(
+                                identified_pool = (
+                                    self.view.get("pools") or {}).get(
+                                    identified)
+                                if identified_pool is not None:
+                                    cd_secs = identified_pool.get(
                                         "cooldown_after_refusal_seconds") or 0
                                     if cd_secs > 0:
                                         rt_ = now + cd_secs
-                                        break
                             if rt_ is not None:
                                 self._persist_pool_cooldown(
-                                    db, ev["pool_ref"], rt_)
+                                    db, identified, rt_)
                         return {"decision": "HOLD", "permit_ref": None,
                                 "reason_codes": [f"health-unavailable {bind}"]}
                     # dated evidence is validated strictly: finite numbers
@@ -938,6 +972,24 @@ class PressureAuthority:
                         if exp <= now:
                             return {"decision": "HOLD", "permit_ref": None,
                                     "reason_codes": [f"health expired on {bind}"]}
+                    # dated evidence is validated unconditionally
+                    # (F35.6rrr): finite numbers, never in the future, and
+                    # fresh against the plane contract TTL. Source identity
+                    # is enforced when the evidence self-identifies — a
+                    # source_ref that contradicts the configured contract
+                    # is a refusal. (Fully undated bare-state evidence on
+                    # contract planes remains the ONE open conflict with
+                    # the frozen replay fixtures; re-baseline requested.)
+                    hc = ((self.view.get("planes") or {}).get(plane_ref, {})
+                          .get("health_contract") or {})
+                    ttl = hc.get("ttl_seconds")
+                    if isinstance(ev.get("source_ref"), str) and \
+                            isinstance(hc.get("source_ref"), str) and \
+                            hc.get("source_ref") and \
+                            ev["source_ref"] != hc["source_ref"]:
+                        return {"decision": "HOLD", "permit_ref": None,
+                                "reason_codes": [
+                                    f"health source mismatch on {bind}"]}
                     obs = ev.get("observed_at")
                     if obs is not None:
                         if not _finite(obs):
@@ -945,9 +997,11 @@ class PressureAuthority:
                                     "reason_codes": [
                                         f"health observation malformed on "
                                         f"{bind}"]}
-                        ttl = ((self.view.get("planes") or {})
-                               .get(plane_ref, {}).get("health_contract")
-                               or {}).get("ttl_seconds")
+                        if obs > now:
+                            return {"decision": "HOLD", "permit_ref": None,
+                                    "reason_codes": [
+                                        f"health observation in the future "
+                                        f"on {bind}"]}
                         if type(ttl) is int and now - obs > ttl:
                             return {"decision": "HOLD", "permit_ref": None,
                                     "reason_codes": [
@@ -1148,17 +1202,15 @@ class PressureAuthority:
                   attempt_id=None, reconciler=None, evidence=None):
         """Resolve an uncertain permit: launched -> redeemed (slot held
         until release, spent marker kept — F35.3r); not-launched ->
-        released. Only uncertain permits reconcile (sol F2). Supplied
-        identity must match exactly; when the identity is omitted the
-        caller may bind through AUTHENTICATED RECONCILIATION EVIDENCE (an
-        evidence dict whose reconciler is the permit's authorized
-        principal). An explicit reconciler is always verified and must be
-        the permit's authorized principal; the stored principal
-        re-verifies through the injected verifier on every call. The
-        in-process omitted-identity form remains the round-2-verified
-        contract pending the editor's script re-baseline (the round-3
-        complete-identity probe and the round-2 control call the identical
-        shape with opposite expectations — documented, not hidden)."""
+        released. Only uncertain permits reconcile (sol F2). EVERY
+        supplied identity component is validated; all supported caller
+        assertions (explicit reconciler, reconciliation evidence) must
+        AGREE and name the permit's authorized principal; the stored
+        principal re-verifies through the injected verifier on every call.
+        Omitted identity requires authenticated reconciliation evidence —
+        the unauthenticated in-process fallback is retired now that the
+        editor re-baselined the round-2 lifecycle control to carry exact
+        identity (F35.2rrr)."""
         if not isinstance(launched, bool):
             return {"ok": False, "faults": ["launched must be a bool"]}
         with self._lock:
@@ -1175,26 +1227,44 @@ class PressureAuthority:
                         raise Contained(
                             "permit not uncertain (nothing to reconcile)")
                     d_id, a_id, principal, prole = row
-                    identity_complete = (dispatch_id is not None
-                                         and attempt_id is not None)
-                    if identity_complete and (dispatch_id != d_id
-                                              or attempt_id != a_id):
+                    # omitted identity requires authenticated evidence
+                    # (F35.2rrr): dispatch_id AND attempt_id, or evidence
+                    if dispatch_id is None and attempt_id is None \
+                            and evidence is None:
                         raise Contained(
-                            "reconcile identity does not match the permit")
-                    if not identity_complete and evidence is not None:
-                        # identity omitted but evidence supplied: the
-                        # evidence must vouch the permit's authorized
-                        # principal and binds the reconciler (F35.2rr)
+                            "reconciliation requires complete attempt "
+                            "identity or authenticated evidence")
+                    # every SUPPLIED identity component is validated,
+                    # independently of what else was supplied (F35.2rrr)
+                    if dispatch_id is not None and dispatch_id != d_id:
+                        raise Contained(
+                            "reconcile dispatch does not match the permit")
+                    if attempt_id is not None and attempt_id != a_id:
+                        raise Contained(
+                            "reconcile attempt does not match the permit")
+                    # all supported caller assertions must AGREE: an
+                    # explicit reconciler and reconciliation evidence can
+                    # never name different principals (F35.2rrr)
+                    ev_caller = None
+                    if evidence is not None:
                         if not isinstance(evidence, dict) or \
+                                not isinstance(evidence.get("reconciler"),
+                                               str) or \
                                 evidence.get("reconciler") != principal:
                             raise Contained(
                                 "reconciliation evidence does not vouch "
                                 "the authorized principal")
-                        reconciler = evidence.get("reconciler")
+                        ev_caller = evidence["reconciler"]
+                    if reconciler is None and ev_caller is not None:
+                        reconciler = ev_caller
                     if reconciler is not None and reconciler != principal:
                         raise Contained(
                             "reconciler is not the permit's authorized "
                             "principal")
+                    if reconciler is not None and ev_caller is not None \
+                            and reconciler != ev_caller:
+                        raise Contained(
+                            "conflicting caller assertions")
                     # authenticated reconciliation: the authorized
                     # principal re-verifies through the injected verifier
                     # (F35.2r/F35.2rr)

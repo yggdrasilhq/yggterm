@@ -3161,16 +3161,19 @@ def main():
         "sol-editor/default"] = 40
     check("T36-16 alias override bounded by canonical ceiling",
           any(x["code"] == "PRESSURE_BOUNDS" for x in sc.validate(bad)))
-    lal = t36_auth("alias-lease")
+    vlow = sc.pressure_view(v3)
+    vlow["baseline"]["sol-high"] = 1
+    lal = t36_auth("alias-lease", view=vlow, config_hash="t36-alias-low")
     lr = lal.lease(request_id="alias-lease-1",
                    expected_config_hash=lal.config_hash,
                    verified_principal="worker",
                    issuer_role_ref="intelligence",
-                   profile_slots={"sol-editor/default": 2},
+                   profile_slots={"sol-editor/default": 5},
                    ttl_seconds=60, expected_lease_revision=0)
-    check("T36-16b alias lease key resolves canonical delegation",
-          lr.get("ok") and lr["profile_slots"] == {"sol-editor/default": 2},
-          json.dumps(lr)[:140])
+    check("T36-16b alias lease resolves delegation and applies canonically",
+          lr.get("ok") and lr["profile_slots"] == {"sol-high": 5}
+          and lal.status()["desired"].get("sol-high") == 5,
+          json.dumps([lr, lal.status()["desired"].get("sol-high")])[:200])
     # F35.9rr: restart invalidates ALL unredeemed grants; shared recovery
     # obligation; peer latch clears from authoritative resolution
     r36 = t36_auth("restart2")
@@ -3261,6 +3264,138 @@ def main():
           and any("dreamers" in rc for rc in x["reason_codes"]),
           json.dumps(x.get("reason_codes"))[:160])
     pr._now = real_now
+
+
+    # =====================================================================
+    # T36c — pressure repair v5 (round-4 residuals F35.2rrr-F35.11rrr).
+    # =====================================================================
+    # F35.2rrr: caller-assertion consistency + the evidence gate
+    # (a fresh uncertain permit per case — successful reconciliation
+    # consumes the uncertainty)
+    c5 = t36_auth("c5")
+
+    def c5_uncertain(tag):
+        p = t36_admit(c5, f"c5-{tag}")["permit_ref"]
+        c5.mark_uncertain(p)
+        return p
+
+    pg0 = c5_uncertain("g0")
+    r = c5.reconcile(pg0, launched=False)
+    # the refused resolution leaves g0 uncertain + the barrier set — clear
+    # it with the authenticated path so later cases admit
+    c5.reconcile(pg0, launched=False, evidence={"reconciler": "worker"})
+    r2 = c5.reconcile(c5_uncertain("g1"), launched=False,
+                      evidence={"reconciler": "worker"})
+    r3 = c5.reconcile(c5_uncertain("g2"), launched=False, reconciler="worker",
+                      evidence={"reconciler": "worker"})
+    r4 = c5.reconcile(c5_uncertain("g3"), launched=False, reconciler="reviewer",
+                      evidence={"reconciler": "worker"})
+    r5 = c5.reconcile(c5_uncertain("g4"), launched=False, dispatch_id="wrong",
+                      attempt_id="a", evidence={"reconciler": "worker"})
+    r6 = c5.reconcile(c5_uncertain("g5"), launched=False, dispatch_id="c5-g5",
+                      attempt_id="a", evidence={"reconciler": "reviewer"})
+    check("T36-20 evidence gate + caller-assertion agreement",
+          not r.get("ok") and r2.get("ok") and r3.get("ok")
+          and not r4.get("ok") and not r5.get("ok") and not r6.get("ok"),
+          json.dumps([r, r2, r4, r5, r6])[:400])
+    # F35.6rrr: future observation; NaN/past/infinite retry fall back to
+    # the configured cooldown; identified-pool cooldown lookup
+    cfg5 = json.loads(json.dumps(v3))
+    cfg5["supply"]["pressure"]["ceilings"]["pools"]["codex-sol"][
+        "cooldown_after_refusal_seconds"] = 60
+    cfg5["supply"]["pressure"]["ceilings"]["pools"]["slow-sol"] = {
+        "binding_refs": ["sol-editor"], "concurrent_slots": 96,
+        "cooldown_after_refusal_seconds": 180}
+    for name, refusal in [
+            ("nan-retry", {"state": "refused", "pool_ref": "slow-sol",
+                           "retry_at": float("nan")}),
+            ("past-retry", {"state": "refused", "pool_ref": "slow-sol",
+                            "retry_at": clock[0] - 5}),
+            ("inf-retry", {"state": "refused", "pool_ref": "slow-sol",
+                           "retry_at": float("inf")})]:
+        h5 = t36_auth(f"c5-{name}", cfg5)
+        seen4 = [0]
+
+        def once_refused(b, _refusal=refusal, _seen=seen4):
+            _seen[0] += 1
+            if _seen[0] == 1:
+                return _refusal
+            return {"state": "ok"}
+
+        h5.health_evidence = once_refused
+        x = t36_admit(h5, f"c5-{name}-d")
+        y = t36_admit(h5, f"c5-{name}-peer", profile="sol-medium")
+        check(f"T36-21 {name} falls back to the configured cooldown",
+              x["decision"] == "HOLD" and y["decision"] == "HOLD"
+              and any("cooldown" in rc for rc in y["reason_codes"]),
+              json.dumps([x.get("reason_codes"),
+                          y.get("reason_codes")])[:200])
+    h5 = t36_auth("c5-future-obs",
+                  health=lambda b: {"state": "ok",
+                                    "observed_at": clock[0] + 10000})
+    x = t36_admit(h5, "c5-future-obs-d")
+    check("T36-21 future observation fail-closed",
+          x["decision"] == "HOLD", json.dumps(x.get("reason_codes"))[:160])
+    # identified-pool cooldown: refusal names slow-sol (180s); the shared
+    # 5s... codex-sol 60s neighbor must not clear it early
+    h5 = t36_auth("c5-identified", cfg5)
+    seen3 = [0]
+
+    def refusing3(b):
+        seen3[0] += 1
+        if seen3[0] == 1:
+            return {"state": "refused", "pool_ref": "slow-sol"}
+        return {"state": "ok"}
+
+    h5.health_evidence = refusing3
+    x = t36_admit(h5, "c5-id-first")
+    clock[0] += 61  # past codex-sol's 60s, well inside slow-sol's 180s
+    y = t36_admit(h5, "c5-id-peer", profile="sol-medium")
+    check("T36-21b cooldown keyed by the IDENTIFIED pool",
+          x["decision"] == "HOLD" and y["decision"] == "HOLD"
+          and any("slow-sol" in rc for rc in y["reason_codes"]),
+          json.dumps(y.get("reason_codes"))[:160])
+    clock[0] = 1800000000.0
+    # F35.9rrr: a resolved peer latch never resurrects on new healthy work
+    ra = t36_auth("c5-latch")
+    pl = t36_launch(ra, "latch-old")
+    rb = pr.PressureAuthority(
+        ra.view, ra.config_hash, state_dir=ra.db_path.parents[2],
+        health_evidence=ra.health_evidence,
+        principal_verifier=ra.principal_verifier, budgets=ra.budgets,
+        plane_budgets=ra.plane_budgets)
+    check("T36-22 latch binds to open-time outstanding work",
+          rb.status()["reconcile_barrier"])
+    ra.release(pl)
+    x = t36_admit(rb, "latch-mid")
+    check("T36-22b peer resolution ends the latch", x["decision"] == "ALLOW")
+    pl2 = t36_launch(ra, "latch-new")
+    x = t36_admit(rb, "latch-after-new")
+    check("T36-22c new unrelated work never resurrects the latch",
+          x["decision"] == "ALLOW", json.dumps(x)[:140])
+    ra.release(pl2)
+    # F35.11rrr: multi-family legacy roles take the most restrictive limit
+    leg5 = json.loads(json.dumps(v3))
+    leg5["supply"].pop("pressure")
+    leg5["supply"]["admission"] = {"global_max_concurrent": 8,
+                                   "per_family": {"ux_parity": 0,
+                                                  "ux_second": 0}}
+    leg5["roles"]["dreamers"] = {
+        "kind": "execution",
+        "profiles": {"ux_parity": {"binding_ref": "glm-workhorse"},
+                     "ux_second": {"binding_ref": "glm-workhorse"}}}
+    leg5.setdefault("planes", {})["workhorse"] = {
+        "owner_policy": "enabled", "binding_refs": ["glm-workhorse"],
+        "budget_refs": []}
+    la5 = t36_auth("legacy5", leg5)
+    la5.token_accounting = lambda bid, plane: True
+    x = la5.admit(dispatch_id="lg5-1", attempt_id="a",
+                  verified_principal="dreamer", role_ref="dreamers",
+                  profile_ref="glm-workhorse/default", plane_ref=None)
+    check("T36-23 multi-family all-zero legacy roles deny",
+          x["decision"] == "HOLD"
+          and any("dreamers" in rc for rc in x["reason_codes"]),
+          json.dumps(x.get("reason_codes"))[:160])
 
     pr._now = real_now
 
