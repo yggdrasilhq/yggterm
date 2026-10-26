@@ -294,9 +294,12 @@ def extract_page_with_state(source_kind, path, gen, lineage, page_text,
     # until recurrence (sol t32 F32.2) — count-1 commands carry hunts too.
     # Unspent windows ride on.
     still = []
+    resolved = set()  # fingerprints that emitted OR retained this call
     for h in hunting:
         close = next((e for e in err_lines if h["window"] - (e + 1) >= 0),
                      None)
+        if h["fp"] in resolved:
+            continue  # consumed fingerprints never double-close (F33.1)
         if close is not None:
             if cmd_fps.get(h["fp"], 0) >= 2:
                 observations.append(make_observation(
@@ -306,6 +309,7 @@ def extract_page_with_state(source_kind, path, gen, lineage, page_text,
                 att_offs.pop(h["fp"], None)  # evidence consumed once
             else:
                 att_offs.setdefault(h["fp"], line_offs[close])
+            resolved.add(h["fp"])
         elif h["window"] - len(bare) > 0:
             still.append({**h, "window": h["window"] - len(bare)})
 
@@ -315,8 +319,9 @@ def extract_page_with_state(source_kind, path, gen, lineage, page_text,
     # boundaries no longer decide whether a loop exists. Every instance
     # carries its remaining window; a fingerprint that emitted here never
     # re-carries (no double emission).
-    emitted_here = set()
     for fp, idxs in instances.items():
+        if fp in resolved:
+            continue  # already closed/retained via a carried hunt (F33.1)
         hit = next((e for i in idxs for e in err_lines if i < e <= i + 3),
                    None)
         if hit is not None:
@@ -326,18 +331,18 @@ def extract_page_with_state(source_kind, path, gen, lineage, page_text,
                     f"bytes@{line_offs[hit]}", fp, lineage,
                     status="unverified-symptom"))
                 att_offs.pop(fp, None)  # fresh closure consumes evidence
-                emitted_here.add(fp)
             else:
                 att_offs.setdefault(fp, line_offs[hit])
+            resolved.add(fp)
         elif fp in att_offs and cmd_fps[fp] >= 2:
             observations.append(make_observation(
                 "cmd-failure-loop", "medium", source_kind, gen,
                 f"bytes@{att_offs[fp]}", fp, lineage,
                 status="unverified-symptom"))
             att_offs.pop(fp, None)  # emit once per retained evidence pair
-            emitted_here.add(fp)
+            resolved.add(fp)
         rem = 3 - (len(bare) - 1 - idxs[-1])
-        if rem > 0 and fp not in emitted_here:
+        if rem > 0 and fp not in resolved:
             still.append({"fp": fp, "window": rem,
                           "byte_off": line_offs[idxs[-1]]})
     pending_fps = still
@@ -402,57 +407,67 @@ def census(sources, cutoff=None, state_dir=None):
 # ------------------------------------------------------------ read
 
 def read_page(path, cursor=0, max_bytes=262144):
-    """Bounded page of COMPLETE lines. Bytes are buffered RAW and decoded
-    once per emitted block — a multibyte UTF-8 char split across a chunk
-    boundary is never half-decoded (t30 residue), and cursor arithmetic is
-    byte-exact (a decoded-text round-trip drifts when replacement chars
-    change byte lengths). The cursor only ever advances over EMITTED bytes
-    (progress guaranteed, sol t28 V3-N1). Returns (text, next_cursor, done,
-    line_offs) — line_offs are RAW-BYTE start offsets of the emitted
-    complete lines (sol t31 F31.4)."""
+    """Bounded page of COMPLETE records. Bytes are buffered RAW, framed by
+    the BYTE splitlines grammar (LF, CRLF and bare CR all terminate a
+    record — sol t33 F33.4), and decoded once per emitted block; cursor
+    arithmetic is byte-exact. The cursor only ever advances over EMITTED
+    bytes (progress guaranteed, sol t28 V3-N1). The oversized bound applies
+    to the individual leading unfinished record. Returns (text,
+    next_cursor, done, line_offs) — RAW-BYTE start offsets of the emitted
+    complete records (sol t31 F31.4)."""
+    if not isinstance(max_bytes, int) or isinstance(max_bytes, bool) \
+            or max_bytes <= 0:
+        raise ValueError(
+            f"max_bytes must be a positive int, got {max_bytes!r} (F33.6)")
     p = Path(path)
     size = p.stat().st_size
     raw = bytearray()
     pos = cursor
+    eof = False
     with p.open("rb") as f:
         f.seek(pos)
         while True:
             chunk = f.read(max_bytes)
             if not chunk:
-                done = True  # EOF: emit whatever remains as final lines
-                break
+                eof = True
+                break  # EOF: everything read is final
             raw += chunk
             pos += len(chunk)
-            if b"\n" in raw:
-                break
+            pieces = raw.splitlines(keepends=True)  # byte record grammar
+            if pieces and (pieces[0].endswith(b"\n")
+                           or pieces[0].endswith(b"\r")):
+                break  # at least one complete record is available
             if len(raw) > _MAX_CARRY:
+                # the leading UNFINISHED record alone exceeds the policy
+                # bound: drop exactly that record, advance past it (F33.4)
+                first = pieces[0] if pieces else raw
                 marker = f"<<oversized-event dropped at bytes@{cursor}>>\n"
-                return marker, pos, False, [cursor]
-    # raw-BYTE line starts in the SAME splitlines grammar as the
-    # extractors (bare CR etc.): a byte-preserving surrogateescape decode
-    # makes piece re-encoding exact, while replacement decoding stays
-    # detection-only (sol t31 F31.4, t32 F32.3)
-    def _starts(buf, base):
-        pieces = buf.decode("utf-8", errors="surrogateescape") \
-                    .splitlines(keepends=True)
-        out, s = [], 0
-        for piece in pieces:
-            out.append(base + s)
-            s += len(piece.encode("utf-8", errors="surrogateescape"))
-        return out
-    nl = raw.rfind(b"\n")
-    if nl >= 0:
-        emitted = raw[:nl + 1]
-        text = emitted.decode("utf-8", errors="replace")
-        # un-emitted trailing partial line stays unread: cursor rewinds to
-        # the start of that partial line so the next pass re-reads it whole
-        next_cursor = min(cursor + len(emitted), size)  # byte-exact
-        # done means EMITTED everything (sol t30 P5): an unterminated tail
-        # record must still be read — the handle reaching EOF is not done
-        return text, next_cursor, next_cursor >= size, _starts(emitted,
-                                                               cursor)
-    tail = raw.decode("utf-8", errors="replace")
-    return tail, pos, pos >= size, _starts(raw, cursor)
+                return marker, cursor + len(first), False, [cursor]
+    complete = []
+    partial = b""
+    if raw:
+        pieces = raw.splitlines(keepends=True)
+        if pieces and not (pieces[-1].endswith(b"\n")
+                           or pieces[-1].endswith(b"\r")):
+            partial = pieces[-1]
+            pieces = pieces[:-1]
+        complete = pieces
+    if eof and partial:
+        # the trailing unterminated record is the FINAL tail — emit it now
+        complete.append(partial)
+        partial = b""
+    emitted = b"".join(complete)
+    # raw-BYTE record starts: piece lengths are exact byte counts in the
+    # same framing grammar; replacement decoding stays detection-only
+    starts, s = [], 0
+    for piece in complete:
+        starts.append(cursor + s)
+        s += len(piece)
+    text = emitted.decode("utf-8", errors="replace")
+    next_cursor = min(cursor + len(emitted), size)  # byte-exact
+    # done means EMITTED everything (sol t30 P5): an unterminated tail
+    # record must still be read — the handle reaching EOF is not done
+    return text, next_cursor, next_cursor >= size, starts
 
 
 # ------------------------------------------------------------ store
@@ -597,7 +612,9 @@ def _load_cursors(state):
         # rebuilt with ONLY known keys: legacy/stale shapes (recent_fps,
         # carry, string pending entries) can never ride along (t30/t31)
         lin = v.get("lineage_id")
-        if lin is not None and not isinstance(lin, str):
+        if not isinstance(lin, str) or not lin:
+            # null/empty identity cannot detect inode replacement — the
+            # whole entry resets (sol t33 F33.3)
             notes.append(f"cursor entry {k[:40]}: invalid lineage — reset")
             continue
         clean[k] = {"cursor": c, "generation": v["generation"],
@@ -802,6 +819,12 @@ def tick(sources, state_dir=None, max_bytes_per_source=262144,
     """One BOUNDED pass (sol t25 #5): page budget stops the pass with
     explicit backlog reporting; generation validated around every commit;
     corrupted cursors reset explicitly; zero model calls."""
+    if not isinstance(max_bytes_per_source, int) \
+            or isinstance(max_bytes_per_source, bool) \
+            or max_bytes_per_source <= 0:
+        raise ValueError(
+            "max_bytes_per_source must be a positive int, got "
+            f"{max_bytes_per_source!r} (F33.6)")
     state = Path(state_dir).expanduser() if state_dir \
         else DEFAULT_STATE.expanduser()
     report = {"at": _now(), "census_sources": 0, "gaps": 0,
@@ -820,14 +843,21 @@ def tick(sources, state_dir=None, max_bytes_per_source=262144,
         else:
             raise ValueError("invalid cohort shape")
     except FileNotFoundError:
-        scanned = set()
+        # missing state is recovered the same as malformed state — a lost
+        # file must not silently erase completed scans (sol t33 F33.2)
+        report["notes"].append(
+            "scanned.json absent — cohort rebuilt from validated cursors")
+        scanned = {c["lineage_id"] for c in cursors.values()
+                   if isinstance(c.get("lineage_id"), str)
+                   and c["lineage_id"]}
     except Exception:
         # corruption never INVENTS cohort members (sol t32 F32.4): rebuild
         # from validated cursor lineage ids and say so
         report["notes"].append(
             "scanned.json invalid — cohort rebuilt from validated cursors")
-        scanned = {c.get("lineage_id") for c in cursors.values()
-                   if isinstance(c.get("lineage_id"), str)}
+        scanned = {c["lineage_id"] for c in cursors.values()
+                   if isinstance(c.get("lineage_id"), str)
+                   and c["lineage_id"]}
     pages = 0
     backlog = 0
     for entry in manifest["sources"]:
@@ -862,6 +892,7 @@ def tick(sources, state_dir=None, max_bytes_per_source=262144,
         lineage = entry["lineage_id"]
         cmd_fps, pending_fps, att_offs = _page_state(cstate, fresh)
         read_any = False
+        deferred = False
         while pages < max_pages and cur < size:
             text, nxt, done, line_offs = read_page(p, cur,
                                                    max_bytes_per_source)
@@ -880,7 +911,7 @@ def tick(sources, state_dir=None, max_bytes_per_source=262144,
                 report["notes"].append(
                     f"generation flapped mid-read: {entry['path']} — "
                     "page discarded, source deferred")
-                cur = size + 1  # force stop this source, commit nothing
+                deferred = True  # counted in backlog + gaps (F33.5)
                 break
             commit_batch(state, entry, obs, nxt,
                          {"cmd_fps": cmd_fps, "pending_fps": pending_fps,
@@ -890,7 +921,10 @@ def tick(sources, state_dir=None, max_bytes_per_source=262144,
                 break
         if read_any:
             scanned.add(lineage)
-        if cur < size and pages >= max_pages:
+        if deferred:
+            backlog += 1
+            report["gaps"] += 1
+        elif cur < size and pages >= max_pages:
             backlog += 1
     report["backlog_remaining"] = backlog
     # opportunities use the MEASURED scanned cohort (sol t31 F31.2), never

@@ -1739,7 +1739,8 @@ def main():
           json.dumps(rep21["notes"])[:160])
     (st21 / "cursors.json").write_text(json.dumps(
         {"queue_run::" + str(run_out):
-         {"cursor": 10 ** 12, "generation": "genX"}}))
+         {"cursor": 10 ** 12, "generation": "genX",
+          "lineage_id": "linX"}}))
     rep21b = cp.tick(sources, state_dir=st21, max_pages=10)
     check("N21b out-of-bounds cursor reset (never silently skips source)",
           rep21b["pages_read"] >= 1
@@ -1833,6 +1834,7 @@ def main():
     st30.mkdir(parents=True, exist_ok=True)
     (st30 / "cursors.json").write_text(json.dumps({
         "queue_run::a.out": {"cursor": 5, "generation": "sz1",
+                  "lineage_id": "lin1",
                   "cmd_fps": {"x": 1},
                   "pending_fps": [{"fp": "fp1", "window": 3, "byte_off": 9}],
                   "recent_fps": ["legacy"], "carry": "junk"},
@@ -2151,6 +2153,126 @@ def main():
           prop0 == [] and cap0.get("note")
           and propn == [] and capn.get("capacity") == "invalid claim_cap",
           json.dumps([len(prop0), cap0, len(propn)]))
+
+    # =====================================================================
+    # T34 closure — sol turn-33 findings F33.1-F33.6.
+    # =====================================================================
+
+    # T34-1 consumed hunts never double-close; replay partition-stable
+    # (F33.1)
+    ERRW = "NameError: name 'w' is not defined\n"
+    dw = fx / "dw.txt"
+    dw.write_text("$ w\n$ w\n" + ERRW)
+    cfw = {}
+    oW1, pW1, aW1 = cp.extract_page_with_state(
+        "queue_run", str(dw), "szW", "linW", dw.read_text(), 0, cfw, [])
+    dw2 = ERRW
+    oW2, pW2, aW2 = cp.extract_page_with_state(
+        "queue_run", str(dw), "szW", "linW", dw2, 12, cfw, pW1,
+        att_offs=aW1)
+    loopsW = [o for o in (oW1 + oW2)
+              if o["detector_id"] == "cmd-failure-loop"]
+    check("T34-1 one loop per fingerprint even when carried and local close",
+          len(loopsW) == 1 and not pW2,
+          json.dumps([(o["span"], o["fingerprint"]) for o in loopsW]))
+    st34w = temp_state() / "composer-t34w"
+    entW = {"path": str(dw), "generation": "szW",
+            "lineage_id": "linW", "source_kind": "queue_run"}
+    cp.commit_batch(st34w, entW, oW1 + oW2, 99,
+                    {"cmd_fps": cfw, "pending_fps": pW2})
+    storedW = len(cp.load_observations(st34w))
+    cp.commit_batch(st34w, entW, oW1 + oW2, 99,
+                    {"cmd_fps": cfw, "pending_fps": pW2})
+    check("T34-1b replay with same evidence never grows storage",
+          len(cp.load_observations(st34w)) == storedW,
+          json.dumps([storedW, len(oW1 + oW2)]))
+
+    # T34-2 missing scanned.json rebuilds with a note (F33.2)
+    st34m = temp_state() / "composer-t34m"
+    (fx / "m1.txt").write_text("plain\n")
+    cp.tick({"queue_run": [str(fx / "m1.txt")]}, state_dir=st34m,
+            max_pages=10)
+    (st34m / "scanned.json").unlink()
+    repM = cp.tick({"queue_run": [str(fx / "m1.txt")]}, state_dir=st34m,
+                   max_pages=10)
+    check("T34-2 absent cohort file rebuilds from cursors with a note",
+          any("scanned.json absent" in n for n in repM["notes"])
+          and repM["scanned_lineages"] == 1,
+          json.dumps([repM["notes"][-1][:80], repM["scanned_lineages"]]))
+
+    # T34-3 null/empty lineage resets the whole cursor entry (F33.3)
+    st34l = temp_state() / "composer-t34l"
+    st34l.mkdir(parents=True, exist_ok=True)
+    (st34l / "cursors.json").write_text(json.dumps({
+        "queue_run::a": {"cursor": 5, "generation": "g", "lineage_id": None,
+                         "cmd_fps": {}, "pending_fps": [], "att_offs": {}},
+        "queue_run::b": {"cursor": 6, "generation": "g", "lineage_id": "",
+                         "cmd_fps": {}, "pending_fps": [], "att_offs": {}}}))
+    cleanL, notesL = cp._load_cursors(st34l)
+    check("T34-3 null and empty lineage entries reset at load",
+          not cleanL and len(notesL) == 2, json.dumps(notesL))
+
+    # T34-4 CR-terminated records frame correctly; oversize is per-record
+    # (F33.4)
+    crf = fx / "cr.bin"
+    crf.write_bytes(b"rec A\rrec B\rrec C\r"
+                    b"NameError: name 'e' is not defined\n")
+    t4c, c4c, d4c, offs4c = cp.read_page(crf, 0, 262144)
+    obs4c, _, _ = cp.extract_page_with_state(
+        "queue_run", str(crf), "szC", "linC", t4c, 0, {}, [],
+        line_offs=offs4c)
+    check("T34-4a CR-terminated records frame; error span exact",
+          obs4c and any(o["span"] == "bytes@18" for o in obs4c),
+          json.dumps([(o["span"], o["detector_id"]) for o in obs4c]))
+    big = fx / "big.bin"
+    big.write_bytes(b"Z" * 70000 + b"rest")
+    tm, cm, dm, _ = cp.read_page(big, 0, 262144)
+    check("T34-4b oversized record dropped alone; cursor passes it",
+          "oversized" in tm and cm == 70004 and dm is False,
+          json.dumps([tm[:40], cm, dm]))
+
+    # T34-5 a deferred source counts in backlog and gaps (F33.5) —
+    # deterministic: generation returns a different token after census
+    st34d = temp_state() / "composer-t34d"
+    flap = fx / "flap.txt"
+    flap.write_text("one\nline\nline\nline\n")
+    real_gen = cp.generation
+    calls = {"n": 0}
+
+    def flappy_gen(p):
+        calls["n"] += 1
+        return "sz-flapped" if calls["n"] == 1 else real_gen(p)
+
+    cp.generation = flappy_gen
+    try:
+        repF = cp.tick({"queue_run": [str(flap)]}, state_dir=st34d,
+                       max_pages=10)
+    finally:
+        cp.generation = real_gen
+    check("T34-5 deferred source lands in backlog and gaps",
+          any("flapped" in n for n in repF["notes"])
+          and repF["gaps"] >= 1 and repF["backlog_remaining"] >= 1,
+          json.dumps([repF["gaps"], repF["backlog_remaining"],
+                      len(repF["notes"])]))
+
+    # T34-6 invalid byte budgets rejected (F33.6)
+    r6 = []
+    for budget in (0, -1, True):
+        try:
+            cp.read_page(fx / "m1.txt", 0, budget)
+            r6.append("accepted")
+        except ValueError:
+            r6.append("rejected")
+    try:
+        cp.tick({"queue_run": [str(fx / "m1.txt")]},
+                state_dir=temp_state() / "composer-t34g",
+                max_bytes_per_source=0)
+        r6.append("tick accepted")
+    except ValueError:
+        r6.append("tick rejected")
+    check("T34-6 zero/negative/bool budgets rejected everywhere",
+          r6 == ["rejected", "rejected", "rejected", "tick rejected"],
+          json.dumps(r6))
 
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
     if FAIL:
