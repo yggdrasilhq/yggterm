@@ -52,7 +52,7 @@ from swarmconfig import atomic_write_json
 from session_review import SessionReview
 
 DEFAULT_STATE = Path("~/.yggterm/swarm/composer")
-DETECTOR_VERSION = "det-v2"
+DETECTOR_VERSION = "det-v3"
 SUPPORTED_SOURCES = ("zcode_rollout", "codex_session", "queue_run",
                      "review_chain", "board")
 _SEVERITIES = ("high", "medium", "low")
@@ -170,7 +170,8 @@ def make_observation(detector_id, severity, source_kind, gen, span, fp,
             "lineage_id": lineage, "span": span, "fingerprint": fp,
             "at": _now()}
     body["dedupe_key"] = _sha(_canonical(
-        [lineage, gen, span, detector_id, DETECTOR_VERSION, fp]))
+        [source_kind, lineage, gen, span, detector_id, DETECTOR_VERSION,
+         fp]))
     return body
 
 
@@ -198,22 +199,28 @@ def validate_observation(obs):
         if not isinstance(obs[k], str) or not obs[k]:
             return f"{k} must be a nonempty string"
     key = _sha(_canonical(
-        [obs["lineage_id"], obs["generation"], obs["span"],
-         obs["detector_id"], obs["detector_version"],
+        [obs["source_kind"], obs["lineage_id"], obs["generation"],
+         obs["span"], obs["detector_id"], obs["detector_version"],
          obs["fingerprint"]]))
     if key != obs["dedupe_key"]:
         return "dedupe key mismatch (forged or stale observation)"
     return None
 
 
-def extract(source_kind, path, gen, lineage, page_text, byte_start):
+def extract(source_kind, path, gen, lineage, page_text, byte_start,
+            line_offs=None):
     """Single-page detector pass with ABSOLUTE byte-offset spans. Returns
     (observations, sig_at). Command-loop state is handled by
     extract_page_with_state."""
     observations = []
     lines = page_text.splitlines(keepends=True)  # CRLF-exact offsets (P6)
+    if line_offs is None or len(line_offs) < len(lines):
+        line_offs = []
+        off = byte_start
+        for line in lines:
+            line_offs.append(off)
+            off += len(line.encode("utf-8", errors="replace"))
     sig_at = {}
-    off = byte_start
     for i, line in enumerate(lines):
         bare = line.rstrip("\r\n")
         sig = _detect_line(bare)
@@ -221,19 +228,18 @@ def extract(source_kind, path, gen, lineage, page_text, byte_start):
             sig_at[i] = sig
             observations.append(make_observation(
                 f"sig-{sig}", "medium", source_kind, gen,
-                f"bytes@{off}", _sha(_normalize(bare))[:16],
+                f"bytes@{line_offs[i]}", _sha(_normalize(bare))[:16],
                 lineage, status="unverified-symptom"))
-        off += len(line.encode("utf-8", errors="replace"))
     return observations, sig_at
 
 
 def extract_page_with_state(source_kind, path, gen, lineage, page_text,
-                            byte_start, cmd_fps, pending_fps=None):
+                            byte_start, cmd_fps, pending_fps=None,
+                            att_offs=None, line_offs=None):
     """Detectors over one page of COMPLETE lines, with persistent per-source
-    loop state. Cross-page protocol (sol t26 #8): a fingerprint with >=2
-    instances and no observed adjacency rides in pending_fps; an error
-    signature in the next page's first two lines completes its loop. State
-    carries fingerprints only — never content (sol t26 N3)."""
+    loop state. State carries fingerprints, window counters and first-attempt
+    adjacency offsets — never content (sol t26 N3). Returns
+    (observations, pending_fps, att_offs)."""
     # Adjacency protocol (sol t30 P2, t25 #6): IN-PAGE, a repeated command
     # with an error in the three lines after ANY of its instances closes at
     # that error line (settled semantics). CROSS-PAGE, a repeated command
@@ -251,13 +257,15 @@ def extract_page_with_state(source_kind, path, gen, lineage, page_text,
                 and isinstance(p.get("byte_off"), int):
             hunting.append({"fp": p["fp"], "window": p["window"],
                             "byte_off": p["byte_off"]})
+    att_offs = dict(att_offs or {})
     observations = []
     lines = page_text.splitlines(keepends=True)  # CRLF-exact offsets (P6)
-    line_offs = []
-    off = byte_start
-    for line in lines:
-        line_offs.append(off)
-        off += len(line.encode("utf-8", errors="replace"))
+    if line_offs is None or len(line_offs) < len(lines):
+        line_offs = []
+        off = byte_start
+        for line in lines:
+            line_offs.append(off)
+            off += len(line.encode("utf-8", errors="replace"))
     bare = [line.rstrip("\r\n") for line in lines]
 
     # 1. signature observations; error lines are the closure anchors
@@ -297,9 +305,18 @@ def extract_page_with_state(source_kind, path, gen, lineage, page_text,
 
     # 4. in-page closure (t25 #6, unchanged); with no in-page closure the
     # lines AFTER the last instance have already spent their window, so
-    # only the unspent remainder carries across the boundary
+    # only the unspent remainder carries across the boundary.
+    # First-attempt retention (sol t31 F31.3): a count-1 command with an
+    # adjacent error retains that error's offset (att_offs, persisted); the
+    # loop EMITS at the retained offset when recurrence reaches two — page
+    # boundaries no longer decide whether a loop exists.
     for fp, idxs in instances.items():
         if cmd_fps[fp] < 2:
+            if cmd_fps[fp] == 1:
+                e0 = next((e for i in idxs for e in err_lines
+                           if i < e <= i + 3), None)
+                if e0 is not None:
+                    att_offs.setdefault(fp, line_offs[e0])
             continue
         hit = next((e for i in idxs for e in err_lines if i < e <= i + 3),
                    None)
@@ -308,6 +325,13 @@ def extract_page_with_state(source_kind, path, gen, lineage, page_text,
                 "cmd-failure-loop", "medium", source_kind, gen,
                 f"bytes@{line_offs[hit]}", fp, lineage,
                 status="unverified-symptom"))
+            att_offs.pop(fp, None)  # evidence consumed by the fresh closure
+        elif fp in att_offs:
+            observations.append(make_observation(
+                "cmd-failure-loop", "medium", source_kind, gen,
+                f"bytes@{att_offs[fp]}", fp, lineage,
+                status="unverified-symptom"))
+            att_offs.pop(fp, None)  # emit once per retained evidence pair
         else:
             rem = 3 - (len(bare) - 1 - idxs[-1])
             if rem > 0:
@@ -319,7 +343,7 @@ def extract_page_with_state(source_kind, path, gen, lineage, page_text,
     uniq = {}
     for o in observations:
         uniq[o["dedupe_key"]] = o
-    return list(uniq.values()), pending_fps
+    return list(uniq.values()), pending_fps, att_offs
 
 
 # ------------------------------------------------------------ census
@@ -380,7 +404,9 @@ def read_page(path, cursor=0, max_bytes=262144):
     boundary is never half-decoded (t30 residue), and cursor arithmetic is
     byte-exact (a decoded-text round-trip drifts when replacement chars
     change byte lengths). The cursor only ever advances over EMITTED bytes
-    (progress guaranteed, sol t28 V3-N1). Returns (text, next_cursor, done)."""
+    (progress guaranteed, sol t28 V3-N1). Returns (text, next_cursor, done,
+    line_offs) — line_offs are RAW-BYTE start offsets of the emitted
+    complete lines (sol t31 F31.4)."""
     p = Path(path)
     size = p.stat().st_size
     raw = bytearray()
@@ -398,17 +424,26 @@ def read_page(path, cursor=0, max_bytes=262144):
                 break
             if len(raw) > _MAX_CARRY:
                 marker = f"<<oversized-event dropped at bytes@{cursor}>>\n"
-                return marker, pos, False
+                return marker, pos, False, [cursor]
     nl = raw.rfind(b"\n")
     if nl >= 0:
-        text = raw[:nl + 1].decode("utf-8", errors="replace")
+        emitted = raw[:nl + 1]
+        # raw-BYTE line offsets (sol t31 F31.4): computed from the raw
+        # buffer — re-encoding replacement-decoded text shifts spans
+        starts = []
+        s = 0
+        for _ in range(emitted.count(b"\n")):
+            starts.append(cursor + s)
+            s = emitted.find(b"\n", s) + 1
+        text = emitted.decode("utf-8", errors="replace")
         # un-emitted trailing partial line stays unread: cursor rewinds to
         # the start of that partial line so the next pass re-reads it whole
-        next_cursor = min(cursor + nl + 1, size)  # byte-exact
+        next_cursor = min(cursor + len(emitted), size)  # byte-exact
         # done means EMITTED everything (sol t30 P5): an unterminated tail
         # record must still be read — the handle reaching EOF is not done
-        return text, next_cursor, next_cursor >= size
-    return raw.decode("utf-8", errors="replace"), pos, pos >= size
+        return text, next_cursor, next_cursor >= size, starts
+    tail = raw.decode("utf-8", errors="replace")
+    return tail, pos, pos >= size, [cursor] if tail else []
 
 
 # ------------------------------------------------------------ store
@@ -472,9 +507,12 @@ def commit_batch(state_dir, entry, observations, cursor, stats):
             raise ValueError(
                 "observation contradicts its source entry "
                 "(generation/lineage mismatch)")
-        if not entry["path"].startswith(obs["source_kind"]) and \
-                obs["source_kind"] not in SUPPORTED_SOURCES:
+        if obs["source_kind"] not in SUPPORTED_SOURCES:
             raise ValueError(f"unknown source kind {obs['source_kind']!r}")
+        if obs["source_kind"] != entry.get("source_kind"):
+            raise ValueError(
+                "observation stratum contradicts its source entry "
+                "(sol t31 F31.6)")
         prev = existing.get(obs["dedupe_key"])
         if prev is not None:
             # `at` is observation time, not identity: replay after a cursor
@@ -495,7 +533,8 @@ def commit_batch(state_dir, entry, observations, cursor, stats):
         "cursor": cursor, "generation": entry.get("generation"),
         "lineage_id": entry.get("lineage_id"),
         "cmd_fps": stats.get("cmd_fps", {}),
-        "pending_fps": list(stats.get("pending_fps", [])), "at": _now()}
+        "pending_fps": list(stats.get("pending_fps", [])),
+        "att_offs": dict(stats.get("att_offs", {})), "at": _now()}
     _atomic_write_json(state / "cursors.json", cursors)
     return {"appended": len(to_append)}
 
@@ -527,14 +566,19 @@ def _load_cursors(state):
             continue
         fps = v.get("cmd_fps", {})
         pfps = v.get("pending_fps", [])
+        aos = v.get("att_offs", {})
         if (not isinstance(fps, dict) or any(
                 not isinstance(fp, str) or type(n) is not int or n < 0
                 for fp, n in fps.items())
                 or not isinstance(pfps, list) or any(
                 not isinstance(p, dict) or not isinstance(p.get("fp"), str)
-                or type(p.get("window")) is not int or p["window"] < 0
+                or type(p.get("window")) is not int
+                or not 1 <= p["window"] <= 3  # protocol bounds (F31.5)
                 or type(p.get("byte_off")) is not int or p["byte_off"] < 0
-                for p in pfps)):
+                for p in pfps)
+                or not isinstance(aos, dict) or any(
+                not isinstance(a, str) or type(w) is not int or w < 0
+                for a, w in aos.items())):
             notes.append(f"cursor entry {k[:40]}: invalid detector state — "
                          "reset")
             continue
@@ -544,7 +588,8 @@ def _load_cursors(state):
                     "cmd_fps": fps,
                     "pending_fps": [{"fp": p["fp"], "window": p["window"],
                                      "byte_off": p["byte_off"]}
-                                    for p in pfps]}
+                                    for p in pfps],
+                    "att_offs": dict(aos)}
     return clean, notes
 
 
@@ -555,8 +600,10 @@ def _page_state(cstate, fresh):
     cross-page pairs (t26 N4; the v5 tick reset was clobbered by the
     unconditional cstate reload — caught in t30)."""
     if fresh:
-        return {}, []
-    return dict(cstate.get("cmd_fps", {})), list(cstate.get("pending_fps", []))
+        return {}, [], {}
+    return (dict(cstate.get("cmd_fps", {})),
+            list(cstate.get("pending_fps", [])),
+            dict(cstate.get("att_offs", {})))
 
 
 # ------------------------------------------------------------ patterns
@@ -743,6 +790,11 @@ def tick(sources, state_dir=None, max_bytes_per_source=262144,
     report["gaps"] = len(manifest["gaps"])
     cursors, cursor_notes = _load_cursors(state)
     report["notes"].extend(cursor_notes)
+    try:
+        scanned = set(json.loads((state / "scanned.json").read_text())
+                      or [])
+    except Exception:
+        scanned = set()  # measured cohort rebuilds from page reads
     pages = 0
     backlog = 0
     for entry in manifest["sources"]:
@@ -769,15 +821,19 @@ def tick(sources, state_dir=None, max_bytes_per_source=262144,
             cur, fresh = 0, True
         gen = entry["generation"]
         lineage = entry["lineage_id"]
-        cmd_fps, pending_fps = _page_state(cstate, fresh)
+        cmd_fps, pending_fps, att_offs = _page_state(cstate, fresh)
+        read_any = False
         while pages < max_pages and cur < size:
-            text, nxt, done = read_page(p, cur, max_bytes_per_source)
+            text, nxt, done, line_offs = read_page(p, cur,
+                                                   max_bytes_per_source)
             if not text:
                 break
-            obs, pending_fps = extract_page_with_state(
+            obs, pending_fps, att_offs = extract_page_with_state(
                 entry["source_kind"], entry["path"], gen, lineage, text,
-                cur, cmd_fps, pending_fps)
+                cur, cmd_fps, pending_fps, att_offs=att_offs,
+                line_offs=line_offs)
             pages += 1
+            read_any = True
             report["pages_read"] += 1
             report["observations"] += len(obs)
             # generation validated BEFORE recording (sol t25 #3)
@@ -788,15 +844,23 @@ def tick(sources, state_dir=None, max_bytes_per_source=262144,
                 cur = size + 1  # force stop this source, commit nothing
                 break
             commit_batch(state, entry, obs, nxt,
-                         {"cmd_fps": cmd_fps, "pending_fps": pending_fps})
+                         {"cmd_fps": cmd_fps, "pending_fps": pending_fps,
+                          "att_offs": att_offs})
             cur = nxt
             if done:
                 break
+        if read_any:
+            scanned.add(lineage)
         if cur < size and pages >= max_pages:
             backlog += 1
     report["backlog_remaining"] = backlog
+    # opportunities use the MEASURED scanned cohort (sol t31 F31.2), never
+    # the enrolled count; both are reported
+    _atomic_write_json(state / "scanned.json", sorted(scanned))
+    report["scanned_lineages"] = len(scanned)
+    report["enrolled_lineages"] = manifest.get("lineages", 0)
     patterns = group_patterns(load_observations(state),
-                              scanned_lineages=manifest.get("lineages", 0))
+                              scanned_lineages=len(scanned))
     report["patterns"] = sum(1 for p in patterns if p["eligible"])
     needs = read_needs(state)
     if not needs.get("available"):

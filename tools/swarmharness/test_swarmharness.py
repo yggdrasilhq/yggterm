@@ -1523,7 +1523,7 @@ def main():
     assembled, cur, done = "", 0, False
     guard = 0
     while not done and guard < 50:
-        t, cur, done = cp.read_page(longf, cur, 12)
+        t, cur, done, _o = cp.read_page(longf, cur, 12)
         assembled += t
         guard += 1
     check("M2 complete-line pages tile the file exactly (12-byte pages)",
@@ -1543,14 +1543,14 @@ def main():
           json.dumps(sorted(sigs)))
 
     # M3b cmd-failure-loop requires error adjacency (sol t25 #6)
-    obs_loop, _pend = cp.extract_page_with_state(
+    obs_loop, _pend, _ao = cp.extract_page_with_state(
         "queue_run", str(run_out), "genX", "linX", run_out.read_text(),
         0, {}, [])
     check("M3b failure loop with adjacent error detected",
           any(o["detector_id"] == "cmd-failure-loop" for o in obs_loop))
     benign = ("$ deploy prod\n$ deploy prod\n$ deploy prod\n"
               "all good, exiting cleanly\n")
-    obs_benign, _ = cp.extract_page_with_state(
+    obs_benign, _, _ = cp.extract_page_with_state(
         "queue_run", "b", "genB", "linB", benign, 0, {}, [])
     check("M3c benign repetition without error adjacency: no loop",
           not any(o["detector_id"] == "cmd-failure-loop"
@@ -1571,7 +1571,8 @@ def main():
           [o["dedupe_key"] for o in obs] == [o["dedupe_key"] for o in obs_b])
     st = temp_state() / "composer-m4"
     entry = {"path": str(run_out), "revision": "genX",
-             "generation": "genX", "lineage_id": "linX"}
+             "generation": "genX", "lineage_id": "linX",
+             "source_kind": "queue_run"}
     r1 = cp.commit_batch(st, entry, obs, 500, {"lines": 7})
     r2 = cp.commit_batch(st, entry, obs_b, 500, {"lines": 7})
     stored = cp.load_observations(st)
@@ -1611,7 +1612,7 @@ def main():
     v_ids = {(p["detector_id"], p["detector_version"]) for p in pats_v}
     check("M6c detector versions never mix silently",
           any(v == "det-v1" for _, v in v_ids)
-          and any(v == "det-v2" for _, v in v_ids))
+          and any(v == cp.DETECTOR_VERSION for _, v in v_ids))
 
     # M7 needs: absent snapshot explicit
     needs = cp.read_needs(temp_state() / "empty-needs")
@@ -1624,14 +1625,14 @@ def main():
         for i in range(n_demand):
             out.append({"pattern_id": f"d{i}",
                         "detector_id": f"det-d{i}", "severity": "medium",
-                        "detector_version": "det-v2",
+                        "detector_version": cp.DETECTOR_VERSION,
                         "independent_incidents": 2, "eligible": True,
                         "opportunities": 5, "strata": ["queue_run"],
                         "evidence": ["deadbeef"]})
         for i in range(n_explore):
             out.append({"pattern_id": f"x{i}",
                         "detector_id": f"det-x{i}", "severity": "low",
-                        "detector_version": "det-v2",
+                        "detector_version": cp.DETECTOR_VERSION,
                         "independent_incidents": 2, "eligible": True,
                         "opportunities": 5, "strata": ["board"],
                         "evidence": ["feedface"]})
@@ -1717,7 +1718,7 @@ def main():
     benign_doc = ("docs say: NameError: name 'q' is not defined is common\n"
                   "$ optional-missing-cmd\n$ optional-missing-cmd\n"
                   "fine\n")
-    obs_doc, _ = cp.extract_page_with_state(
+    obs_doc, _, _ = cp.extract_page_with_state(
         "queue_run", "doc", "genD", "linD", benign_doc, 0, {}, [])
     check("N20 benign controls: no high severity, no loop",
           not any(o["severity"] == "high" for o in obs_doc)
@@ -1814,7 +1815,7 @@ def main():
     utf.write_bytes("héllo wörld ✓ end\n".encode("utf-8"))
     asm, curu, doneu, guard = "", 0, False, 0
     while not doneu and guard < 200:
-        t, curu, doneu = cp.read_page(utf, curu, 1)
+        t, curu, doneu, _o = cp.read_page(utf, curu, 1)
         asm += t
         guard += 1
     check("T30-1 multibyte chars intact across 1-byte pages; cursor exact",
@@ -1822,7 +1823,7 @@ def main():
           and doneu and curu == utf.stat().st_size, repr(asm)[:120])
     trunc = fx / "trunc.txt"
     trunc.write_bytes("ok é".encode("utf-8")[:4])
-    tt, curt, donet = cp.read_page(trunc, 0, 64)
+    tt, curt, donet, _o = cp.read_page(trunc, 0, 64)
     check("T30-1b truncated trailing char -> replacement, no stall",
           donet and curt == 4 and "\ufffd" in tt, repr(tt))
 
@@ -1841,7 +1842,8 @@ def main():
     check("T30-2 pending_fps validated; legacy keys dropped on load",
           set(clean30) == {"a.out"}
           and set(clean30["a.out"]) ==
-              {"cursor", "generation", "cmd_fps", "pending_fps"}
+              {"cursor", "generation", "cmd_fps", "pending_fps",
+               "att_offs"}
           and clean30["a.out"]["pending_fps"] ==
               [{"fp": "fp1", "window": 3, "byte_off": 9}]
           and len(notes30) == 2,
@@ -1850,8 +1852,9 @@ def main():
     # T30-3 fresh detector state on reset (the v5 tick clobber bug)
     cs30 = {"cmd_fps": {"x": 9}, "pending_fps": ["old-fp"]}
     check("T30-3 reset picks FRESH detector state; continuing reloads",
-          cp._page_state(cs30, True) == ({}, [])
-          and cp._page_state(cs30, False) == ({"x": 9}, ["old-fp"]))
+          cp._page_state(cs30, True) == ({}, [], {})
+          and cp._page_state(cs30, False) ==
+              ({"x": 9}, ["old-fp"], {}))
 
     # T30-4 call_id transport tokens collapse (same fault, different ids)
     n1 = cp._normalize('"call_id": "chatcmpl-abc123"')
@@ -1884,23 +1887,23 @@ def main():
     ERR = "NameError: name 'q' is not defined\n"
     adj = fx / "adj.txt"
     adj.write_text("$ cmd\n$ cmd\nfiller\nfiller\nfiller\n" + ERR)
-    obsA, pendA = cp.extract_page_with_state(
+    obsA, pendA, aoA = cp.extract_page_with_state(
         "queue_run", str(adj), "sz1", "lin", adj.read_text(), 0, {}, [])
     check("T31-2a error beyond the window after repeat -> expired, no loop",
           not [o for o in obsA if o["detector_id"] == "cmd-failure-loop"]
           and pendA == [],
           json.dumps([(o["detector_id"], o["span"]) for o in obsA]))
     adj.write_text("$ cmd\n$ cmd\nfiller\nfiller\n" + ERR)
-    obsB, pendB = cp.extract_page_with_state(
+    obsB, pendB, aoB = cp.extract_page_with_state(
         "queue_run", str(adj), "sz1", "lin", adj.read_text(), 0, {}, [])
     check("T31-2b error 3 lines after repeat closes at the error line",
           len([o for o in obsB if o["detector_id"] == "cmd-failure-loop"])
           == 1 and obsB[-1]["span"] == "bytes@26" and not pendB,
           json.dumps([(o["span"], o["detector_id"]) for o in obsB]))
     adj.write_text("$ cmd\n$ cmd\n")
-    _, pendC = cp.extract_page_with_state(
+    _, pendC, _ac = cp.extract_page_with_state(
         "queue_run", str(adj), "sz1", "lin", adj.read_text(), 0, {}, [])
-    obsC, pendC2 = cp.extract_page_with_state(
+    obsC, pendC2, _ac2 = cp.extract_page_with_state(
         "queue_run", str(adj), "sz1", "lin", ERR, 8, {}, pendC)
     check("T31-2c hunt rides across pages, closes at the error line",
           len([o for o in obsC if o["detector_id"] == "cmd-failure-loop"])
@@ -1929,8 +1932,8 @@ def main():
     # T31-5 unterminated tail emitted before done (t30 P5)
     tailf = fx / "tail.txt"
     tailf.write_bytes(b"err one\nunterminated tail")
-    t1, c1, d1 = cp.read_page(tailf, 0, 262144)
-    t2, c2, d2 = cp.read_page(tailf, c1, 262144)
+    t1, c1, d1, _o1 = cp.read_page(tailf, 0, 262144)
+    t2, c2, d2, _o2 = cp.read_page(tailf, c1, 262144)
     check("T31-5 tail record emitted; done only when cursor reaches EOF",
           d1 is False and c1 == 8 and t2 == "unterminated tail"
           and d2 and c2 == tailf.stat().st_size,
@@ -1939,11 +1942,113 @@ def main():
     # T31-6 CRLF byte spans exact (t30 P6)
     crlf = fx / "crlf.txt"
     crlf.write_bytes(b"ok line\r\nNameError: name 'x' is not defined\r\n")
-    obs6, _ = cp.extract_page_with_state(
+    obs6, _, _ = cp.extract_page_with_state(
         "queue_run", str(crlf), "sz1", "lin", crlf.read_text(), 0, {}, [])
     check("T31-6 CRLF spans advance by full encoded line",
           obs6 and obs6[0]["span"] == "bytes@8",
           json.dumps([(o["span"], o["detector_id"]) for o in obs6]))
+
+    # =====================================================================
+    # T32 closure — sol turn-31 findings F31.1-F31.6.
+    # =====================================================================
+
+    # T32-1 cross-stratum alias: same physical file, two kinds -> distinct
+    # keys, one shared lineage, both commit without integrity error (F31.1)
+    aliasf = fx / "alias.txt"
+    aliasf.write_text("$ git push\n$ git push\n"
+                      "NameError: name 'z' is not defined\n")
+    o1, _, _ = cp.extract_page_with_state(
+        "queue_run", str(aliasf), "sz9", "lin9", aliasf.read_text(), 0, {}, [])
+    o2, _, _ = cp.extract_page_with_state(
+        "codex_session", str(aliasf), "sz9", "lin9",
+        aliasf.read_text(), 0, {}, [])
+    st32a = temp_state() / "composer-t32a"
+    st32a.mkdir(parents=True, exist_ok=True)
+    e_q = {"path": str(aliasf), "generation": "sz9", "lineage_id": "lin9",
+           "source_kind": "queue_run"}
+    e_c = dict(e_q, source_kind="codex_session")
+    cp.commit_batch(st32a, e_q, o1, 99, {"cmd_fps": {}, "pending_fps": []})
+    cp.commit_batch(st32a, e_c, o2, 99, {"cmd_fps": {}, "pending_fps": []})
+    check("T32-1 strata alias: distinct keys, one lineage, both commit",
+          len(cp.load_observations(st32a)) == len(o1) + len(o2)
+          and {o["lineage_id"] for o in o1} ==
+              {o["lineage_id"] for o in o2}
+          and not ({o["dedupe_key"] for o in o1}
+                   & {o["dedupe_key"] for o in o2}),
+          json.dumps([len(o1), len(o2)]))
+
+    # T32-2 scanned cohort measured, enrolled reported separately (F31.2)
+    srcs32 = {"queue_run": [str(fx / f"scan{i}.txt") for i in range(3)]}
+    for i in range(3):
+        (fx / f"scan{i}.txt").write_text("plain line\n")
+    st32s = temp_state() / "composer-t32s"
+    repA = cp.tick(srcs32, state_dir=st32s, max_pages=1)
+    repB = cp.tick(srcs32, state_dir=st32s, max_pages=10)
+    check("T32-2 scanned cohort measured; enrolled separate",
+          repA["scanned_lineages"] == 1
+          and repA["enrolled_lineages"] == 3
+          and repB["scanned_lineages"] == 3,
+          json.dumps({k: repA[k] for k in
+                      ("scanned_lineages", "enrolled_lineages")}
+                     | {"B_scanned": repB["scanned_lineages"]}))
+
+    # T32-3 first-attempt adjacency retained across pages; emits at the
+    # retained offset when recurrence reaches two (F31.3)
+    fa = fx / "fa.txt"
+    fa.write_text("$ once\nNameError: name 'w' is not defined\n")
+    obs1, _, ao1 = cp.extract_page_with_state(
+        "queue_run", str(fa), "szA", "linA", fa.read_text(), 0, {}, [])
+    check("T32-3a count-1 attempt retains its adjacent error offset",
+          not [o for o in obs1 if o["detector_id"] == "cmd-failure-loop"]
+          and len(ao1) == 1, json.dumps(ao1))
+    fpk = next(iter(ao1))
+    obs2, _, ao2 = cp.extract_page_with_state(
+        "queue_run", str(fa), "szA", "linA", "$ once\n", 44, {fpk: 1},
+        [], att_offs=ao1)
+    check("T32-3b recurrence emits at the retained first-error offset",
+          len([o for o in obs2 if o["detector_id"] == "cmd-failure-loop"])
+          == 1 and obs2[-1]["span"] == "bytes@7" and ao2 == {},
+          json.dumps([(o["span"], o["detector_id"]) for o in obs2]))
+
+    # T32-4 raw-byte offsets survive replacement decoding (F31.4)
+    badu = fx / "badu.bin"
+    badu.write_bytes(b"ok\xff\nNameError: name 'b' is not defined\n")
+    t4, c4, d4, offs4 = cp.read_page(badu, 0, 262144)
+    obs4, _, _ = cp.extract_page_with_state(
+        "queue_run", str(badu), "szB", "linB", t4, 0, {}, [],
+        line_offs=offs4)
+    check("T32-4 reader-supplied offsets keep spans byte-exact",
+          obs4 and obs4[0]["span"] == "bytes@4",
+          json.dumps([(o["span"], o["detector_id"]) for o in obs4]))
+
+    # T32-5 impossible hunt windows reset at load (F31.5)
+    st32w = temp_state() / "composer-t32w"
+    st32w.mkdir(parents=True, exist_ok=True)
+    (st32w / "cursors.json").write_text(json.dumps({
+        "q/w.out": {"cursor": 1, "generation": "sz", "cmd_fps": {},
+                    "att_offs": {},
+                    "pending_fps": [{"fp": "ff", "window": 100,
+                                     "byte_off": 0}]}}))
+    cleanW, notesW = cp._load_cursors(st32w)
+    check("T32-5 window outside 1..3 resets the cursor entry",
+          not cleanW and len(notesW) == 1, json.dumps(notesW))
+
+    # T32-6 source-kind membership + entry equality (F31.6)
+    st32b = temp_state() / "composer-t32b"
+    st32b.mkdir(parents=True, exist_ok=True)
+    raised1 = raised2 = False
+    try:
+        cp.commit_batch(st32b, e_q, o2, 5, {"cmd_fps": {}, "pending_fps": []})
+    except ValueError:
+        raised1 = True
+    try:
+        cp.commit_batch(st32b, dict(e_q, path="bogus.txt",
+                                    source_kind="bogus"),
+                        o1, 5, {"cmd_fps": {}, "pending_fps": []})
+    except ValueError:
+        raised2 = True
+    check("T32-6 stratum must equal entry kind; membership unconditional",
+          raised1 and raised2, json.dumps([raised1, raised2]))
 
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
     if FAIL:
