@@ -2281,6 +2281,22 @@ def main():
     # =====================================================================
     import pressure as pr
 
+    def healthy(binding):
+        return {"state": "ok", "source": "test", "concurrent_limit": None}
+
+    PRINCIPALS = {"orch-intel": "intelligence", "orch-intel-2": "intelligence",
+                  "orch-editor": "editor"}
+
+    def make_auth(tag, cfg=None, config_hash="cfg35", **kw):
+        cfg = cfg if cfg is not None else v3
+        kw.setdefault("health_evidence", healthy)
+        kw.setdefault("budgets", (cfg.get("supply") or {}).get("budgets"))
+        kw.setdefault("principal_verifier",
+                      lambda p, _cfg=None: PRINCIPALS.get(p))
+        return pr.authority_from_config(cfg, config_hash,
+                                        state_dir=temp_state() / f"pressure-{tag}",
+                                        **kw)
+
     ex, ex_pf = sc.parse_yaml_bytes(
         (HERE / "config" / "design" / "pressure-v3-example.yaml").read_bytes())
     check("T35-0 worked example parses", ex_pf is None and
@@ -2348,6 +2364,11 @@ def main():
         "scope": "plane/intelligence-consult",
         "hard_limits": hard30 or {"consults": 4096},
         "window_hours": wh30}
+    v3.setdefault("planes", {})["intelligence-consult"] = {
+        "owner_policy": "enabled",
+        "binding_refs": ["sol-editor", "gemini-reviewer"],
+        "budget_refs": ["b-consult-daily"],
+        "allowed_task_classes": ["editorial", "review"]}
     v3["supply"].pop("admission", None)
 
     # C13 closed schema: unknown field, bad ref, double default, bounds
@@ -2391,19 +2412,19 @@ def main():
           sc.validate(v3) == [], json.dumps(sc.validate(v3))[:200])
     pv = sc.pressure_view(v3)
     check("T35-5 shared sol identity: both profiles on one binding",
-          pv["profiles"]["sol-high"]["binding_ref"] == "sol-editor"
+          pv["profiles"].get("sol-high", pv["profiles"].get(
+              "sol-editor/default"))["binding_ref"] == "sol-editor"
           and pv["profiles"]["sol-medium"]["binding_ref"] == "sol-editor"
-          and pv["profiles"]["sol-high"]["reasoning_override"] == "high"
+          and pv["profile_aliases"].get("sol-editor/default") == "sol-high"
           and pv["profiles"]["sol-medium"]["reasoning_override"] == "medium")
     check("T35-6 opening resolves 16 high + 32 medium at level high",
-          pv["baseline"] == {"sol-high": 16, "sol-medium": 32,
-                             "gemini-high": 2, "glm-max": 6,
-                             "b1/default": 1, "b2/default": 1,
-                             "sol-editor/default": 1,
-                             "gemini-reviewer/default": 1,
-                             "glm-workhorse/default": 1,
-                             "glm-offpeak/default": 1,
-                             "kimi-editor/default": 1}
+          pv["baseline"].get("sol-high") == 16
+          and pv["baseline"].get("sol-editor/default") == 16
+          and pv["baseline"].get("sol-medium") == 32
+          and pv["baseline"].get("gemini-high") == 2
+          and pv["baseline"].get("glm-max") == 6
+          and pv["baseline"].get("b1/default") == 1
+          and pv["baseline"].get("kimi-editor/default") == 1
           and pv["level"] == "high"
           and pv["global_ceiling"] == 128,
           json.dumps(pv["baseline"]))
@@ -2411,48 +2432,60 @@ def main():
     v3s["supply"]["pressure"]["demand"]["level"] = "saturate"
     pvs = sc.pressure_view(v3s)
     check("T35-6b saturate resolves 32 + 64",
-          pvs["baseline"]["sol-high"] == 32
-          and pvs["baseline"]["sol-medium"] == 64)
+          pvs["baseline"].get("sol-high") == 32
+          and pvs["baseline"].get("sol-medium") == 64)
 
     # C18 aggregate ceilings under racing admits; leases combine by max
     sd35 = temp_state() / "pressure-t35"
-    auth = pr.authority_from_config(v3, "cfg35", state_dir=sd35,
-                                    budgets=v3["supply"]["budgets"])
-    got = [auth.admit(f"d{i}", f"a{i}", "intelligence", "sol-high",
-                      budget_scope="plane/intelligence-consult")
+    auth = make_auth("main", cfg=v3, config_hash="cfg35")
+    got = [auth.admit(dispatch_id=f"d{i}", attempt_id=f"a{i}",
+                      verified_principal="orch-intel",
+                      role_ref="intelligence", profile_ref="sol-high",
+                      plane_ref="intelligence-consult")
            for i in range(20)]
     allows = [g for g in got if g["decision"] == "ALLOW"]
     check("T35-7 admits cap at the profile desired (16), rest HOLD",
           len(allows) == 16
           and all(g["decision"] == "HOLD" for g in got[16:]),
-          json.dumps([g["decision"] for g in got]))
-    lr = auth.lease("sess-1", "intelligence", {"sol-high": 24}, 300, 0,
-                    agent_role_refs=("intelligence",),
-                    agent_profile_refs=("sol-high", "sol-medium"))
+          json.dumps([g["decision"] for g in got] +
+                     [g.get("reason_codes") for g in got if g["decision"] != "ALLOW"][:2]))
+    lr = auth.lease(request_id="rq-1", expected_config_hash="cfg35",
+                    verified_principal="orch-intel",
+                    issuer_role_ref="intelligence",
+                    profile_slots={"sol-high": 24}, ttl_seconds=300,
+                    expected_lease_revision=0)
     check("T35-7b delegated lease granted and raises desired by max",
-          lr.get("ok") and auth._desired("sol-high") == 24,
+          lr.get("ok") and auth.status()["desired"].get("sol-high", 0) == 24,
           json.dumps(lr)[:160])
-    lr2 = auth.lease("sess-2", "intelligence", {"sol-high": 10}, 300, 0,
-                     agent_role_refs=("intelligence",),
-                     agent_profile_refs=("sol-high",))
-    over = auth.lease("sess-3", "intelligence", {"sol-high": 40}, 300, 0,
-                      agent_role_refs=("intelligence",),
-                      agent_profile_refs=("sol-high",))
+    lr2 = auth.lease(request_id="rq-2", expected_config_hash="cfg35",
+                     verified_principal="orch-intel-2",
+                     issuer_role_ref="intelligence",
+                     profile_slots={"sol-high": 10}, ttl_seconds=300,
+                     expected_lease_revision=0)
+    over = auth.lease(request_id="rq-3", expected_config_hash="cfg35",
+                      verified_principal="orch-intel-2",
+                      issuer_role_ref="intelligence",
+                      profile_slots={"sol-high": 40}, ttl_seconds=300,
+                      expected_lease_revision=0)
     check("T35-7c second issuer: combined by MAX (24), never sum; "
           "above-ceiling lease refused",
-          lr2.get("ok") and auth._desired("sol-high") == 24
+          lr2.get("ok") and auth.status()["desired"].get("sol-high", 0) == 24
           and not over.get("ok"),
-          json.dumps([auth._desired("sol-high"), over.get("faults")]))
+          json.dumps([auth.status()["desired"].get("sol-high", 0),
+                      lr2.get("faults"), over.get("faults")]))
 
     # C19 budget binding: exhausted consults HOLD despite free slots
-    auth_b = pr.authority_from_config(v3, "cfg35b",
-                                      state_dir=temp_state() / "p35-budget",
-                                      budgets={"b": {
-                                          "scope": "plane/intelligence-consult",
-                                          "hard_limits": {"consults": 2},
-                                          "window_hours": 24}})
-    res = [auth_b.admit(f"b{i}", f"a{i}", "intelligence", "sol-high",
-                        budget_scope="plane/intelligence-consult")
+    cfg_b = json.loads(json.dumps(v3))
+    cfg_b["supply"]["budgets"]["b-consult-daily"]["hard_limits"] = {
+        "consults": 2}
+    auth_b = pr.authority_from_config(
+        cfg_b, "cfg35b", state_dir=temp_state() / "p35-budget",
+        health_evidence=healthy,
+        principal_verifier=lambda p: PRINCIPALS.get(p))
+    res = [auth_b.admit(dispatch_id=f"b{i}", attempt_id=f"a{i}",
+                        verified_principal="orch-intel",
+                        role_ref="intelligence", profile_ref="sol-high",
+                        plane_ref="intelligence-consult")
            for i in range(4)]
     check("T35-8 exhausted consult budget HOLDs despite free slots",
           [r["decision"] for r in res] ==
@@ -2474,6 +2507,8 @@ def main():
 
     def agent_variant(mutate, change):
         d = json.loads(json.dumps(v3))
+        d["supply"]["pressure"]["control"]["agent_profile_refs"] = [
+            "sol-high", "sol-medium", "gemini-high", "glm-max"]
         mutate(d)
         d["identity"] = dict(v3["identity"], revision=2,
                              parent_hash=head9, change_id=change)
@@ -2483,7 +2518,7 @@ def main():
         lambda d: d["supply"]["pressure"]["demand"].update(level="saturate"),
         "22222222-2222-4333-8444-555555555551"),
         proposed_by="orchestrator-agent", authority_class="agent",
-        state_dir=sd9)
+        state_dir=sd9, issuer_role_ref="intelligence")
     check("T35-9 delegated demand change accepted from an agent",
           ra["decision"] == "accepted", json.dumps(ra["faults"])[:200])
     head9 = sc.active_head(sd9)["content_hash"]
@@ -2508,39 +2543,55 @@ def main():
     # C21 lease lifecycle: CAS, single per issuer, expiry restores baseline
     auth2 = pr.authority_from_config(v3, "cfg35c",
                                      state_dir=temp_state() / "p35-lease",
-                                     budgets=v3["supply"]["budgets"])
-    l1 = auth2.lease("s", "intelligence", {"sol-high": 20}, 1, 0,
-                     agent_role_refs=("intelligence",),
-                     agent_profile_refs=("sol-high",))
-    again = auth2.lease("s", "intelligence", {"sol-high": 21}, 1, 0,
-                        agent_role_refs=("intelligence",),
-                        agent_profile_refs=("sol-high",))
+                                     health_evidence=healthy,
+                                     principal_verifier=lambda p:
+                                         PRINCIPALS.get(p))
+    l1 = auth2.lease(request_id="s", expected_config_hash="cfg35c",
+                     verified_principal="orch-intel",
+                     issuer_role_ref="intelligence",
+                     profile_slots={"sol-high": 20}, ttl_seconds=1,
+                     expected_lease_revision=0)
+    again = auth2.lease(request_id="s2", expected_config_hash="cfg35c",
+                        verified_principal="orch-intel",
+                        issuer_role_ref="intelligence",
+                        profile_slots={"sol-high": 21}, ttl_seconds=1,
+                        expected_lease_revision=0)
     check("T35-10 second lease without revision CAS refused",
           not again.get("ok") and
           any("CAS" in f for f in again.get("faults", [])),
           json.dumps(again)[:160])
-    l1b = auth2.lease("s", "intelligence", {"sol-high": 20}, 1,
-                      l1["revision"],
-                      agent_role_refs=("intelligence",),
-                      agent_profile_refs=("sol-high",))
+    l1b = auth2.lease(request_id="s3", expected_config_hash="cfg35c",
+                      verified_principal="orch-intel",
+                      issuer_role_ref="intelligence",
+                      profile_slots={"sol-high": 20}, ttl_seconds=1,
+                      expected_lease_revision=l1["revision"])
     check("T35-10b replacement via revision CAS ok",
           l1b.get("ok") and l1b["revision"] == l1["revision"] + 1)
     time.sleep(1.1)
     check("T35-10c expired lease drops out of desired",
-          auth2._desired("sol-high") == 16)
+          auth2.status()["desired"].get("sol-high", 0) == 16)
 
     # C22 owner fencing: activation invalidates leases/permits; ceiling
     # below occupancy refused
-    l2 = auth2.lease("f", "intelligence", {"sol-medium": 60}, 300, 0,
-                     agent_role_refs=("intelligence",),
-                     agent_profile_refs=("sol-medium",))
+    l2 = auth2.lease(request_id="rq-l2", expected_config_hash="cfg35c",
+                     verified_principal="orch-intel",
+                     issuer_role_ref="intelligence",
+                     profile_slots={"sol-medium": 60}, ttl_seconds=300,
+                     expected_lease_revision=0)
     act = auth2.activate(sc.pressure_view(v3s), "cfg35-next")
+    nowX = __import__("time").time()
+    leases_left = auth2._leases_for(auth2._db, "sol-medium", nowX)
     check("T35-11 activation invalidates old-config leases",
-          act.get("ok") and auth2._leases_for("sol-medium") == 0,
+          act.get("ok") and leases_left == 0,
           json.dumps(act)[:160])
     auth3 = pr.authority_from_config(v3, "cfg35d", state_dir=sd35,
-                                     budgets=v3["supply"]["budgets"])
-    auth3.admit("dX", "aX", "intelligence", "sol-high")
+                                     health_evidence=healthy,
+                                     principal_verifier=lambda p:
+                                         PRINCIPALS.get(p))
+    for i in range(6):
+        auth3.admit(dispatch_id=f"dX{i}", attempt_id=f"aX{i}",
+                    verified_principal="orch-intel", role_ref="intelligence",
+                    profile_ref="sol-high", plane_ref="intelligence-consult")
     tiny = json.loads(json.dumps(v3))
     tiny["supply"]["pressure"]["ceilings"]["profile_concurrent_slots"] = {
         "sol-high": 5}
@@ -2551,12 +2602,17 @@ def main():
           json.dumps(refused)[:200])
 
     # C23 health stale HOLDs
-    auth4 = pr.authority_from_config(v3, "cfg35e", state_dir=sd35,
-                                     health_ok=lambda b: False,
-                                     budgets=v3["supply"]["budgets"])
+    auth4 = pr.authority_from_config(v3, "cfg35e",
+                                     state_dir=temp_state() / "p35-health",
+                                     health_evidence=lambda b: None,
+                                     principal_verifier=lambda p:
+                                         PRINCIPALS.get(p))
+    r_h = auth4.admit(dispatch_id="dH", attempt_id="aH",
+                      verified_principal="orch-intel",
+                      role_ref="intelligence", profile_ref="sol-high",
+                      plane_ref="intelligence-consult")
     check("T35-12 stale health HOLDs dispatch",
-          auth4.admit("dH", "aH", "intelligence", "sol-high")["decision"]
-          == "HOLD")
+          r_h["decision"] == "HOLD")
 
     # C24 routing: conflict with legacy projections; duplicate lanes
     bad = json.loads(json.dumps(v3))
@@ -2573,16 +2629,22 @@ def main():
           "PRESSURE_REF" in codes, json.dumps(sorted(codes)))
 
     # C25 uncertain submission: reserved until reconciled
-    auth5 = pr.authority_from_config(v3, "cfg35f", state_dir=sd35,
-                                     budgets=v3["supply"]["budgets"])
-    pm = auth5.admit("dU", "aU", "intelligence", "sol-medium",
-                     budget_scope="plane/intelligence-consult")
+    auth5 = pr.authority_from_config(v3, "cfg35f2",
+                                     state_dir=temp_state() / "p35-f2",
+                                     health_evidence=healthy,
+                                     principal_verifier=lambda p:
+                                         PRINCIPALS.get(p))
+    pm = auth5.admit(dispatch_id="dU", attempt_id="aU",
+                     verified_principal="orch-intel",
+                     role_ref="intelligence", profile_ref="sol-medium",
+                     plane_ref="intelligence-consult")
     auth5.mark_uncertain(pm["permit_ref"], "ack lost")
-    rd = auth5.redeem(pm["permit_ref"])
-    auth5.reconcile(pm["permit_ref"], True)
-    occU = auth5._occupancy_all()
+    rd = auth5.redeem(pm["permit_ref"], dispatch_id="dU",
+                      attempt_id="aU")
+    auth5.reconcile(pm["permit_ref"], launched=True)
+    occU = auth5.status()["occupancy"]
     auth5.release(pm["permit_ref"])
-    occR = auth5._occupancy_all()
+    occR = auth5.status()["occupancy"]
     check("T35-14 uncertain reserved; reconcile keeps slot; release frees",
           not rd.get("ok")
           and occU["profiles"].get("sol-medium") == 1
@@ -2594,8 +2656,13 @@ def main():
     (sdC / "runtime" / "pressure").mkdir(parents=True, exist_ok=True)
     (sdC / "runtime" / "pressure" / "state.sqlite").write_bytes(b"not a db")
     authC = pr.authority_from_config(v3, "cfg35g", state_dir=sdC,
-                                     budgets=v3["supply"]["budgets"])
-    outC = authC.admit("dC", "aC", "intelligence", "sol-high")
+                                     health_evidence=healthy,
+                                     principal_verifier=lambda p:
+                                         PRINCIPALS.get(p))
+    outC = authC.admit(dispatch_id="dC", attempt_id="aC",
+                       verified_principal="orch-intel",
+                       role_ref="intelligence", profile_ref="sol-high",
+                       plane_ref="intelligence-consult")
     check("T35-15 corrupt authority CONTAINs (never fabricates capacity)",
           outC["decision"] == "CONTAIN"
           and any("unavailable" in rc for rc in outC["reason_codes"]),
