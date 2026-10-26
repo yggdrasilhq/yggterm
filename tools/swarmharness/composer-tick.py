@@ -41,7 +41,7 @@ def main():
     # brain-pair review runs automatically (idempotent per batch)
     try:
         import composer_review
-        composer_review.main()
+        composer_review.main()  # prints its own noop/review line
     except Exception as e:  # review failure never breaks the tick
         print("  review-step skipped:", e)
     return 0
