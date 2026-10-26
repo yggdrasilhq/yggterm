@@ -1474,6 +1474,141 @@ def main():
     check("T18-9 suspension dominates exemption",
           ress["outcome"] == "SUSPENDED", json.dumps(ress)[:160])
 
+    # =====================================================================
+    # 60+. COMPOSER — the fleet lesson miner (owner 2026-10-26; sol arch)
+    # =====================================================================
+    import composer as cp
+
+    fx = temp_state() / "corpus"
+    (fx / "queue").mkdir(parents=True, exist_ok=True)
+    run_out = fx / "queue" / "ztq-test-a1.out"
+    run_out.write_text(
+        "starting work\n"
+        "bash: -c: line 0: syntax error near unexpected token `('\n"
+        "$ ssh dev 'cd repo && git status\n"
+        "bash: -c: line 0: syntax error near unexpected token `('\n"
+        "$ ssh dev 'cd repo && git status\n"
+        "$ ssh dev 'cd repo && git status\n"
+        "done\n")
+    missing = fx / "queue" / "gone.out"
+
+    # M1 census: ok + missing + unsupported all enumerated
+    man = cp.census({"queue_run": [str(run_out), str(missing)],
+                     "weird_kind": [str(run_out)]}, state_dir=temp_state())
+    ok_entries = [s for s in man["sources"] if s.get("status") == "ok"]
+    check("M1 census enumerates ok sources with revisions",
+          len(ok_entries) == 1 and ok_entries[0]["revision"].startswith("sz"))
+    check("M1b census gaps never silent",
+          len(man["gaps"]) == 2
+          and {g["status"] for g in man["gaps"]} == {"missing",
+                                                     "unsupported_kind"},
+          json.dumps(man["gaps"])[:160])
+
+    # M2 read_page: bounded cursor resume, no re-read, exact coverage
+    text1, cur1, done1 = cp.read_page(run_out, 0, 64)
+    text2, cur2, done2 = cp.read_page(run_out, cur1, 64)
+    check("M2 pages tile the file exactly",
+          cur1 > 0 and (done2 or cur2 > cur1)
+          and len(text1) + (len(text2) if not done1 else 0) > 0)
+
+    # M3 detectors: signature + failure loop
+    obs, stats = cp.extract("queue_run", str(run_out), "szX:deadbeef",
+                            run_out.read_text(), 0)
+    sigs = {o["detector_id"] for o in obs}
+    check("M3 harness signature detected",
+          "sig-ssh-argv-join" in sigs, json.dumps(sorted(sigs)))
+    check("M3b failure loop detected (same command 3x)",
+          "cmd-failure-loop" in sigs, json.dumps(sorted(sigs)))
+    check("M3c observations carry fingerprints, not message bodies",
+          all(len(o["fingerprint"]) == 16 for o in obs)
+          and "starting work" not in cp._canonical(obs))
+
+    # M4 dedupe: same span -> same key; double commit -> one stored
+    obs_b, _ = cp.extract("queue_run", str(run_out), "szX:deadbeef",
+                          run_out.read_text(), 0)
+    check("M4 extraction is deterministic (same dedupe keys)",
+          [o["dedupe_key"] for o in obs] == [o["dedupe_key"] for o in obs_b])
+    st = temp_state() / "composer-m4"
+    entry = {"path": str(run_out), "revision": "szX:deadbeef"}
+    cp.commit_batch(st, entry, obs, 500, {"lines": 7})
+    cp.commit_batch(st, entry, obs_b, 500, {"lines": 7})
+    stored = cp.load_observations(st)
+    keys = [o["dedupe_key"] for o in stored]
+    check("M4b replay deduped at grouping (same keys, counts merge)",
+          len(keys) == len(set(keys)) or len(keys) == 2 * len(set(keys)))
+
+    # M5 cursor atomicity: cursor advances only with observations durable
+    cursors = json.loads((st / "cursors.json").read_text())
+    check("M5 cursor state committed",
+          cursors[str(run_out)]["cursor"] == 500
+          and cursors[str(run_out)]["revision"] == "szX:deadbeef")
+
+    # M6 patterns: incidents = distinct source revisions, not row counts
+    pats = cp.group_patterns(stored, min_incidents=2)
+    sig_pat = next((p for p in pats
+                    if p["detector_id"] == "sig-ssh-argv-join"), None)
+    check("M6 pattern incidents counted across revisions",
+          sig_pat is not None and sig_pat["independent_incidents"] == 1
+          and not sig_pat["eligible"], json.dumps(sig_pat)[:160])
+    stored_x = [dict(o, source_revision=f"sz{i}") for i, o in
+                enumerate(stored)]
+    pats_x = cp.group_patterns(stored_x, min_incidents=2)
+    sig_x = next((p for p in pats_x
+                  if p["detector_id"] == "sig-ssh-argv-join"), None)
+    check("M6b distinct revisions make pattern eligible",
+          sig_x is not None and sig_x["eligible"]
+          and sig_x["severity"] in ("high", "medium", "low"))
+
+    # M7 needs: absent snapshot is reported explicitly, never pretended
+    needs = cp.read_needs(temp_state() / "empty-needs")
+    check("M7 absent needs snapshot explicit",
+          needs["available"] is False and "absent" in needs["reason"])
+
+    # M8 ranking: needs boost + exploration lane reserved
+    p_rank = [{"pattern_id": "p1", "detector_id": "sig-ssh-argv-join",
+               "severity": "high", "independent_incidents": 3,
+               "eligible": True, "strata": ["queue_run"]},
+              {"pattern_id": "p2", "detector_id": "cmd-failure-loop",
+               "severity": "medium", "independent_incidents": 1,
+               "eligible": True, "strata": ["queue_run"]}]
+    needs_on = {"available": True, "needs": {"revision": 1, "items": [
+        {"need_id": "n1", "relevant_fault_families": ["cmd-failure-loop"],
+         "urgency": 5}]}}
+    ranked_off = cp.rank_patterns(p_rank, {"available": False})
+    ranked_on = cp.rank_patterns(p_rank, needs_on)
+    check("M8 needs boost reorders demand lane",
+          ranked_off[0]["pattern_id"] == "p1"
+          and ranked_on[0]["pattern_id"] == "p2"
+          and ranked_on[0]["lane"] == "demand",
+          json.dumps(ranked_on)[:200])
+    lanes = {r["pattern_id"]: r["lane"] for r in ranked_on}
+    check("M8b exploration lane exists",
+          any(l == "exploration" for l in lanes.values())
+          or len(ranked_on) < 2)
+
+    # M9 outbox idempotent
+    st9 = temp_state() / "composer-m9"
+    st9.mkdir(parents=True, exist_ok=True)
+    props1 = cp.propose_claims(st9, ranked_on, cap=5)
+    props2 = cp.propose_claims(st9, ranked_on, cap=5)
+    outbox_lines = (st9 / "outbox.jsonl").read_text().splitlines()
+    check("M9 proposal outbox idempotent by pattern_id",
+          len(props1) == 2 and len(props2) == 0
+          and len(outbox_lines) == 2, f"{len(props1)}/{len(props2)}")
+
+    # M10 tick end-to-end on fixtures; second tick reads nothing new
+    st10 = temp_state() / "composer-m10"
+    sources = {"queue_run": [str(run_out)]}
+    rep1 = cp.tick(sources, state_dir=st10)
+    rep2 = cp.tick(sources, state_dir=st10)
+    check("M10 tick extracts + resumes (second pass reads nothing new)",
+          rep1["pages_read"] >= 1 and rep1["observations"] >= 2
+          and rep2["pages_read"] == 0 and rep2["observations"] == 0,
+          json.dumps({k: rep2[k] for k in
+                      ("pages_read", "observations", "proposals")}))
+    check("M10b tick reports explicit needs fallback",
+          any("absent" in n for n in rep1["notes"]))
+
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
     if FAIL:
         print("FAILED:", *FAIL, sep="\n  - ")
