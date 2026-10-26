@@ -1,6 +1,7 @@
-"""pressure — the swarm-config v3 admission authority (repair v2).
+"""pressure — the swarm-config v3 admission authority (repair v3).
 
-Repair of the sol implementation review (2026-10-26, 11 findings):
+Repair of the sol implementation review (2026-10-26, 11 findings; delta
+review 2026-10-26 residuals F35.1r-F35.11r):
 - F1  every mutation runs inside a BEGIN IMMEDIATE transaction — the write
       fence is taken BEFORE any config/lease/occupancy/budget/permit read
       and held through commit; rejections and exceptions roll back.
@@ -32,6 +33,31 @@ Repair of the sol implementation review (2026-10-26, 11 findings):
 - F9  explicit provisioning vs rw-only opening; restart bumps the epoch,
       invalidates leases/unredeemed permits and blocks new permits while
       uncertain launch state exists; store problems CONTAIN.
+
+Repair v3 (delta review residuals):
+- F35.1r ordinary opening is READ-ONLY with respect to authority state:
+  it never writes meta (never restores a cached config_hash, never bumps
+  the epoch). The epoch transition is the explicit, fenced restart()
+  operation. Every public mutation — including mark_uncertain, reconcile
+  and release — fences against the store's active config hash. activate
+  is pure ceiling comparison: no recursive authority construction.
+- F35.2r redeem re-verifies the permit's principal through the injected
+  verifier (the executor IS the admitted principal); reconcile requires
+  an authenticated reconciler and exact identity when supplied. Expired
+  never-redeemed grants terminalize under the transaction at admit time
+  (state 'expired', attempt history preserved), so a definite nonlaunch
+  frees the dispatch for a fresh attempt. Never touches redeemed or
+  uncertain work.
+- F35.3r an omitted plane is authoritatively derived (an enabled plane
+  covering the binding; none means CONTAIN — an unbudgeted omission is
+  impossible). Budget checks use one implementation that enforces consult
+  AND token limits independently. Reconciled launches keep their spent
+  marker (redeemed_at) so release never refunds spending. Budgets and
+  plane-budget mappings ride the compiled view and refresh atomically
+  with activation, bound to the same policy hash.
+- F35.9r the factory bootstraps a NEVER-initialized area only; a vacated
+  store inside an initialized area is a lost committed store (CONTAIN).
+  Opening validates the signer key (exact 32 bytes, no fallback key).
 """
 import hashlib
 import hmac
@@ -134,9 +160,10 @@ class PressureAuthority:
         self.token_accounting = token_accounting  # None => token budgets CONTAIN
         self.principal_verifier = principal_verifier  # None => unverified
         self.budgets = budgets if budgets is not None else \
-            (self.view.get("budgets") or {})
+            (view.get("budgets") if isinstance(view, dict) else None) or {}
         self.plane_budgets = plane_budgets if plane_budgets is not None \
-            else (self.view.get("plane_budgets") or {})
+            else (view.get("plane_budgets") if isinstance(view, dict)
+                  else None) or {}
         sd = Path(state_dir).expanduser() if state_dir \
             else Path("~/.yggterm/swarm").expanduser()
         self.db_path = sd / "runtime" / "pressure" / "state.sqlite"
@@ -144,10 +171,17 @@ class PressureAuthority:
         self._db = None
         self._contained = None  # reason string when the store is unusable
         self._signer_key = None
+        self._recovery_barrier = False  # outstanding work seen at open time
         self._open()
 
     # ------------------------------------------------------------ opening
     def _open(self):
+        """READ-ONLY open (F35.1r): the store's meta is authoritative and
+        never rewritten from the handle. Ordinary opening performs no
+        epoch transition, no lease/permit invalidation and no identity
+        write — that is restart()'s job, explicitly. The only state this
+        computes is the crash-recovery latch: outstanding launched or
+        uncertain work at open time holds new permits until reconciled."""
         try:
             if not self.db_path.exists():
                 self._contained = "store-missing (provision explicitly)"
@@ -161,34 +195,28 @@ class PressureAuthority:
                 "AND name='meta'").fetchone()
             if not row:
                 self._contained = "store not provisioned"
+                db.close()
                 return
             stored = dict(db.execute(
                 "SELECT key, value FROM meta").fetchall())
             if stored.get("schema_version") != str(_SCHEMA_VERSION):
                 self._contained = "store schema version mismatch"
+                db.close()
                 return
-            self._signer_key = bytes.fromhex(
-                stored.get("signer_key", "") or "") or None
-            # restart fence: new epoch, invalidate leases + unredeemed
-            # permits, block new permits while uncertain state exists (F9)
-            epoch = int(stored.get("epoch", "0")) + 1
-            now = _now()
-            db.execute("BEGIN IMMEDIATE")
-            db.execute("DELETE FROM leases WHERE expires_at > ?", (now,))
-            db.execute("DELETE FROM permits WHERE state = 'granted'",
-                       ())
-            barrier = 1 if db.execute(
-                "SELECT COUNT(*) FROM permits WHERE state = 'uncertain'"
-            ).fetchone()[0] else 0
-            db.executemany(
-                "INSERT OR REPLACE INTO meta (key, value) VALUES (?,?)",
-                [("epoch", str(epoch)),
-                 ("reconcile_barrier", str(barrier)),
-                 ("config_hash", stored.get("config_hash", ""))])
-            rcpt = self._receipt(db, "restart", {
-                "epoch": epoch, "config_hash": stored.get("config_hash"),
-                "reconcile_barrier": bool(barrier), "at": now})
-            db.execute("COMMIT")
+            try:
+                key = bytes.fromhex(stored.get("signer_key") or "")
+            except ValueError:
+                key = b""
+            if len(key) != 32:
+                # presence and exact length are verified; there is no
+                # fallback key (F35.9r)
+                self._contained = "signer key missing or invalid (containment)"
+                db.close()
+                return
+            self._signer_key = key
+            self._recovery_barrier = bool(db.execute(
+                "SELECT COUNT(*) FROM permits WHERE state IN "
+                "('uncertain','redeemed')").fetchone()[0])
             self._db = db
             self._contained = None
         except (sqlite3.Error, OSError, ValueError) as exc:
@@ -249,9 +277,11 @@ class PressureAuthority:
         return self._db
 
     def _receipt(self, db, kind, body):
+        if not self._signer_key:
+            raise Contained("signer key unavailable")
         material = {"kind": kind, "body": body,
-                    "signer": (self._signer_key or b"").hex()}
-        rcpt = hmac.new(self._signer_key or b"pressure-auth",
+                    "signer": self._signer_key.hex()}
+        rcpt = hmac.new(self._signer_key,
                         _canonical(material).encode(),
                         hashlib.sha256).hexdigest()
         db.execute("INSERT INTO events (at, kind, receipt, body) "
@@ -267,6 +297,73 @@ class PressureAuthority:
             raise Contained(
                 f"stale authority handle: handle={self.config_hash[:12]} "
                 f"store={str(stored)[:12]}")
+
+    def _write_barrier(self, db):
+        """Recompute the persisted reconciliation flag from UNCERTAIN state
+        (unresolved launch outcomes hold new permits, sol F9/F35.9r) and
+        drop this handle's crash-recovery latch only when no outstanding
+        uncertain-or-launched work remains at all."""
+        n_unc = db.execute(
+            "SELECT COUNT(*) FROM permits WHERE state = "
+            "'uncertain'").fetchone()[0]
+        db.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES "
+            "('reconcile_barrier', ?)", ("1" if n_unc else "0",))
+        if not n_unc:
+            n_out = db.execute(
+                "SELECT COUNT(*) FROM permits WHERE state IN "
+                "('uncertain','redeemed')").fetchone()[0]
+            if not n_out:
+                self._recovery_barrier = False
+        return bool(n_unc) or self._recovery_barrier
+
+    def _barriered(self, db):
+        meta = dict(db.execute(
+            "SELECT key, value FROM meta").fetchall())
+        return meta.get("reconcile_barrier") == "1" or self._recovery_barrier
+
+    def restart(self):
+        """The explicit serialized epoch transition (F35.1r/F35.9r) — the
+        ONLY startup write, and only when a consumer calls it: a new epoch,
+        expired never-redeemed grants terminalize (attempt and digest
+        history preserved), all runtime leases invalidate, and the
+        reconciliation barrier is reassessed from outstanding state."""
+        with self._lock:
+            db2 = self._db
+            try:
+                with self._txn() as db:
+                    self._fenced(db)
+                    now = _now()
+                    db.execute(
+                        "UPDATE permits SET state='expired' "
+                        "WHERE state='granted' AND expires_at <= ?", (now,))
+                    db.execute("DELETE FROM leases")
+                    epoch = int((dict(db.execute(
+                        "SELECT key, value FROM meta").fetchall()).get(
+                        "epoch") or "0")) + 1
+                    db.execute(
+                        "INSERT OR REPLACE INTO meta (key, value) VALUES "
+                        "('epoch', ?)", (str(epoch),))
+                    barrier = self._write_barrier(db)
+                    if db.execute(
+                            "SELECT COUNT(*) FROM permits WHERE state IN "
+                            "('uncertain','redeemed')").fetchone()[0]:
+                        # a restart with outstanding launched/uncertain work
+                        # holds THIS handle until reconciliation (F35.9r)
+                        self._recovery_barrier = True
+                        barrier = True
+                    rcpt = self._receipt(db, "restart", {
+                        "epoch": epoch, "config_hash": self.config_hash,
+                        "reconcile_barrier": barrier, "at": now})
+                    return {"ok": True, "receipt": rcpt, "epoch": epoch}
+            except Contained as exc:
+                if db2 is not None and db2.in_transaction:
+                    db2.execute("ROLLBACK")
+                return {"ok": False, "faults": [str(exc)]}
+            except sqlite3.Error as exc:
+                if db2 is not None and db2.in_transaction:
+                    db2.execute("ROLLBACK")
+                return {"ok": False, "faults": [f"store-error {exc}"]}
 
     def _verify(self, verified_principal, role_ref):
         """Resolve the principal through the injected verifier and require
@@ -353,7 +450,9 @@ class PressureAuthority:
                 if used + 1 > limits["consults"]:
                     return False, None, (f"budget {bid}: {used}+1 > "
                                          f"{limits['consults']} consults")
-            elif "tokens" in limits:
+            if "tokens" in limits:
+                # independent check — consult and token limits both
+                # enforce (F35.3r: no elif bypass for mixed budgets)
                 if self.token_accounting is None:
                     raise Contained(
                         f"budget {bid} meters tokens and no token "
@@ -364,28 +463,53 @@ class PressureAuthority:
             checked.append(bid)
         return True, checked, None
 
+    def _pool_cooldowns(self, db):
+        raw = dict(db.execute(
+            "SELECT key, value FROM meta").fetchall()).get("pool_cooldowns")
+        try:
+            out = _json.loads(raw) if raw else {}
+        except Exception:
+            return {}
+        return {k: v for k, v in out.items()
+                if isinstance(v, (int, float)) and not isinstance(v, bool)}
+
+    def _persist_pool_cooldown(self, db, pool_ref, retry_at):
+        """An identified pool refusal persists as a shared cooldown: every
+        member binding of the pool holds until the retry time (F35.6r)."""
+        cd = self._pool_cooldowns(db)
+        cur = cd.get(pool_ref)
+        if isinstance(cur, (int, float)) and cur >= retry_at:
+            return
+        cd[pool_ref] = retry_at
+        db.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES (?,?)",
+            ("pool_cooldowns", _canonical(cd)))
+
     # ------------------------------------------------------------ verbs
-    def activate(self, view, config_hash):
+    def activate(self, view, config_hash, *, budgets=None, plane_budgets=None):
         """Bind to a new config inside the fence; invalidate previous-config
         leases/unredeemed permits; refuse any ceiling below counted
-        occupancy — profiles, bindings, pools, roles, global (sol F8)."""
+        occupancy — profiles, bindings, pools, roles, global (sol F8).
+        Pure ceiling comparison against the PROPOSED view (F35.1r: no
+        recursive authority construction). Budgets and plane-budget
+        mappings come from the same proposed view and refresh atomically
+        with the policy hash (F35.3r)."""
         with self._lock:
+            db2 = self._db
             try:
                 with self._txn() as db:
-                    self._fenced_check(db)
+                    self._fenced(db)
                     now = _now()
                     occ = self._occupancy_all(db, now)
-                    new = PressureAuthority(
-                        view, config_hash, state_dir=self.db_path.parents[2],
-                        health_evidence=self.health_evidence,
-                        token_accounting=self.token_accounting,
-                        principal_verifier=self.principal_verifier,
-                        budgets=self.budgets,
-                        plane_budgets=self.plane_budgets)
-                    faults = new._check_ceilings_against(db, occ)
+                    faults = self._check_ceilings(view, occ)
                     if faults:
-                        db.execute("ROLLBACK")
                         return {"ok": False, "faults": faults}
+                    nb = budgets if budgets is not None else \
+                        (view.get("budgets") if isinstance(view, dict)
+                         else None)
+                    npb = plane_budgets if plane_budgets is not None else \
+                        (view.get("plane_budgets") if isinstance(view, dict)
+                         else None)
                     db.execute("DELETE FROM leases WHERE config_hash != ?",
                                (config_hash,))
                     db.execute("DELETE FROM permits WHERE config_hash != ? "
@@ -395,33 +519,35 @@ class PressureAuthority:
                     rcpt = self._receipt(db, "activate",
                                          {"config_hash": config_hash,
                                           "at": now})
-                    db.execute("COMMIT")
-                    self.view = view
-                    self.config_hash = config_hash
-                    self.version = view.get("version")
-                    return {"ok": True, "receipt": rcpt}
+                    # COMMIT happens on context exit; only after it succeeds
+                    # does this handle adopt the new identity atomically
+                self.view = view
+                self.config_hash = config_hash
+                self.version = view.get("version")
+                if nb is not None:
+                    self.budgets = nb
+                if npb is not None:
+                    self.plane_budgets = npb
+                return {"ok": True, "receipt": rcpt}
             except Contained as exc:
+                if db2 is not None and db2.in_transaction:
+                    db2.execute("ROLLBACK")
                 return {"ok": False, "faults": [str(exc)]}
             except sqlite3.Error as exc:
+                if db2 is not None and db2.in_transaction:
+                    db2.execute("ROLLBACK")
                 return {"ok": False, "faults": [f"store-error {exc}"]}
 
-    def _fenced_check(self, db):
-        stored = dict(db.execute(
-            "SELECT key, value FROM meta").fetchall()).get("config_hash")
-        if stored and stored != self.config_hash:
-            raise Contained(
-                f"stale handle for activation: handle={self.config_hash[:12]} "
-                f"store={str(stored)[:12]}")
-
-    def _check_ceilings_against(self, db, occ):
-        v = self.view or {}
+    @staticmethod
+    def _check_ceilings(view, occ):
+        v = view or {}
         faults = []
         g = v.get("global_ceiling")
         if isinstance(g, int) and occ.get("global", 0) > g:
             faults.append(f"PRESSURE_BELOW_INFLIGHT: global occupancy "
                           f"{occ['global']} > ceiling {g}")
         for pid, n in (occ.get("profiles") or {}).items():
-            prof = self._canonical_view_profile(v, pid)
+            prof = PressureAuthority._canonical_view_profile(v, pid)
             if prof is None:
                 faults.append(f"PRESSURE_BELOW_INFLIGHT: profile {pid} "
                               f"vanished with {n} in flight")
@@ -438,10 +564,11 @@ class PressureAuthority:
             if n > b.get("ceiling", 1):
                 faults.append(f"PRESSURE_BELOW_INFLIGHT: binding {bid} "
                               f"occupancy {n} > ceiling {b['ceiling']}")
-        for pid, n in (occ.get("pools") or {}).items():
-            pool = (v.get("pools") or {}).get(pid)
-            if pool is None:
-                continue
+        # pool occupancy derives from EVERY PROPOSED pool's membership over
+        # binding counts — never from the old view's pool ids (F35.8r)
+        for pid, pool in (v.get("pools") or {}).items():
+            n = sum((occ.get("bindings") or {}).get(b, 0)
+                    for b in (pool.get("binding_refs") or []))
             if n > pool.get("concurrent_slots", 1):
                 faults.append(f"PRESSURE_BELOW_INFLIGHT: pool {pid} "
                               f"occupancy {n} > ceiling "
@@ -454,7 +581,8 @@ class PressureAuthority:
                               f"occupancy {n} > limit {role_max}")
         return faults
 
-    def _canonical_view_profile(self, v, pid):
+    @staticmethod
+    def _canonical_view_profile(v, pid):
         profiles = v.get("profiles") or {}
         if pid in profiles:
             return profiles[pid]
@@ -606,18 +734,27 @@ class PressureAuthority:
     def admit(self, *, dispatch_id, attempt_id, verified_principal,
               role_ref, profile_ref, plane_ref=None):
         """The gate every managed dispatch path calls (C27). Intersecting
-        predicates inside the write fence; budget derived from the plane;
-        single-use permit; replay fence per dispatch/attempt (sol F2)."""
+        predicates inside the write fence; budget derived from the plane
+        (an omitted plane is derived from the binding — F35.3r); single-use
+        permit; replay fence per dispatch/attempt (sol F2). Expired
+        never-redeemed grants terminalize under this transaction before
+        the replay scan (F35.2r) — attempt history is preserved."""
         request = {"dispatch_id": dispatch_id, "attempt_id": attempt_id,
                    "principal": verified_principal, "role": role_ref,
                    "profile": profile_ref, "plane": plane_ref,
                    "config_hash": self.config_hash}
         rd = _digest(request)
         with self._lock:
+            db2 = self._db
             try:
                 with self._txn() as db:
                     self._fenced(db)
                     now = _now()
+                    # definite nonlaunch: an expired, never-redeemed grant
+                    # terminalizes (history kept) and frees the dispatch
+                    db.execute(
+                        "UPDATE permits SET state='expired' "
+                        "WHERE state='granted' AND expires_at <= ?", (now,))
                     # replay fence: identical retry -> the existing outcome;
                     # a new attempt cannot bypass an unresolved dispatch
                     prior = db.execute(
@@ -652,80 +789,114 @@ class PressureAuthority:
                         role_ref)
                     if route is None:
                         raise Contained(f"unknown role {role_ref}")
-                    canon = self._canonical_profile(profile_ref)
+                    aliases = self.view.get("profile_aliases") or {}
+
+                    def _c(x):
+                        return aliases.get(x, x) if isinstance(x, str) else x
+
+                    canon = _c(profile_ref)
                     prof = (self.view.get("profiles") or {}).get(canon)
                     if prof is None:
                         raise Contained(f"unknown profile {profile_ref}")
-                    eligible = [route.get("preferred_profile_ref")] + list(
-                        route.get("fallback_profile_refs") or []) + [
-                        ln.get("profile_ref") for ln in
-                        (route.get("lanes") or [])]
-                    if profile_ref not in [e for e in eligible if e]:
+                    eligible = {_c(e) for e in (
+                        [route.get("preferred_profile_ref")]
+                        + list(route.get("fallback_profile_refs") or [])
+                        + [ln.get("profile_ref") for ln in
+                           (route.get("lanes") or [])]) if e}
+                    if canon not in eligible:
                         raise Contained(
                             f"profile {profile_ref} is not in role "
                             f"{role_ref} routes")
                     bind = prof.get("binding_ref")
-                    bstate = (self.view.get("bindings") or {}).get(
-                        bind, {}).get("status")
-                    if bstate != "admitted":
+                    bdoc = (self.view.get("bindings") or {}).get(bind, {})
+                    if bdoc.get("status") != "admitted":
                         raise Contained(
-                            f"binding {bind} is {bstate or 'unknown'}")
-                    if plane_ref is not None:
-                        plane = (self.view.get("planes") or {}).get(plane_ref)
-                        if not plane:
-                            raise Contained(f"unknown plane {plane_ref}")
-                        if plane.get("owner_policy") != "enabled":
+                            f"binding {bind} is "
+                            f"{bdoc.get('status') or 'unknown'}")
+                    # role capability requirements survive compilation and
+                    # intersect at admission (F35.6r)
+                    missing = set(route.get("required_capabilities") or []) \
+                        - set(bdoc.get("capabilities") or [])
+                    if missing:
+                        raise Contained(
+                            f"binding {bind} lacks required capabilities "
+                            f"{sorted(missing)}")
+                    # the plane is required or authoritatively derived
+                    # (F35.3r): an unbudgeted omission is impossible
+                    if plane_ref is None:
+                        cands = sorted(
+                            pid for pid, p in
+                            (self.view.get("planes") or {}).items()
+                            if p.get("owner_policy") == "enabled"
+                            and bind in (p.get("binding_refs") or []))
+                        if not cands:
                             raise Contained(
-                                f"plane {plane_ref} is "
-                                f"{plane.get('owner_policy')}")
-                        if bind not in (plane.get("binding_refs") or []):
-                            raise Contained(
-                                f"binding {bind} not in plane {plane_ref}")
-                    # health evidence: typed, fail-closed (sol F6)
-                    ev = None
-                    if self.health_evidence is not None:
-                        ev = self.health_evidence(bind)
+                                f"no enabled plane covers binding {bind}; "
+                                "plane_ref is required")
+                        plane_ref = cands[0]
+                    plane = (self.view.get("planes") or {}).get(plane_ref)
+                    if not plane:
+                        raise Contained(f"unknown plane {plane_ref}")
+                    if plane.get("owner_policy") != "enabled":
+                        raise Contained(
+                            f"plane {plane_ref} is "
+                            f"{plane.get('owner_policy')}")
+                    if bind not in (plane.get("binding_refs") or []):
+                        raise Contained(
+                            f"binding {bind} not in plane {plane_ref}")
+                    # health evidence: typed, fail-closed; provider failure
+                    # is unavailable evidence, never an exception escape
+                    # (F35.6r)
+                    try:
+                        ev = self.health_evidence(bind) \
+                            if self.health_evidence is not None else None
+                    except Exception as exc:
+                        return {"decision": "HOLD", "permit_ref": None,
+                                "reason_codes": [
+                                    f"health-evidence-unavailable {bind} "
+                                    f"({type(exc).__name__})"]}
                     if not isinstance(ev, dict) or \
                             ev.get("state") not in ("ok", "healthy"):
+                        if isinstance(ev, dict) and \
+                                isinstance(ev.get("pool_ref"), str) and \
+                                isinstance(ev.get("retry_at"), (int, float)) \
+                                and not isinstance(ev.get("retry_at"), bool):
+                            # identified pool refusal persists as a shared
+                            # cooldown across the pool's member profiles
+                            self._persist_pool_cooldown(
+                                db, ev["pool_ref"], ev["retry_at"])
                         return {"decision": "HOLD", "permit_ref": None,
                                 "reason_codes": [f"health-unavailable {bind}"]}
+                    exp = ev.get("expires_at")
+                    if isinstance(exp, (int, float)) and \
+                            not isinstance(exp, bool) and exp <= now:
+                        return {"decision": "HOLD", "permit_ref": None,
+                                "reason_codes": [f"health expired on {bind}"]}
                     limit = ev.get("concurrent_limit")
-                    # budget reservation (derived from the plane, sol F3)
-                    scopes = self._budget_scopes_for(plane_ref)
-                    for bid in scopes:
-                        budget = (self.budgets or {}).get(bid)
-                        if not budget:
-                            raise Contained(
-                                f"budget {bid} missing from config")
-                        if budget.get("spendable") is False:
-                            raise Contained(f"budget {bid} not spendable")
-                        limits = budget.get("hard_limits") or {}
-                        window = (budget.get("window_hours", 24) or 24) * 3600
-                        if "consults" in limits:
-                            used = db.execute(
-                                "SELECT COALESCE(SUM(budget_cost),0) FROM "
-                                "permits WHERE budget_scopes LIKE ? AND "
-                                "granted_at > ? AND (state IN ('granted',"
-                                "'redeemed','uncertain','spent') OR "
-                                "(state='released' AND redeemed_at IS NOT "
-                                "NULL))",
-                                (f'%"{bid}"%', now - window)).fetchone()[0]
-                            if used + 1 > limits["consults"]:
+                    if limit is not None and type(limit) is not int:
+                        return {"decision": "HOLD", "permit_ref": None,
+                                "reason_codes": [
+                                    f"health limit malformed on {bind}"]}
+                    # persisted pool cooldowns intersect across member
+                    # profiles regardless of what the probe now reports
+                    cd = self._pool_cooldowns(db)
+                    for pool_id, pool in (
+                            self.view.get("pools") or {}).items():
+                        if bind in (pool.get("binding_refs") or []):
+                            rt_ = cd.get(pool_id)
+                            if isinstance(rt_, (int, float)) and rt_ > now:
                                 return {"decision": "HOLD",
                                         "permit_ref": None,
                                         "reason_codes": [
-                                            f"budget {bid}: {used}+1 > "
-                                            f"{limits['consults']} consults"]}
-                        elif "tokens" in limits:
-                            if self.token_accounting is None:
-                                raise Contained(
-                                    f"budget {bid} meters tokens and no "
-                                    "token accounting interface is wired")
-                            if not self.token_accounting(bid, plane_ref):
-                                return {"decision": "HOLD",
-                                        "permit_ref": None,
-                                        "reason_codes": [
-                                            f"budget {bid}: tokens refused"]}
+                                            f"pool {pool_id} cooldown until "
+                                            f"{rt_}"]}
+                    # budget reservation — one checked implementation,
+                    # consult AND token limits enforced independently
+                    ok, scopes, breason = self._budget_check(
+                        db, plane_ref, now)
+                    if not ok:
+                        return {"decision": "HOLD", "permit_ref": None,
+                                "reason_codes": [breason]}
                     # occupancy vs every applicable ceiling
                     occ = self._occupancy_all(db, now)
                     desired = max(
@@ -736,17 +907,21 @@ class PressureAuthority:
                     if p_occ + 1 > desired:
                         reasons.append(f"profile {profile_ref} "
                                        f"{p_occ}+1 > desired {desired}")
-                    pceil = prof.get("ceiling", 1)
-                    if p_occ + 1 > pceil:
+                    pceil = prof.get("ceiling")
+                    if isinstance(pceil, int) and \
+                            not isinstance(pceil, bool) and \
+                            p_occ + 1 > pceil:
                         reasons.append(f"profile {profile_ref} "
                                        f"ceiling {pceil}")
-                    limit = ev.get("concurrent_limit") if ev else None
-                    if isinstance(limit, int) and p_occ + 1 > limit:
-                        reasons.append(f"health limit {limit} on {bind}")
+                    # the health limit binds the BINDING, so it intersects
+                    # every profile that shares it (F35.6r)
                     b_occ = occ["bindings"].get(bind, 0)
-                    bceil = (self.view.get("bindings") or {}).get(
-                        bind, {}).get("ceiling", 1)
-                    if b_occ + 1 > bceil:
+                    if type(limit) is int and b_occ + 1 > limit:
+                        reasons.append(f"health limit {limit} on {bind}")
+                    bceil = bdoc.get("ceiling")
+                    if isinstance(bceil, int) and \
+                            not isinstance(bceil, bool) and \
+                            b_occ + 1 > bceil:
                         reasons.append(f"binding {bind} {b_occ}+1 > "
                                        f"ceiling {bceil}")
                     for pool_id, pool in (
@@ -768,11 +943,10 @@ class PressureAuthority:
                     if reasons:
                         return {"decision": "HOLD", "permit_ref": None,
                                 "reason_codes": reasons}
-                    # barrier: uncertain launch state blocks new permits (F9)
-                    barrier = dict(db.execute(
-                        "SELECT key, value FROM meta").fetchall()).get(
-                        "reconcile_barrier")
-                    if barrier == "1":
+                    # barrier: outstanding reconciliation state blocks new
+                    # permits (F9/F35.9r) — the persisted flag or the
+                    # crash-recovery latch from opening
+                    if self._barriered(db):
                         return {"decision": "HOLD", "permit_ref": None,
                                 "reason_codes": ["reconciliation-barrier"]}
                     permit_ref = str(uuid.uuid4())
@@ -799,13 +973,11 @@ class PressureAuthority:
                             "receipt": rcpt, "binding_ref": bind,
                             "profile_ref": canon, "reason_codes": []}
             except Contained as exc:
-                db2 = self._db
                 if db2 is not None and db2.in_transaction:
                     db2.execute("ROLLBACK")
                 return {"decision": "CONTAIN", "permit_ref": None,
                         "reason_codes": [str(exc)]}
             except sqlite3.Error as exc:
-                db2 = self._db
                 if db2 is not None and db2.in_transaction:
                     db2.execute("ROLLBACK")
                 return {"decision": "CONTAIN", "permit_ref": None,
@@ -813,11 +985,27 @@ class PressureAuthority:
 
     def redeem(self, permit_ref, *, dispatch_id, attempt_id):
         """Fence immediately before launch. Only granted+unexpired+current
-        permits redeem (sol F2); one-row update authorizes the launch."""
+        permits redeem (sol F2); the executor re-verifies as the permit's
+        admitted principal through the injected verifier (F35.2r); one-row
+        update authorizes the launch."""
         with self._lock:
+            db2 = self._db
             try:
                 with self._txn() as db:
                     self._fenced(db)
+                    row = db.execute(
+                        "SELECT state, principal, role_ref FROM permits "
+                        "WHERE permit_ref = ?", (permit_ref,)).fetchone()
+                    if not row:
+                        raise Contained("unknown permit")
+                    state, principal, prole = row
+                    if state != "granted":
+                        raise Contained(
+                            f"permit not redeemable (state={state})")
+                    # the executor is the admitted principal, re-verified
+                    # NOW — a verifier that stopped authorizing stops all
+                    # redemption (F35.2r)
+                    self._resolve_principal(principal, prole)
                     now = _now()
                     cur = db.execute(
                         "UPDATE permits SET state = 'redeemed', "
@@ -828,12 +1016,8 @@ class PressureAuthority:
                         (now, permit_ref, self.config_hash, now,
                          dispatch_id, attempt_id))
                     if cur.rowcount != 1:
-                        row = db.execute(
-                            "SELECT state FROM permits WHERE permit_ref = ?",
-                            (permit_ref,)).fetchone()
                         raise Contained(
-                            f"permit not redeemable (state="
-                            f"{row[0] if row else 'unknown'})")
+                            "permit not redeemable (identity or expiry)")
                     rcpt = self._receipt(db, "redeem",
                                          {"permit_ref": permit_ref,
                                           "dispatch_id": dispatch_id,
@@ -841,36 +1025,32 @@ class PressureAuthority:
                                           "at": now})
                     return {"ok": True, "receipt": rcpt}
             except Contained as exc:
-                db2 = self._db
                 if db2 is not None and db2.in_transaction:
                     db2.execute("ROLLBACK")
                 return {"ok": False, "faults": [str(exc)]}
             except sqlite3.Error as exc:
-                db2 = self._db
                 if db2 is not None and db2.in_transaction:
                     db2.execute("ROLLBACK")
                 return {"ok": False, "faults": [f"store-error {exc}"]}
 
     def mark_uncertain(self, permit_ref, detail=""):
         with self._lock:
+            db2 = self._db
             try:
                 with self._txn() as db:
+                    self._fenced(db)
                     cur = db.execute(
                         "UPDATE permits SET state = 'uncertain' WHERE "
                         "permit_ref = ? AND state IN ('granted','redeemed')",
                         (permit_ref,))
                     if cur.rowcount != 1:
                         raise Contained("permit not markable uncertain")
-                    db.execute(
-                        "INSERT OR REPLACE INTO meta (key, value) "
-                        "VALUES ('reconcile_barrier', '1')")
+                    self._write_barrier(db)
                     rcpt = self._receipt(db, "mark-uncertain",
                                          {"permit_ref": permit_ref,
                                           "detail": str(detail)[:200]})
-                    db.execute("COMMIT")
                     return {"ok": True, "receipt": rcpt}
             except (Contained, sqlite3.Error) as exc:
-                db2 = self._db
                 if db2 is not None and db2.in_transaction:
                     db2.execute("ROLLBACK")
                 return {"ok": False,
@@ -880,39 +1060,49 @@ class PressureAuthority:
     def reconcile(self, permit_ref, *, launched, dispatch_id=None,
                   attempt_id=None):
         """Resolve an uncertain permit: launched -> redeemed (slot held
-        until release); not-launched -> released. Only uncertain permits
-        reconcile (sol F2)."""
+        until release, spent marker kept — F35.3r); not-launched ->
+        released. Only uncertain permits reconcile (sol F2). The
+        reconciler re-verifies through the injected verifier (F35.2r) and
+        any supplied dispatch/attempt identity must match exactly."""
+        if not isinstance(launched, bool):
+            return {"ok": False, "faults": ["launched must be a bool"]}
         with self._lock:
+            db2 = self._db
             try:
                 with self._txn() as db:
+                    self._fenced(db)
+                    now = _now()
                     row = db.execute(
-                        "SELECT dispatch_id, attempt_id FROM permits "
-                        "WHERE permit_ref = ? AND state = 'uncertain'",
-                        (permit_ref,)).fetchone()
+                        "SELECT dispatch_id, attempt_id, principal, "
+                        "role_ref FROM permits WHERE permit_ref = ? AND "
+                        "state = 'uncertain'", (permit_ref,)).fetchone()
                     if not row:
                         raise Contained(
                             "permit not uncertain (nothing to reconcile)")
-                    d_id, a_id = row
-                    if dispatch_id not in (None, d_id) or \
-                            attempt_id not in (None, a_id):
+                    d_id, a_id, principal, prole = row
+                    if (dispatch_id is not None and dispatch_id != d_id) \
+                            or (attempt_id is not None and
+                                attempt_id != a_id):
                         raise Contained(
                             "reconcile identity does not match the permit")
-                    db.execute(
-                        "UPDATE permits SET state = ? WHERE permit_ref = ?",
-                        ("redeemed" if launched else "released", permit_ref))
-                    remain = db.execute(
-                        "SELECT COUNT(*) FROM permits WHERE state = "
-                        "'uncertain'").fetchone()[0]
-                    if not remain:
-                        db.execute("INSERT OR REPLACE INTO meta (key, value)"
-                                   " VALUES ('reconcile_barrier', '0')")
+                    # authenticated reconciliation evidence: the reconciler
+                    # resolves as the permit's principal (F35.2r)
+                    self._resolve_principal(principal, prole)
+                    if launched:
+                        db.execute(
+                            "UPDATE permits SET state = 'redeemed', "
+                            "redeemed_at = ? WHERE permit_ref = ?",
+                            (now, permit_ref))
+                    else:
+                        db.execute(
+                            "UPDATE permits SET state = 'released' "
+                            "WHERE permit_ref = ?", (permit_ref,))
+                    self._write_barrier(db)
                     rcpt = self._receipt(db, "reconcile",
                                          {"permit_ref": permit_ref,
-                                          "launched": bool(launched)})
-                    db.execute("COMMIT")
+                                          "launched": launched})
                     return {"ok": True, "receipt": rcpt}
             except (Contained, sqlite3.Error) as exc:
-                db2 = self._db
                 if db2 is not None and db2.in_transaction:
                     db2.execute("ROLLBACK")
                 return {"ok": False,
@@ -921,10 +1111,13 @@ class PressureAuthority:
 
     def release(self, permit_ref):
         """The dispatch finished: free its slot. Terminal and idempotent
-        (sol F2); unknown permits fault."""
+        (sol F2); unknown permits fault; fenced like every mutation
+        (F35.1r)."""
         with self._lock:
+            db2 = self._db
             try:
                 with self._txn() as db:
+                    self._fenced(db)
                     cur = db.execute(
                         "UPDATE permits SET state = 'released' WHERE "
                         "permit_ref = ? AND state IN ('granted','redeemed',"
@@ -939,12 +1132,11 @@ class PressureAuthority:
                         raise Contained(
                             f"permit not releasable "
                             f"(state={row[0] if row else 'unknown'})")
+                    self._write_barrier(db)
                     rcpt = self._receipt(db, "release",
                                          {"permit_ref": permit_ref})
-                    db.execute("COMMIT")
                     return {"ok": True, "receipt": rcpt}
             except (Contained, sqlite3.Error) as exc:
-                db2 = self._db
                 if db2 is not None and db2.in_transaction:
                     db2.execute("ROLLBACK")
                 return {"ok": False,
@@ -965,7 +1157,8 @@ class PressureAuthority:
         return {"available": True, "config_hash": self.config_hash,
                 "version": self.version, "level": self.view.get("level"),
                 "epoch": meta.get("epoch"),
-                "reconcile_barrier": meta.get("reconcile_barrier") == "1",
+                "reconcile_barrier": meta.get("reconcile_barrier") == "1"
+                or self._recovery_barrier,
                 "occupancy": occ, "active_leases": leases,
                 "desired": {pid: self._desired(db, pid, now)
                             for pid in self.view.get("profiles", {})}}
@@ -973,16 +1166,19 @@ class PressureAuthority:
 
 def authority_from_config(cfg, config_hash, state_dir=None, **kw):
     """Compile a config through pressure_view; budgets and plane budget
-    mappings load from the config itself (sol F3) unless overridden.
-    First-use provisioning: provisions the store ONLY when no store file
-    exists yet — an existing missing/corrupt store stays containment."""
+    mappings load from the config itself (sol F3) unless overridden — the
+    compiled view carries them too, so activation refreshes them bound to
+    the same policy hash. First-use bootstrap: the store is provisioned
+    ONLY when the runtime/pressure area has never been initialized; a
+    vacated store inside an initialized area is a LOST committed store
+    and stays containment, never a fresh authority (F35.9r)."""
     import swarmconfig as sc
     sd = Path(state_dir).expanduser() if state_dir         else Path("~/.yggterm/swarm").expanduser()
-    store = sd / "runtime" / "pressure" / "state.sqlite"
-    if not store.exists():
+    area = sd / "runtime" / "pressure"
+    if not area.exists():
         PressureAuthority.provision({}, config_hash, state_dir=state_dir)
-    kw.setdefault("budgets", (cfg.get("supply") or {}).get("budgets") or {})
     view = sc.pressure_view(cfg)
+    kw.setdefault("budgets", (cfg.get("supply") or {}).get("budgets") or {})
     kw.setdefault("plane_budgets", {
         pid: {"binding_refs": p.get("binding_refs") or [],
               "owner_policy": p.get("owner_policy"),

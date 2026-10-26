@@ -462,13 +462,28 @@ def _adjudicate_one(state, area, p):
         "proposed_by": principal,
         "reason": env.get("reason") or f"sync batch accept from {p.get('origin_host')}",
     }
+    # F35.4r: the ledger supplies the authenticated context accept()
+    # requires. The sync transport vouches for the captured principal
+    # (claimed principal, else the origin host); the role is DERIVED from
+    # the vouch — "owner" for endorsed captures, "agent" otherwise (demand
+    # delegation in a config therefore lists "agent" among its
+    # agent_role_refs to enable ledger-carried demand edits).
+    verified_agent = ("owner" if endorsed
+                      else env.get("claimed_principal") or p.get("origin_host"))
+    _vouched_role = "owner" if endorsed else "agent"
+
+    def _ledger_verifier(who, _v=verified_agent, _r=_vouched_role):
+        return _r if who == _v else None
+
     final_bytes = canonical_json(final)  # canonical JSON form is valid YAML
     # COMMIT ORDER (sol t7#3/t9#1): seal -> journal (fsync = commit point) ->
     # activate. A journal failure leaves an uncommitted seal, never a moved
     # pointer; recovery reads committed releases exclusively.
     r = accept(final_bytes, proposed_by=principal, authority_class=authority_class,
                parent_expected=head_hash, state_dir=state, change_id=cid,
-               reason=final["identity"]["reason"], commit_point="seal-only")
+               reason=final["identity"]["reason"], commit_point="seal-only",
+               principal_verifier=_ledger_verifier,
+               verified_principal=verified_agent, issuer_role_ref="agent")
     if r["decision"] != "accepted":
         return {**base_detail, "decision": r["decision"],
                 "detail": "; ".join(x["detail"] for x in r["faults"])[:200]}
@@ -478,7 +493,9 @@ def _adjudicate_one(state, area, p):
     _journal_append(state, area, rec)  # COMMIT POINT (fsync)
     r = accept(final_bytes, proposed_by=principal, authority_class=authority_class,
                parent_expected=head_hash, state_dir=state, change_id=cid,
-               reason=final["identity"]["reason"], commit_point="activate-only")
+               reason=final["identity"]["reason"], commit_point="activate-only",
+               principal_verifier=_ledger_verifier,
+               verified_principal=verified_agent, issuer_role_ref="agent")
     _refresh_current_yaml(state)
     return {**base_detail, "decision": "accepted",
             "revision": r.get("revision"), "content_hash": r.get("content_hash")}

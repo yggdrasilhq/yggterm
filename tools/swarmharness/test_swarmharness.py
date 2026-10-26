@@ -59,6 +59,22 @@ def child_load_noyaml(state_dir):
 
 
 def main():
+    # suite-wide principal verifier for agent-class accept calls (F35.4r):
+    # a claimed role never authorizes — the resolved role does
+    SUITE_PRINCIPALS = {"agent:core-keeper": "core-keeper",
+                        "agent:x": "intelligence",
+                        "orchestrator-agent": "intelligence",
+                        "agent-x": "intelligence"}
+
+    def suite_verifier(p):
+        return SUITE_PRINCIPALS.get(p)
+
+    def agent_accept(payload, *, proposed_by, state_dir, **kw):
+        kw.setdefault("principal_verifier", suite_verifier)
+        kw.setdefault("verified_principal", proposed_by)
+        return sc.accept(payload, proposed_by=proposed_by,
+                         authority_class="agent", state_dir=state_dir, **kw)
+
     # ---- 1. genesis validates; semantic hash is stable and hex64
     cfg, pf = sc.parse_yaml_bytes(GENESIS)
     check("genesis parses", pf is None, str(pf))
@@ -124,7 +140,7 @@ def main():
     v2["identity"]["parent_hash"] = sc.content_hash(cfg)
     v2["identity"]["change_id"] = str(uuid.uuid4())
     v2["supply"]["schedules"] = {"wake_interval_min": 30}
-    ra = sc.accept(v2, proposed_by="agent:core-keeper", authority_class="agent", state_dir=sd)
+    ra = agent_accept(v2, proposed_by="agent:core-keeper", state_dir=sd)
     check("agent supply edit accepted", ra["decision"] == "accepted", json.dumps(ra["faults"]))
 
     v3 = json.loads(json.dumps(v2))
@@ -132,7 +148,7 @@ def main():
     v3["identity"]["parent_hash"] = ra["content_hash"]
     v3["identity"]["change_id"] = str(uuid.uuid4())
     v3["planes"]["plane1"]["owner_policy"] = "disabled"
-    ru = sc.accept(v3, proposed_by="agent:core-keeper", authority_class="agent", state_dir=sd)
+    ru = agent_accept(v3, proposed_by="agent:core-keeper", state_dir=sd)
     check("agent plane edit -> rejected_unauthorized",
           ru["decision"] == "rejected_unauthorized", ru["decision"])
     check("head after unauthorized == v2 head", sc.active_head(sd)["content_hash"] == ra["content_hash"])
@@ -149,7 +165,7 @@ def main():
     v4["identity"]["parent_hash"] = ro["content_hash"]
     v4["identity"]["change_id"] = str(uuid.uuid4())
     v4["catalog"]["bindings"]["bnew"] = {"status": "declared", "capabilities": ["dreamer"]}
-    radd = sc.accept(v4, proposed_by="agent:x", authority_class="agent", state_dir=sd)
+    radd = agent_accept(v4, proposed_by="agent:x", state_dir=sd)
     check("agent adds declared binding accepted", radd["decision"] == "accepted",
           json.dumps(radd["faults"]))
     v5 = json.loads(json.dumps(v4))
@@ -157,7 +173,7 @@ def main():
     v5["identity"]["parent_hash"] = radd["content_hash"]
     v5["identity"]["change_id"] = str(uuid.uuid4())
     v5["catalog"]["bindings"]["b1"]["model"] = "hijacked"
-    redit = sc.accept(v5, proposed_by="agent:x", authority_class="agent", state_dir=sd)
+    redit = agent_accept(v5, proposed_by="agent:x", state_dir=sd)
     check("agent edits existing binding rejected",
           redit["decision"] == "rejected_unauthorized", redit["decision"])
     sd2 = temp_state()
@@ -396,8 +412,8 @@ def main():
     pb = json.loads(json.dumps(cfg))
     pb["identity"].update(revision=2, parent_hash=hP, change_id=str(uuid.uuid4()))
     pb["supply"]["budgets"]["bud1"]["hard_limits"]["tokens"] = 999999999
-    rp = sc.accept(sc.canonical_json(pb), proposed_by="agent:x", authority_class="agent",
-                   parent_expected=hP, state_dir=sdP)
+    rp = agent_accept(sc.canonical_json(pb), proposed_by="agent:x",
+                      parent_expected=hP, state_dir=sdP)
     check("P1 agent budget increase rejected", rp["decision"] == "rejected_unauthorized",
           rp["decision"])
 
@@ -2308,7 +2324,9 @@ def main():
     # three admitted bindings the profiles ride (conformance genesis has
     # only its own b1/b2 seed bindings)
     v3["catalog"]["harnesses"].update({
-        "codex": {"kind": "consult-cli"}, "agy": {"kind": "consult-cli"}, "zcode-tui": {"kind": "dispatch-queue"}})
+        "codex": {"kind": "consult-cli", "adapter_ref": "consult-codex-v1"},
+        "agy": {"kind": "consult-cli", "adapter_ref": "consult-agy-v1"},
+        "zcode-tui": {"kind": "dispatch-queue", "adapter_ref": "queue-serve-v2"}})
     v3["catalog"]["providers"].update({p: {"id": p} for p in ("openai", "google", "zai")})
     v3["catalog"]["accounts"].update({"openai-sol": {"provider": "openai"}, "google-bundled": {"provider": "google"}, "zai-primary": {"provider": "zai"}})
     v3["catalog"]["plans"].update({"openai-paid": {"provider": "openai", "kind": "subscription"}, "gemini-bundled": {"provider": "google", "kind": "subscription"}, "zai-coding-plan": {"provider": "zai", "kind": "subscription"}})
@@ -2514,29 +2532,29 @@ def main():
                              parent_hash=head9, change_id=change)
         return json.dumps(d)
 
-    ra = sc.accept(agent_variant(
+    ra = agent_accept(agent_variant(
         lambda d: d["supply"]["pressure"]["demand"].update(level="saturate"),
         "22222222-2222-4333-8444-555555555551"),
-        proposed_by="orchestrator-agent", authority_class="agent",
+        proposed_by="orchestrator-agent",
         state_dir=sd9, issuer_role_ref="intelligence")
     check("T35-9 delegated demand change accepted from an agent",
           ra["decision"] == "accepted", json.dumps(ra["faults"])[:200])
     head9 = sc.active_head(sd9)["content_hash"]
-    rc_ = sc.accept(agent_variant(
+    rc_ = agent_accept(agent_variant(
         lambda d: d["supply"]["pressure"]["ceilings"].update(
             global_concurrent_slots=256),
         "22222222-2222-4333-8444-555555555552"),
-        proposed_by="orchestrator-agent", authority_class="agent",
+        proposed_by="orchestrator-agent",
         state_dir=sd9)
     check("T35-9b agent raising a ceiling -> rejected_unauthorized",
           rc_["decision"] == "rejected_unauthorized", rc_["decision"])
     head9 = sc.active_head(sd9)["content_hash"]
-    rr = sc.accept(agent_variant(
+    rr = agent_accept(agent_variant(
         lambda d: d["supply"]["pressure"].update(
             control=dict(d["supply"]["pressure"]["control"],
                          agent_level_names=["normal"])),
         "22222222-2222-4333-8444-555555555553"),
-        proposed_by="agent-x", authority_class="agent", state_dir=sd9)
+        proposed_by="agent-x", state_dir=sd9)
     check("T35-9c undelegated level -> rejected_unauthorized",
           rr["decision"] == "rejected_unauthorized", rr["decision"])
 
@@ -2676,6 +2694,365 @@ def main():
           "GLM-5.3-Flash"
           and pv["profiles"]["glm-max"]["binding_ref"] == "glm-workhorse")
 
+
+
+    # =====================================================================
+    # T36 — pressure repair v3 (delta review F35.1r-F35.11r residuals).
+    # Each check pins one required repair from the sol delta review
+    # (2026-10-26): read-only open, explicit restart, executor
+    # re-verification, expired-grant terminalization, plane derivation,
+    # spent markers, atomic budget refresh, cooldown sharing, capability
+    # intersection, alias resolution, expanded-target bounds, and the
+    # legacy executable view.
+    # =====================================================================
+    clock = [1800000000.0]
+    real_now = pr._now
+    pr._now = lambda: clock[0]
+    suite_principals2 = {"worker": "intelligence", "editor2": "editor"}
+
+    def suite_verifier2(p):
+        return suite_principals2.get(p)
+
+    def t36_auth(tag, cfg=None, *, health=None, verifier=None, view=None,
+                 config_hash=None):
+        cfg = cfg if cfg is not None else v3
+        v = view if view is not None else sc.pressure_view(cfg)
+        return pr.PressureAuthority.provision(
+            v, config_hash or f"t36-{tag}",
+            state_dir=temp_state() / f"t36-{tag}",
+            health_evidence=health if health is not None else healthy,
+            principal_verifier=verifier or suite_verifier2,
+            budgets=(cfg.get("supply") or {}).get("budgets"),
+            plane_budgets={
+                pid: {"binding_refs": p.get("binding_refs") or [],
+                      "owner_policy": p.get("owner_policy"),
+                      "budget_refs": p.get("budget_refs") or []}
+                for pid, p in (cfg.get("planes") or {}).items()})
+
+    def t36_admit(a, d, attempt="a", role="intelligence",
+                  profile="sol-high", plane="intelligence-consult",
+                  principal="worker"):
+        return a.admit(dispatch_id=d, attempt_id=attempt,
+                       verified_principal=principal, role_ref=role,
+                       profile_ref=profile, plane_ref=plane)
+
+    def t36_launch(a, d, **kw):
+        x = t36_admit(a, d, **kw)
+        assert x["decision"] == "ALLOW", (d, x)
+        r = a.redeem(x["permit_ref"], dispatch_id=d, attempt_id="a")
+        assert r.get("ok"), r
+        return x["permit_ref"]
+
+    # F35.1r: ordinary open is read-only; the store identity is
+    # authoritative; every mutation fences
+    a = t36_auth("open-ro")
+    pref = t36_launch(a, "ro-launch")
+    b = pr.PressureAuthority(
+        a.view, a.config_hash, state_dir=a.db_path.parents[2],
+        health_evidence=a.health_evidence,
+        principal_verifier=a.principal_verifier, budgets=a.budgets,
+        plane_budgets=a.plane_budgets)
+    check("T36-1 reopening preserves replay identity (read-only open)",
+          b._db.execute("SELECT state FROM permits WHERE permit_ref=?",
+                        (pref,)).fetchone()[0] == "redeemed")
+    x = t36_admit(b, "ro-launch")
+    check("T36-1b replayed dispatch returns the same permit",
+          x["decision"] == "ALLOW" and x.get("permit_ref") == pref)
+    b.release(pref)
+    x = t36_admit(b, "ro-new")
+    check("T36-1c new dispatch on the reopened handle admits after release",
+          x["decision"] == "ALLOW", json.dumps(x)[:120])
+    stale = pr.PressureAuthority(
+        a.view, a.config_hash, state_dir=a.db_path.parents[2],
+        health_evidence=a.health_evidence,
+        principal_verifier=a.principal_verifier, budgets=a.budgets,
+        plane_budgets=a.plane_budgets)
+    act = b.activate(json.loads(json.dumps(b.view)), "t" * 64)
+    x2 = t36_admit(b, "post-act")
+    check("T36-1d activation ok; stale mark/reconcile/release fenced",
+          act.get("ok") and x2["decision"] == "ALLOW"
+          and not stale.mark_uncertain(x2["permit_ref"]).get("ok")
+          and not stale.release(x2["permit_ref"]).get("ok")
+          and not stale.reconcile(x2["permit_ref"], launched=False).get("ok"),
+          json.dumps(act)[:120])
+    a2 = t36_auth("restart")
+    pref2 = t36_launch(a2, "rs-live")
+    rs = a2.restart()
+    check("T36-2 restart keeps launched history and sets the barrier",
+          rs.get("ok") and a2.status()["reconcile_barrier"]
+          and a2._db.execute(
+              "SELECT state FROM permits WHERE permit_ref=?",
+              (pref2,)).fetchone()[0] == "redeemed")
+    a2.release(pref2)
+    check("T36-2b release clears the barrier",
+          not a2.status()["reconcile_barrier"])
+    a3 = t36_auth("expiry")
+    pref3 = t36_admit(a3, "exp-dispatch")["permit_ref"]
+    clock[0] += 31
+    x = t36_admit(a3, "exp-dispatch", attempt="b")
+    check("T36-3 expired never-redeemed grant terminalizes and frees "
+          "the dispatch",
+          x["decision"] == "ALLOW"
+          and a3._db.execute(
+              "SELECT state FROM permits WHERE permit_ref=?",
+              (pref3,)).fetchone()[0] == "expired")
+    clock[0] = 1800000000.0
+    # F35.2r: executor re-verification and reconcile evidence
+    a4 = t36_auth("authz")
+    pref4 = t36_admit(a4, "authz-d")["permit_ref"]
+    a4.principal_verifier = lambda p: None
+    r = a4.redeem(pref4, dispatch_id="authz-d", attempt_id="a")
+    a4.principal_verifier = suite_verifier2
+    r2 = a4.redeem(pref4, dispatch_id="authz-d", attempt_id="a")
+    a4.mark_uncertain(pref4)
+    a4.principal_verifier = lambda p: None
+    rc = a4.reconcile(pref4, launched=False)
+    a4.principal_verifier = suite_verifier2
+    rc2 = a4.reconcile(pref4, launched=False, dispatch_id="wrong")
+    rc3 = a4.reconcile(pref4, launched=False, dispatch_id="authz-d",
+                       attempt_id="a")
+    check("T36-4 redeem/reconcile re-verify; supplied identity exact; "
+          "launched strict bool",
+          not r.get("ok") and r2.get("ok") and not rc.get("ok")
+          and not rc2.get("ok") and rc3.get("ok")
+          and not a4.reconcile(pref4, launched="no").get("ok"))
+    # F35.3r: plane derivation, spending lifecycle, atomic refresh
+    cfg_b36 = json.loads(json.dumps(v3))
+    cfg_b36["supply"]["budgets"]["b-consult-daily"]["hard_limits"] = {
+        "consults": 1}
+    f36 = pr.authority_from_config(
+        cfg_b36, "t36-budget",
+        state_dir=temp_state() / "t36-budget",
+        health_evidence=healthy, principal_verifier=suite_verifier2)
+    check("T36-5 factory loads budgets from config",
+          f36.budgets.get("b-consult-daily", {}).get("hard_limits") ==
+          {"consults": 1})
+    p5 = t36_launch(f36, "bud-first")
+    f36.release(p5)
+    x = t36_admit(f36, "bud-second")
+    xn = t36_admit(f36, "bud-noplane", plane=None)
+    check("T36-5b spent work retains spending; omitted plane derives",
+          x["decision"] == "HOLD" and xn["decision"] == "HOLD")
+    f36b = pr.authority_from_config(
+        cfg_b36, "t36-budget2",
+        state_dir=temp_state() / "t36-budget2",
+        health_evidence=healthy, principal_verifier=suite_verifier2)
+    p5b = t36_launch(f36b, "bud-reconciled")
+    f36b.mark_uncertain(p5b)
+    f36b.reconcile(p5b, launched=True)
+    f36b.release(p5b)
+    x = t36_admit(f36b, "bud-after-reconciled")
+    check("T36-5c reconciled launch keeps its spent marker",
+          x["decision"] == "HOLD", json.dumps(x)[:140])
+    cfg_mix = json.loads(json.dumps(v3))
+    cfg_mix["supply"]["budgets"]["b-consult-daily"]["hard_limits"] = {
+        "consults": 100, "tokens": 5}
+    m36 = t36_auth("mix", cfg_mix)
+    x = t36_admit(m36, "mix-d")
+    check("T36-5d mixed budget without token accounting CONTAINs",
+          x["decision"] == "CONTAIN", json.dumps(x)[:140])
+    p6 = t36_launch(b, "spent-refresh")
+    b.mark_uncertain(p6)
+    b.reconcile(p6, launched=True)
+    b.release(p6)
+    newview = json.loads(json.dumps(b.view))
+    act = b.activate(newview, "u" * 64)
+    check("T36-5e activation refreshes budgets bound to the policy hash",
+          act.get("ok") and b.config_hash == "u" * 64
+          and b.budgets == newview["budgets"])
+    # F35.6r: health expiry, malformed limit, provider failure, binding
+    # intersection, cooldown sharing, capability intersection
+    for name, ev in [
+            ("expired", lambda b: {"state": "ok", "expires_at":
+                                   clock[0] - 1}),
+            ("badlimit", lambda b: {"state": "ok",
+                                    "concurrent_limit": "zero"}),
+            ("raise", lambda b: (_ for _ in ()).throw(OSError("x")))]:
+        h36 = t36_auth(f"health-{name}", health=ev)
+        x = t36_admit(h36, f"health-{name}-d")
+        check(f"T36-6 health {name} fail-closed",
+              x["decision"] == "HOLD", json.dumps(x)[:140])
+    h36 = t36_auth("health-bind",
+                   health=lambda b: {"state": "ok", "concurrent_limit": 1})
+    t36_launch(h36, "hb-first")
+    x = t36_admit(h36, "hb-second", profile="sol-medium")
+    check("T36-6b health limit binds the shared binding",
+          x["decision"] == "HOLD"
+          and any("health limit" in rc for rc in x["reason_codes"]),
+          json.dumps(x)[:140])
+    c36 = t36_auth("cooldown")
+    seen = [0]
+
+    def refusing(b):
+        seen[0] += 1
+        if seen[0] == 1:
+            return {"state": "refused", "pool_ref": "codex-sol",
+                    "retry_at": clock[0] + 60}
+        return {"state": "ok"}
+
+    c36.health_evidence = refusing
+    x = t36_admit(c36, "cd-first")
+    y = t36_admit(c36, "cd-peer", profile="sol-medium")
+    check("T36-6c pool refusal cooldown persists across member profiles",
+          x["decision"] == "HOLD" and y["decision"] == "HOLD"
+          and any("cooldown" in rc for rc in y["reason_codes"]),
+          json.dumps([x["reason_codes"], y["reason_codes"]])[:160])
+    cfg_cap = json.loads(json.dumps(v3))
+    cfg_cap["roles"]["editor"]["required_capabilities"] = ["implementation"]
+    cap36 = t36_auth("cap", cfg_cap)
+    x = cap36.admit(dispatch_id="cap-d", attempt_id="a",
+                    verified_principal="editor2", role_ref="editor",
+                    profile_ref="sol-high",
+                    plane_ref="intelligence-consult")
+    check("T36-6d required capability intersects at admission",
+          x["decision"] != "ALLOW", json.dumps(x)[:140])
+    # F35.7r: alias route resolution and alias override effect
+    al36 = t36_auth("alias")
+    x = t36_admit(al36, "alias-d", profile="sol-editor/default")
+    check("T36-7 canonical alias resolves the route to sol-high",
+          x["decision"] == "ALLOW" and x.get("profile_ref") == "sol-high",
+          json.dumps(x)[:140])
+    cfg_ov = json.loads(json.dumps(v3))
+    cfg_ov["supply"]["pressure"]["demand"]["profile_slot_overrides"][
+        "sol-editor/default"] = 1
+    check("T36-7b alias override lands on the canonical profile",
+          not sc.validate(cfg_ov)
+          and sc.pressure_view(cfg_ov)["baseline"]["sol-high"] == 1)
+    # F35.8r: activation counts PROPOSED pool membership over bindings
+    p36 = t36_auth("pools")
+    t36_launch(p36, "pool-1")
+    t36_launch(p36, "pool-2", profile="sol-medium")
+    vpool = json.loads(json.dumps(p36.view))
+    vpool["pools"]["codex-sol"]["binding_refs"].append("gemini-reviewer")
+    vpool["pools"]["codex-sol"]["concurrent_slots"] = 1
+    x = p36.activate(vpool, "p" * 64)
+    check("T36-8 activation bounds proposed pool membership",
+          not x.get("ok") and any("BELOW_INFLIGHT" in fl
+                                  for fl in x.get("faults", [])),
+          json.dumps(x)[:160])
+    # F35.9r: lost store CONTAINs; missing signer key CONTAINs
+    sd_lost = temp_state() / "t36-lost"
+    l36 = pr.authority_from_config(v3, "t36-lost", state_dir=sd_lost,
+                                   health_evidence=healthy,
+                                   principal_verifier=suite_verifier2)
+    t36_launch(l36, "lost-live")
+    l36._db.close()
+    (sd_lost / "runtime" / "pressure" / "state.sqlite").unlink()
+    l36b = pr.authority_from_config(v3, "t36-lost", state_dir=sd_lost,
+                                    health_evidence=healthy,
+                                    principal_verifier=suite_verifier2)
+    x = t36_admit(l36b, "after-lost")
+    check("T36-9 vacated store inside an initialized area CONTAINs",
+          x["decision"] == "CONTAIN", json.dumps(x)[:140])
+    s36 = t36_auth("signer")
+    s36._db.execute("DELETE FROM meta WHERE key='signer_key'")
+    s36._db.commit()
+    s36._db.close()
+    s36b = pr.PressureAuthority(
+        s36.view, s36.config_hash, state_dir=s36.db_path.parents[2],
+        health_evidence=s36.health_evidence,
+        principal_verifier=s36.principal_verifier, budgets=s36.budgets,
+        plane_budgets=s36.plane_budgets)
+    x = t36_admit(s36b, "after-signer-loss")
+    check("T36-9b missing signer key CONTAINs (no fallback key)",
+          x["decision"] == "CONTAIN", json.dumps(x)[:140])
+    # F35.10r schema closures
+    bad = json.loads(json.dumps(v3))
+    bad["supply"]["pressure"]["control"]["lease_max_active_per_issuer"] = True
+    check("T36-10 lease_max_active bool rejected (exact int)",
+          bool(sc.validate(bad)))
+    for name, mut in [
+            ("binding-ceilings", lambda c: c["supply"]["pressure"]
+             ["ceilings"].update({"binding_concurrent_slots": [1]})),
+            ("level-slots", lambda c: c["supply"]["pressure"]["levels"]
+             ["high"].update({"profile_slots": [1]})),
+            ("overrides", lambda c: c["supply"]["pressure"]["demand"]
+             .update({"profile_slot_overrides": [1]})),
+            ("routing", lambda c: c["roles"]["editor"]
+             .update({"routing": [1]}))]:
+        bad = json.loads(json.dumps(v3))
+        mut(bad)
+        try:
+            faults = sc.validate(bad)
+        except Exception as e:
+            faults = [{"code": f"RAISED {e}"}]
+        check(f"T36-10b malformed {name} -> structural fault, no raise",
+              bool(faults), json.dumps(faults)[:140])
+    bad = json.loads(json.dumps(v3))
+    bad["roles"]["intelligence"]["binding_refs"] = []
+    check("T36-10c empty binding_refs projection must still cover routes",
+          any(x["code"] == "PRESSURE_ROUTE_CONFLICT"
+              for x in sc.validate(bad)))
+    bad = json.loads(json.dumps(v3))
+    bad["supply"]["pressure"]["control"]["persistent_agent_edits"] = False
+    for lv_ in bad["supply"]["pressure"]["levels"].values():
+        lv_["default_profile_slots"] = 20
+        lv_["profile_slots"] = {}
+    check("T36-10d expanded default targets bound by profile ceilings",
+          any(x["code"] == "PRESSURE_BOUNDS" for x in sc.validate(bad)))
+    bad = json.loads(json.dumps(v3))
+    pr36 = bad["supply"]["pressure"]
+    pr36["levels"] = {"one": {"default_profile_slots": 1,
+                              "profile_slots": {}},
+                      "two": {"default_profile_slots": 2,
+                              "profile_slots": {}}}
+    pr36["ceilings"]["default_binding_concurrent_slots"] = 2
+    pr36["ceilings"]["default_profile_concurrent_slots"] = 2
+    pr36["demand"] = {"level": "one", "profile_slot_overrides": {}}
+    pr36["control"]["agent_level_names"] = ["one", "two"]
+    pr36["control"]["agent_profile_refs"] = [
+        "sol-high", "sol-medium", "gemini-high", "glm-max"]
+    check("T36-10e delegated default expansion faults on synthesized "
+          "profiles",
+          any(x["code"] == "PRESSURE_DELEGATION"
+              for x in sc.validate(bad)))
+    bad = json.loads(json.dumps(v3))
+    bad["catalog"]["harnesses"]["codex"]["adapter_ref"] = "unknown-adapter"
+    check("T36-10f unknown adapter refuses reasoning certification",
+          bool(sc.validate(bad)))
+    bad = json.loads(json.dumps(v3))
+    bad["roles"]["editor"]["routing"]["fallback_profile_refs"] = [
+        "kimi-editor/default", "sol-editor/default"]
+    check("T36-10g alias-resolved duplicate chain faults",
+          bool(sc.validate(bad)))
+    # F35.11r compatibility: executable legacy views and derived routes
+    v2cfg = sc.parse_yaml_bytes(GENESIS)[0]
+    v2v = sc.pressure_view(v2cfg)
+    check("T36-11 v2 compiles an executable legacy view",
+          v2v["profiles"] and v2v["bindings"] and v2v["role_routing"]
+          and v2v["role_routing"].get("editor", {}).get(
+              "preferred_profile_ref") == "b1/default")
+    leg = json.loads(json.dumps(v3))
+    leg["supply"].pop("pressure")
+    leg["supply"]["admission"] = {"global_max_concurrent": 1,
+                                  "per_family": {}}
+    check("T36-11b v3-without-pressure validates clean with legacy limits",
+          not sc.validate(leg)
+          and sc.pressure_view(leg)["global_ceiling"] == 1)
+    legauth = t36_auth("legacy", leg)
+    x = t36_admit(legauth, "leg-1")
+    y = t36_admit(legauth, "leg-2", profile="gemini-high", plane=None)
+    check("T36-11c legacy global limit enforces via derived routes",
+          x["decision"] == "ALLOW" and y["decision"] == "HOLD",
+          json.dumps([x["decision"], y["decision"],
+                      y.get("reason_codes")])[:160])
+    imp = json.loads(json.dumps(v3))
+    imp["roles"]["editor"].pop("routing")
+    imp["roles"]["dreamers"] = {
+        "kind": "execution",
+        "profiles": {"ux_parity": {"binding_ref": "glm-workhorse"}}}
+    iv = sc.pressure_view(imp)
+    check("T36-11d absent routing derives the role chain (D7)",
+          not sc.validate(imp) and "editor" in iv["role_routing"]
+          and iv["role_routing"]["editor"]["preferred_profile_ref"] ==
+          "sol-editor/default"
+          and iv["role_routing"]["editor"]["derived"] is True
+          and "dreamers" in iv["role_routing"])
+    alld = t36_admit(t36_auth("implicit", imp), "imp-d",
+                     profile="sol-editor/default")
+    check("T36-11e derived route admits through the alias",
+          alld["decision"] == "ALLOW", json.dumps(alld)[:140])
+    pr._now = real_now
 
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
     if FAIL:
