@@ -1584,9 +1584,9 @@ def main():
     # M5 cursor state committed atomically
     cursors = json.loads((st / "cursors.json").read_text())
     check("M5 cursor carries generation, lineage, and loop state",
-          cursors[str(run_out)]["cursor"] == 500
-          and cursors[str(run_out)]["generation"] == "genX"
-          and "cmd_fps" in cursors[str(run_out)])
+          cursors["queue_run::" + str(run_out)]["cursor"] == 500
+          and cursors["queue_run::" + str(run_out)]["generation"] == "genX"
+          and "cmd_fps" in cursors["queue_run::" + str(run_out)])
 
     # M6 incidents counted per LINEAGE (t25 #1): appends never inflate
     pats = cp.group_patterns(stored, min_incidents=2)
@@ -1738,7 +1738,8 @@ def main():
                   for n in rep21["notes"]),
           json.dumps(rep21["notes"])[:160])
     (st21 / "cursors.json").write_text(json.dumps(
-        {str(run_out): {"cursor": 10 ** 12, "generation": "genX"}}))
+        {"queue_run::" + str(run_out):
+         {"cursor": 10 ** 12, "generation": "genX"}}))
     rep21b = cp.tick(sources, state_dir=st21, max_pages=10)
     check("N21b out-of-bounds cursor reset (never silently skips source)",
           rep21b["pages_read"] >= 1
@@ -1831,23 +1832,24 @@ def main():
     st30 = temp_state() / "composer-t30"
     st30.mkdir(parents=True, exist_ok=True)
     (st30 / "cursors.json").write_text(json.dumps({
-        "a.out": {"cursor": 5, "generation": "sz1",
+        "queue_run::a.out": {"cursor": 5, "generation": "sz1",
                   "cmd_fps": {"x": 1},
                   "pending_fps": [{"fp": "fp1", "window": 3, "byte_off": 9}],
                   "recent_fps": ["legacy"], "carry": "junk"},
-        "b.out": {"cursor": 3, "generation": "sz2",
-                  "cmd_fps": {"y": 1}, "pending_fps": [7]},
-        "c.out": {"cursor": True, "generation": "sz3"}}))
+        "queue_run::b.out": {"cursor": 3, "generation": "sz2",
+                             "cmd_fps": {"y": 1}, "pending_fps": [7]},
+        "queue_run::c.out": {"cursor": True, "generation": "sz3"},
+        "legacyplain": {"cursor": 9, "generation": "sz4"}}))
     clean30, notes30 = cp._load_cursors(st30)
     check("T30-2 pending_fps validated; legacy keys dropped on load",
-          set(clean30) == {"a.out"}
-          and set(clean30["a.out"]) ==
-              {"cursor", "generation", "cmd_fps", "pending_fps",
-               "att_offs"}
-          and clean30["a.out"]["pending_fps"] ==
+          set(clean30) == {"queue_run::a.out"}
+          and set(clean30["queue_run::a.out"]) ==
+              {"cursor", "generation", "lineage_id", "cmd_fps",
+               "pending_fps", "att_offs"}
+          and clean30["queue_run::a.out"]["pending_fps"] ==
               [{"fp": "fp1", "window": 3, "byte_off": 9}]
-          and len(notes30) == 2,
-          json.dumps([sorted(clean30), notes30])[:200])
+          and len(notes30) == 3,
+          json.dumps([sorted(clean30), notes30])[:300])
 
     # T30-3 fresh detector state on reset (the v5 tick clobber bug)
     cs30 = {"cmd_fps": {"x": 9}, "pending_fps": ["old-fp"]}
@@ -1878,9 +1880,9 @@ def main():
                                       "byte_off": 40}]})
     cl31, _ = cp._load_cursors(st31)
     check("T31-1 pending_fps round-trips through commit_batch",
-          cl31["q/a.out"]["pending_fps"] ==
+          cl31["queue_run::q/a.out"]["pending_fps"] ==
           [{"fp": "ab", "window": 3, "byte_off": 40}]
-          and cl31["q/a.out"]["cmd_fps"] == {"ab": 2},
+          and cl31["queue_run::q/a.out"]["cmd_fps"] == {"ab": 2},
           json.dumps(cl31)[:220])
 
     # T31-2 adjacency window (t30 P2)
@@ -1901,10 +1903,11 @@ def main():
           == 1 and obsB[-1]["span"] == "bytes@26" and not pendB,
           json.dumps([(o["span"], o["detector_id"]) for o in obsB]))
     adj.write_text("$ cmd\n$ cmd\n")
+    cfC = {}
     _, pendC, _ac = cp.extract_page_with_state(
-        "queue_run", str(adj), "sz1", "lin", adj.read_text(), 0, {}, [])
+        "queue_run", str(adj), "sz1", "lin", adj.read_text(), 0, cfC, [])
     obsC, pendC2, _ac2 = cp.extract_page_with_state(
-        "queue_run", str(adj), "sz1", "lin", ERR, 8, {}, pendC)
+        "queue_run", str(adj), "sz1", "lin", ERR, 8, cfC, pendC)
     check("T31-2c hunt rides across pages, closes at the error line",
           len([o for o in obsC if o["detector_id"] == "cmd-failure-loop"])
           == 1 and obsC[-1]["span"] == "bytes@8" and not pendC2,
@@ -1923,7 +1926,7 @@ def main():
     st31b = temp_state() / "composer-t31b"
     st31b.mkdir(parents=True, exist_ok=True)
     (st31b / "cursors.json").write_text(json.dumps({
-        "q/x.out": {"cursor": 4, "generation": "sz1",
+        "queue_run::q/x.out": {"cursor": 4, "generation": "sz1",
                     "cmd_fps": {"k": False}, "pending_fps": []}}))
     clean31b, notes31b = cp._load_cursors(st31b)
     check("T31-4 boolean count rejected (bool is not a count)",
@@ -2025,7 +2028,8 @@ def main():
     st32w = temp_state() / "composer-t32w"
     st32w.mkdir(parents=True, exist_ok=True)
     (st32w / "cursors.json").write_text(json.dumps({
-        "q/w.out": {"cursor": 1, "generation": "sz", "cmd_fps": {},
+        "queue_run::q/w.out": {"cursor": 1, "generation": "sz",
+                               "cmd_fps": {},
                     "att_offs": {},
                     "pending_fps": [{"fp": "ff", "window": 100,
                                      "byte_off": 0}]}}))
@@ -2049,6 +2053,104 @@ def main():
         raised2 = True
     check("T32-6 stratum must equal entry kind; membership unconditional",
           raised1 and raised2, json.dumps([raised1, raised2]))
+
+    # =====================================================================
+    # T33 closure — sol turn-32 findings F32.1-F32.5.
+    # =====================================================================
+
+    # T33-1 cursor identity per (kind, path); lineage change resets (F32.1)
+    idem = fx / "idem.txt"
+    idem.write_text("$ dup\n$ dup\nplain\n")
+    st33 = temp_state() / "composer-t33"
+    repK1 = cp.tick({"queue_run": [str(idem)],
+                     "codex_session": [str(idem)]},
+                    state_dir=st33, max_pages=10)
+    cur33, _ = cp._load_cursors(st33)
+    kinds33 = {k.split("::")[0] for k in cur33}
+    idem_bytes = idem.read_bytes()
+    newi = fx / "idem2.txt"
+    newi.write_bytes(idem_bytes)  # same bytes, NEW inode
+    idem.unlink()
+    newi.rename(idem)
+    repK2 = cp.tick({"queue_run": [str(idem)]}, state_dir=st33,
+                    max_pages=10)
+    check("T33-1 both strata keep cursors; lineage change re-reads fresh",
+          kinds33 == {"queue_run", "codex_session"}
+          and repK2["pages_read"] >= 1
+          and any("lineage changed" in n for n in repK2["notes"]),
+          json.dumps([sorted(kinds33), repK2["pages_read"],
+                      repK2["notes"][-1][:80]]))
+
+    # T33-2 count-1 hunt carries across pages; retained offset emits at
+    # recurrence (F32.2)
+    ERRQ = "NameError: name 'q' is not defined\n"
+    fa = fx / "fa.txt"
+    fa.write_text("$ once\n")
+    _, pend1, _ = cp.extract_page_with_state(
+        "queue_run", str(fa), "szQ", "linQ", fa.read_text(), 0, {}, [])
+    check("T33-2a count-1 command carries its window",
+          len(pend1) == 1 and pend1[0]["window"] == 3,
+          json.dumps(pend1))
+    fa2 = ERRQ
+    obs2q, _, ao2q = cp.extract_page_with_state(
+        "queue_run", str(fa), "szQ", "linQ", fa2, 7, {}, pend1)
+    check("T33-2b carried closure on count-1 retains, no emit",
+          not [o for o in obs2q
+               if o["detector_id"] == "cmd-failure-loop"]
+          and len(ao2q) == 1, json.dumps([(o["detector_id"], o["span"])
+                                          for o in obs2q]))
+    fpq = next(iter(ao2q))
+    obs3q, _, ao3q = cp.extract_page_with_state(
+        "queue_run", str(fa), "szQ", "linQ", "$ once\n", 44, {fpq: 1}, [],
+        att_offs=ao2q)
+    check("T33-2c recurrence emits at the retained offset",
+          len([o for o in obs3q
+               if o["detector_id"] == "cmd-failure-loop"]) == 1
+          and obs3q[-1]["span"] == "bytes@7" and ao3q == {},
+          json.dumps([(o["span"], o["detector_id"]) for o in obs3q]))
+
+    # T33-3 bare-CR grammar: exact raw offsets in both extractors (F32.3)
+    bcr = fx / "bcr.bin"
+    bcr.write_bytes(b"\xff\r" + b"NameError: name 'c' is not defined\n")
+    t3c, c3c, d3c, offs3 = cp.read_page(bcr, 0, 262144)
+    obs3c, _ = cp.extract(
+        "queue_run", str(bcr), "szR", "linR", t3c, 0, line_offs=offs3)
+    obs3d, _, _ = cp.extract_page_with_state(
+        "queue_run", str(bcr), "szR", "linR", t3c, 0, {}, [],
+        line_offs=offs3)
+    check("T33-3 bare-CR lines get exact raw offsets",
+          obs3c and obs3c[0]["span"] == "bytes@2"
+          and obs3d and obs3d[0]["span"] == "bytes@2",
+          json.dumps([(o["span"], o["detector_id"]) for o in obs3c
+                      + obs3d]))
+
+    # T33-4 corrupt cohort state rebuilds with an explicit note (F32.4)
+    st33c = temp_state() / "composer-t33c"
+    (fx / "cohort.txt").write_text("$ a\n$ a\nNameError: name 'd' is not "
+                                   "defined\n")
+    cp.tick({"queue_run": [str(fx / "cohort.txt")]}, state_dir=st33c,
+            max_pages=10)
+    (st33c / "scanned.json").write_text('"corrupt"')
+    repC = cp.tick({"queue_run": [str(fx / "cohort.txt")]},
+                   state_dir=st33c, max_pages=10)
+    check("T33-4 corrupt cohort rebuilds from cursors with a note",
+          any("cohort rebuilt" in n for n in repC["notes"])
+          and repC["scanned_lineages"] == 1,
+          json.dumps([repC["notes"][-1][:80], repC["scanned_lineages"]]))
+
+    # T33-5 zero claim cap emits nothing (F32.5)
+    st33d = temp_state() / "composer-t33d"
+    pat0 = [{"pattern_id": "d0", "detector_id": "det-d0",
+             "severity": "medium", "detector_version": cp.DETECTOR_VERSION,
+             "independent_incidents": 2, "eligible": True,
+             "opportunities": 5, "strata": ["queue_run"],
+             "evidence": ["e"], "lane": "demand"}]
+    prop0, cap0 = cp.propose_claims(st33d, pat0, cap=0, max_outbox=200)
+    propn, capn = cp.propose_claims(st33d, pat0, cap=-1, max_outbox=200)
+    check("T33-5 claim_cap 0 and negative emit nothing",
+          prop0 == [] and cap0.get("note")
+          and propn == [] and capn.get("capacity") == "invalid claim_cap",
+          json.dumps([len(prop0), cap0, len(propn)]))
 
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
     if FAIL:

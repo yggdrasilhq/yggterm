@@ -289,54 +289,57 @@ def extract_page_with_state(source_kind, path, gen, lineage, page_text,
             instances.setdefault(fp, []).append(i)
 
     # 3. previous-page hunts close while their window still reaches an
-    # error line of THIS page (every line here consumed one window line);
-    # the unspent remainder rides on
+    # error line of THIS page. A closure on a count>=2 fingerprint emits
+    # immediately; on a count-1 fingerprint it RETAINS the error offset
+    # until recurrence (sol t32 F32.2) — count-1 commands carry hunts too.
+    # Unspent windows ride on.
     still = []
     for h in hunting:
         close = next((e for e in err_lines if h["window"] - (e + 1) >= 0),
                      None)
         if close is not None:
-            observations.append(make_observation(
-                "cmd-failure-loop", "medium", source_kind, gen,
-                f"bytes@{line_offs[close]}", h["fp"], lineage,
-                status="unverified-symptom"))
+            if cmd_fps.get(h["fp"], 0) >= 2:
+                observations.append(make_observation(
+                    "cmd-failure-loop", "medium", source_kind, gen,
+                    f"bytes@{line_offs[close]}", h["fp"], lineage,
+                    status="unverified-symptom"))
+                att_offs.pop(h["fp"], None)  # evidence consumed once
+            else:
+                att_offs.setdefault(h["fp"], line_offs[close])
         elif h["window"] - len(bare) > 0:
             still.append({**h, "window": h["window"] - len(bare)})
 
-    # 4. in-page closure (t25 #6, unchanged); with no in-page closure the
-    # lines AFTER the last instance have already spent their window, so
-    # only the unspent remainder carries across the boundary.
-    # First-attempt retention (sol t31 F31.3): a count-1 command with an
-    # adjacent error retains that error's offset (att_offs, persisted); the
-    # loop EMITS at the retained offset when recurrence reaches two — page
-    # boundaries no longer decide whether a loop exists.
+    # 4. in-page closure (t25 #6). First-attempt retention (sol t31 F31.3,
+    # t32 F32.2): a count-1 command with an adjacent error retains that
+    # error's offset; recurrence emits at the retained offset — page
+    # boundaries no longer decide whether a loop exists. Every instance
+    # carries its remaining window; a fingerprint that emitted here never
+    # re-carries (no double emission).
+    emitted_here = set()
     for fp, idxs in instances.items():
-        if cmd_fps[fp] < 2:
-            if cmd_fps[fp] == 1:
-                e0 = next((e for i in idxs for e in err_lines
-                           if i < e <= i + 3), None)
-                if e0 is not None:
-                    att_offs.setdefault(fp, line_offs[e0])
-            continue
         hit = next((e for i in idxs for e in err_lines if i < e <= i + 3),
                    None)
         if hit is not None:
-            observations.append(make_observation(
-                "cmd-failure-loop", "medium", source_kind, gen,
-                f"bytes@{line_offs[hit]}", fp, lineage,
-                status="unverified-symptom"))
-            att_offs.pop(fp, None)  # evidence consumed by the fresh closure
-        elif fp in att_offs:
+            if cmd_fps[fp] >= 2:
+                observations.append(make_observation(
+                    "cmd-failure-loop", "medium", source_kind, gen,
+                    f"bytes@{line_offs[hit]}", fp, lineage,
+                    status="unverified-symptom"))
+                att_offs.pop(fp, None)  # fresh closure consumes evidence
+                emitted_here.add(fp)
+            else:
+                att_offs.setdefault(fp, line_offs[hit])
+        elif fp in att_offs and cmd_fps[fp] >= 2:
             observations.append(make_observation(
                 "cmd-failure-loop", "medium", source_kind, gen,
                 f"bytes@{att_offs[fp]}", fp, lineage,
                 status="unverified-symptom"))
             att_offs.pop(fp, None)  # emit once per retained evidence pair
-        else:
-            rem = 3 - (len(bare) - 1 - idxs[-1])
-            if rem > 0:
-                still.append({"fp": fp, "window": rem,
-                              "byte_off": line_offs[idxs[-1]]})
+            emitted_here.add(fp)
+        rem = 3 - (len(bare) - 1 - idxs[-1])
+        if rem > 0 and fp not in emitted_here:
+            still.append({"fp": fp, "window": rem,
+                          "byte_off": line_offs[idxs[-1]]})
     pending_fps = still
     # dedupe observations by dedupe key (a fingerprint both carried and
     # locally looped emits once)
@@ -425,25 +428,31 @@ def read_page(path, cursor=0, max_bytes=262144):
             if len(raw) > _MAX_CARRY:
                 marker = f"<<oversized-event dropped at bytes@{cursor}>>\n"
                 return marker, pos, False, [cursor]
+    # raw-BYTE line starts in the SAME splitlines grammar as the
+    # extractors (bare CR etc.): a byte-preserving surrogateescape decode
+    # makes piece re-encoding exact, while replacement decoding stays
+    # detection-only (sol t31 F31.4, t32 F32.3)
+    def _starts(buf, base):
+        pieces = buf.decode("utf-8", errors="surrogateescape") \
+                    .splitlines(keepends=True)
+        out, s = [], 0
+        for piece in pieces:
+            out.append(base + s)
+            s += len(piece.encode("utf-8", errors="surrogateescape"))
+        return out
     nl = raw.rfind(b"\n")
     if nl >= 0:
         emitted = raw[:nl + 1]
-        # raw-BYTE line offsets (sol t31 F31.4): computed from the raw
-        # buffer — re-encoding replacement-decoded text shifts spans
-        starts = []
-        s = 0
-        for _ in range(emitted.count(b"\n")):
-            starts.append(cursor + s)
-            s = emitted.find(b"\n", s) + 1
         text = emitted.decode("utf-8", errors="replace")
         # un-emitted trailing partial line stays unread: cursor rewinds to
         # the start of that partial line so the next pass re-reads it whole
         next_cursor = min(cursor + len(emitted), size)  # byte-exact
         # done means EMITTED everything (sol t30 P5): an unterminated tail
         # record must still be read — the handle reaching EOF is not done
-        return text, next_cursor, next_cursor >= size, starts
+        return text, next_cursor, next_cursor >= size, _starts(emitted,
+                                                               cursor)
     tail = raw.decode("utf-8", errors="replace")
-    return tail, pos, pos >= size, [cursor] if tail else []
+    return tail, pos, pos >= size, _starts(raw, cursor)
 
 
 # ------------------------------------------------------------ store
@@ -529,7 +538,7 @@ def commit_batch(state_dir, entry, observations, cursor, stats):
     if to_append:
         _atomic_append_jsonl(state / "observations.jsonl", to_append)
     cursors, _notes = _load_cursors(state)
-    cursors[entry["path"]] = {
+    cursors[f"{entry.get('source_kind')}::{entry['path']}"] = {
         "cursor": cursor, "generation": entry.get("generation"),
         "lineage_id": entry.get("lineage_id"),
         "cmd_fps": stats.get("cmd_fps", {}),
@@ -556,6 +565,9 @@ def _load_cursors(state):
     for k, v in raw.items():
         if not isinstance(v, dict):
             notes.append(f"cursor entry {k[:40]}: not a mapping — reset")
+            continue
+        if "::" not in k:
+            notes.append(f"legacy cursor entry {k[:40]} — reset (F32.1)")
             continue
         c = v.get("cursor")
         if not isinstance(c, int) or isinstance(c, bool) or c < 0:
@@ -584,7 +596,12 @@ def _load_cursors(state):
             continue
         # rebuilt with ONLY known keys: legacy/stale shapes (recent_fps,
         # carry, string pending entries) can never ride along (t30/t31)
+        lin = v.get("lineage_id")
+        if lin is not None and not isinstance(lin, str):
+            notes.append(f"cursor entry {k[:40]}: invalid lineage — reset")
+            continue
         clean[k] = {"cursor": c, "generation": v["generation"],
+                    "lineage_id": lin,
                     "cmd_fps": fps,
                     "pending_fps": [{"fp": p["fp"], "window": p["window"],
                                      "byte_off": p["byte_off"]}
@@ -742,6 +759,11 @@ def propose_claims(state_dir, ranked, cap=5, max_outbox=200):
     existing_n = len(seen)
     if existing_n >= max_outbox:
         return [], {"capacity": "outbox full", "existing": existing_n}
+    if not isinstance(cap, int) or isinstance(cap, bool) or cap < 0:
+        return [], {"capacity": "invalid claim_cap", "cap": cap}
+    if cap == 0:
+        return [], {"capacity": "ok", "existing": existing_n,
+                    "note": "claim_cap=0 — no emissions (F32.5)"}
     reserve = max(1, int(round(cap * 0.2))) if cap >= 2 else 1
     unseen = [p for p in ranked if p["pattern_id"] not in seen]
     demand = [p for p in unseen if p["lane"] == "demand"]
@@ -791,10 +813,21 @@ def tick(sources, state_dir=None, max_bytes_per_source=262144,
     cursors, cursor_notes = _load_cursors(state)
     report["notes"].extend(cursor_notes)
     try:
-        scanned = set(json.loads((state / "scanned.json").read_text())
-                      or [])
+        raw_scanned = json.loads((state / "scanned.json").read_text())
+        if isinstance(raw_scanned, list) and all(
+                isinstance(x, str) and x for x in raw_scanned):
+            scanned = set(raw_scanned)
+        else:
+            raise ValueError("invalid cohort shape")
+    except FileNotFoundError:
+        scanned = set()
     except Exception:
-        scanned = set()  # measured cohort rebuilds from page reads
+        # corruption never INVENTS cohort members (sol t32 F32.4): rebuild
+        # from validated cursor lineage ids and say so
+        report["notes"].append(
+            "scanned.json invalid — cohort rebuilt from validated cursors")
+        scanned = {c.get("lineage_id") for c in cursors.values()
+                   if isinstance(c.get("lineage_id"), str)}
     pages = 0
     backlog = 0
     for entry in manifest["sources"]:
@@ -805,7 +838,8 @@ def tick(sources, state_dir=None, max_bytes_per_source=262144,
             continue
         p = Path(entry["path"])
         size = p.stat().st_size
-        cstate = cursors.get(entry["path"], {})
+        cstate = cursors.get(
+            f"{entry['source_kind']}::{entry['path']}", {})
         cur = cstate.get("cursor", 0)
         fresh = False
         if not isinstance(cur, int) or cur < 0 or cur > size:
@@ -818,6 +852,11 @@ def tick(sources, state_dir=None, max_bytes_per_source=262144,
             report["notes"].append(
                 f"source generation changed: {entry['path']} — reprocessing "
                 "with FRESH detector state")
+            cur, fresh = 0, True
+        if cstate.get("lineage_id") not in (None, entry["lineage_id"]):
+            report["notes"].append(
+                f"lineage changed on {entry['path']} — reprocessing with "
+                "FRESH detector state (sol t32 F32.1)")
             cur, fresh = 0, True
         gen = entry["generation"]
         lineage = entry["lineage_id"]
