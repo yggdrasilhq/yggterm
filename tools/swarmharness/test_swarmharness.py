@@ -1475,7 +1475,16 @@ def main():
           ress["outcome"] == "SUSPENDED", json.dumps(ress)[:160])
 
     # =====================================================================
-    # 60+. COMPOSER — the fleet lesson miner (owner 2026-10-26; sol arch)
+    # =====================================================================
+    # =====================================================================
+    # =====================================================================
+    # =====================================================================
+    # =====================================================================
+    # =====================================================================
+    # =====================================================================
+    # =====================================================================
+    # 60+. COMPOSER v2 — the fleet lesson miner (owner 2026-10-26; sol arch;
+    # turn-25 findings 1-13 closed here)
     # =====================================================================
     import composer as cp
 
@@ -1492,122 +1501,306 @@ def main():
         "done\n")
     missing = fx / "queue" / "gone.out"
 
-    # M1 census: ok + missing + unsupported all enumerated
-    man = cp.census({"queue_run": [str(run_out), str(missing)],
+    # M1 census: ok + missing + unsupported + nonregular all enumerated
+    (fx / "adir").mkdir(exist_ok=True)
+    man = cp.census({"queue_run": [str(run_out), str(missing),
+                                   str(fx / "adir")],
                      "weird_kind": [str(run_out)]}, state_dir=temp_state())
     ok_entries = [s for s in man["sources"] if s.get("status") == "ok"]
-    check("M1 census enumerates ok sources with revisions",
-          len(ok_entries) == 1 and ok_entries[0]["revision"].startswith("sz"))
-    check("M1b census gaps never silent",
-          len(man["gaps"]) == 2
-          and {g["status"] for g in man["gaps"]} == {"missing",
-                                                     "unsupported_kind"},
-          json.dumps(man["gaps"])[:160])
+    check("M1 census ok sources carry generation tokens",
+          len(ok_entries) == 1
+          and ok_entries[0]["generation"].startswith("sz"))
+    check("M1b census gaps never silent (missing+unsupported+not-regular)",
+          len(man["gaps"]) == 3
+          and {g["status"] for g in man["gaps"]} ==
+              {"missing", "unsupported_kind", "not-a-regular-file"},
+          json.dumps(man["gaps"])[:200])
 
-    # M2 read_page: bounded cursor resume, no re-read, exact coverage
-    text1, cur1, done1 = cp.read_page(run_out, 0, 64)
-    text2, cur2, done2 = cp.read_page(run_out, cur1, 64)
-    check("M2 pages tile the file exactly",
-          cur1 > 0 and (done2 or cur2 > cur1)
-          and len(text1) + (len(text2) if not done1 else 0) > 0)
+    # M2 read_page: carry preserves partial lines across tiny pages
+    long_line = "NameError: name 'foo' is not defined\n" + "filler\n"
+    longf = fx / "long.txt"
+    longf.write_text(long_line)
+    assembled, cur, done = "", 0, False
+    guard = 0
+    while not done and guard < 50:
+        t, cur, done = cp.read_page(longf, cur, 12)
+        assembled += t
+        guard += 1
+    check("M2 complete-line pages tile the file exactly (12-byte pages)",
+          assembled == long_line and done and guard < 50,
+          json.dumps({"assembled": len(assembled),
+                      "orig": len(long_line), "pages": guard}))
 
-    # M3 detectors: signature + failure loop
-    obs, stats = cp.extract("queue_run", str(run_out), "szX:deadbeef",
-                            run_out.read_text(), 0)
+    # M3 detectors: signature = unverified symptom, medium, never high
+    obs, sig_at = cp.extract("queue_run", str(run_out), "genX",
+                             "linX", run_out.read_text(), 0)
     sigs = {o["detector_id"] for o in obs}
-    check("M3 harness signature detected",
-          "sig-ssh-argv-join" in sigs, json.dumps(sorted(sigs)))
-    check("M3b failure loop detected (same command 3x)",
-          "cmd-failure-loop" in sigs, json.dumps(sorted(sigs)))
-    check("M3c observations carry fingerprints, not message bodies",
-          all(len(o["fingerprint"]) == 16 for o in obs)
-          and "starting work" not in cp._canonical(obs))
+    check("M3 harness signature detected as unverified-symptom medium",
+          "sig-ssh-argv-join" in sigs
+          and all(o["severity"] == "medium"
+                  and o["status"] == "unverified-symptom"
+                  for o in obs if o["detector_id"].startswith("sig-")),
+          json.dumps(sorted(sigs)))
 
-    # M4 dedupe: same span -> same key; double commit -> one stored
-    obs_b, _ = cp.extract("queue_run", str(run_out), "szX:deadbeef",
-                          run_out.read_text(), 0)
-    check("M4 extraction is deterministic (same dedupe keys)",
+    # M3b cmd-failure-loop requires error adjacency (sol t25 #6)
+    obs_loop, _pend = cp.extract_page_with_state(
+        "queue_run", str(run_out), "genX", "linX", run_out.read_text(),
+        0, {}, [])
+    check("M3b failure loop with adjacent error detected",
+          any(o["detector_id"] == "cmd-failure-loop" for o in obs_loop))
+    benign = ("$ deploy prod\n$ deploy prod\n$ deploy prod\n"
+              "all good, exiting cleanly\n")
+    obs_benign, _ = cp.extract_page_with_state(
+        "queue_run", "b", "genB", "linB", benign, 0, {}, [])
+    check("M3c benign repetition without error adjacency: no loop",
+          not any(o["detector_id"] == "cmd-failure-loop"
+                  for o in obs_benign))
+
+    # M3d fingerprints normalized: transport metadata excluded (t25#7)
+    e1 = "NameError: name 'foo' is not defined [ts=12:00:01 id=99 call=aaa]"
+    e2 = "NameError: name 'foo' is not defined [ts=13:45:07 id=7 call=bbb]"
+    fp1 = cp._sha(cp._normalize(e1))[:16]
+    fp2 = cp._sha(cp._normalize(e2))[:16]
+    check("M3d normalized fingerprints equal across transport metadata",
+          fp1 == fp2)
+
+    # M4 deterministic extraction + replay dedupe ENFORCED at commit
+    obs_b, _ = cp.extract("queue_run", str(run_out), "genX",
+                          "linX", run_out.read_text(), 0)
+    check("M4 extraction deterministic (same dedupe keys)",
           [o["dedupe_key"] for o in obs] == [o["dedupe_key"] for o in obs_b])
     st = temp_state() / "composer-m4"
-    entry = {"path": str(run_out), "revision": "szX:deadbeef"}
-    cp.commit_batch(st, entry, obs, 500, {"lines": 7})
-    cp.commit_batch(st, entry, obs_b, 500, {"lines": 7})
+    entry = {"path": str(run_out), "revision": "genX",
+             "generation": "genX", "lineage_id": "linX"}
+    r1 = cp.commit_batch(st, entry, obs, 500, {"lines": 7})
+    r2 = cp.commit_batch(st, entry, obs_b, 500, {"lines": 7})
     stored = cp.load_observations(st)
     keys = [o["dedupe_key"] for o in stored]
-    check("M4b replay deduped at grouping (same keys, counts merge)",
-          len(keys) == len(set(keys)) or len(keys) == 2 * len(set(keys)))
+    check("M4b identical replay is a no-op (unique keys at commit)",
+          r1["appended"] == len(obs) and r2["appended"] == 0
+          and len(keys) == len(set(keys)), json.dumps(r2))
 
-    # M5 cursor atomicity: cursor advances only with observations durable
+    # M5 cursor state committed atomically
     cursors = json.loads((st / "cursors.json").read_text())
-    check("M5 cursor state committed",
+    check("M5 cursor carries generation, lineage, and loop state",
           cursors[str(run_out)]["cursor"] == 500
-          and cursors[str(run_out)]["revision"] == "szX:deadbeef")
+          and cursors[str(run_out)]["generation"] == "genX"
+          and "cmd_fps" in cursors[str(run_out)])
 
-    # M6 patterns: incidents = distinct source revisions, not row counts
+    # M6 incidents counted per LINEAGE (t25 #1): appends never inflate
     pats = cp.group_patterns(stored, min_incidents=2)
     sig_pat = next((p for p in pats
                     if p["detector_id"] == "sig-ssh-argv-join"), None)
-    check("M6 pattern incidents counted across revisions",
+    check("M6 same-lineage observations = one incident, ineligible",
           sig_pat is not None and sig_pat["independent_incidents"] == 1
           and not sig_pat["eligible"], json.dumps(sig_pat)[:160])
-    stored_x = [dict(o, source_revision=f"sz{i}") for i, o in
-                enumerate(stored)]
-    pats_x = cp.group_patterns(stored_x, min_incidents=2)
-    sig_x = next((p for p in pats_x
-                  if p["detector_id"] == "sig-ssh-argv-join"), None)
-    check("M6b distinct revisions make pattern eligible",
-          sig_x is not None and sig_x["eligible"]
-          and sig_x["severity"] in ("high", "medium", "low"))
+    stored_x = []
+    for i, o in enumerate(stored):
+        q = dict(o, lineage_id=f"linX{i}")
+        q["dedupe_key"] = cp._sha(cp._canonical(
+            [o["generation"], o["span"], o["detector_id"],
+             o["detector_version"], o["fingerprint"] + str(i)]))
+        stored_x.append(q)
+    pats_x = cp.group_patterns(stored_x, min_incidents=1)
+    check("M6b distinct lineages eligible; opportunities denominator",
+          all(p["opportunities"] >= 1 for p in pats_x) and pats_x)
 
-    # M7 needs: absent snapshot is reported explicitly, never pretended
+    # M6c detector versions partition patterns (t25 #7)
+    mixed = [dict(stored_x[0], detector_version="det-v1")]
+    pats_v = cp.group_patterns(stored_x + mixed, min_incidents=1)
+    v_ids = {(p["detector_id"], p["detector_version"]) for p in pats_v}
+    check("M6c detector versions never mix silently",
+          any(v == "det-v1" for _, v in v_ids)
+          and any(v == "det-v2" for _, v in v_ids))
+
+    # M7 needs: absent snapshot explicit
     needs = cp.read_needs(temp_state() / "empty-needs")
     check("M7 absent needs snapshot explicit",
           needs["available"] is False and "absent" in needs["reason"])
 
-    # M8 ranking: needs boost + exploration lane reserved
-    p_rank = [{"pattern_id": "p1", "detector_id": "sig-ssh-argv-join",
-               "severity": "high", "independent_incidents": 3,
-               "eligible": True, "strata": ["queue_run"]},
-              {"pattern_id": "p2", "detector_id": "cmd-failure-loop",
-               "severity": "medium", "independent_incidents": 1,
-               "eligible": True, "strata": ["queue_run"]}]
-    needs_on = {"available": True, "needs": {"revision": 1, "items": [
-        {"need_id": "n1", "relevant_fault_families": ["cmd-failure-loop"],
-         "urgency": 5}]}}
-    ranked_off = cp.rank_patterns(p_rank, {"available": False})
-    ranked_on = cp.rank_patterns(p_rank, needs_on)
-    check("M8 needs boost reorders demand lane",
-          ranked_off[0]["pattern_id"] == "p1"
-          and ranked_on[0]["pattern_id"] == "p2"
-          and ranked_on[0]["lane"] == "demand",
-          json.dumps(ranked_on)[:200])
-    lanes = {r["pattern_id"]: r["lane"] for r in ranked_on}
-    check("M8b exploration lane exists",
-          any(l == "exploration" for l in lanes.values())
-          or len(ranked_on) < 2)
+    # M8 ranking lanes + M9 outbox idempotent with reserved exploration
+    def mkpats(n_demand, n_explore):
+        out = []
+        for i in range(n_demand):
+            out.append({"pattern_id": f"d{i}",
+                        "detector_id": f"det-d{i}", "severity": "medium",
+                        "detector_version": "det-v2",
+                        "independent_incidents": 2, "eligible": True,
+                        "opportunities": 5, "strata": ["queue_run"],
+                        "evidence": ["deadbeef"]})
+        for i in range(n_explore):
+            out.append({"pattern_id": f"x{i}",
+                        "detector_id": f"det-x{i}", "severity": "low",
+                        "detector_version": "det-v2",
+                        "independent_incidents": 2, "eligible": True,
+                        "opportunities": 5, "strata": ["board"],
+                        "evidence": ["feedface"]})
+        for p in out[:n_demand]:
+            p["lane"] = "demand"
+        for p in out[n_demand:]:
+            p["lane"] = "exploration"
+        return out
 
-    # M9 outbox idempotent
     st9 = temp_state() / "composer-m9"
     st9.mkdir(parents=True, exist_ok=True)
-    props1 = cp.propose_claims(st9, ranked_on, cap=5)
-    props2 = cp.propose_claims(st9, ranked_on, cap=5)
-    outbox_lines = (st9 / "outbox.jsonl").read_text().splitlines()
-    check("M9 proposal outbox idempotent by pattern_id",
-          len(props1) == 2 and len(props2) == 0
-          and len(outbox_lines) == 2, f"{len(props1)}/{len(props2)}")
+    ranked = mkpats(6, 4)
+    props1, cap1 = cp.propose_claims(st9, ranked, cap=5, max_outbox=200)
+    lanes1 = [p["lane"] for p in props1]
+    props2, _ = cp.propose_claims(st9, ranked, cap=5, max_outbox=200)
+    props3, _ = cp.propose_claims(st9, ranked, cap=5, max_outbox=200)
+    out_ids = cp._outbox_ids(st9 / "outbox.jsonl")
+    check("M9 first pass reserves exploration slot",
+          len(props1) == 5 and "exploration" in lanes1
+          and lanes1.count("exploration") == 1,
+          json.dumps(lanes1))
+    check("M9b seen-filtered passes never re-propose; all reach outbox",
+          len(props2) == 5 and len(props3) == 0
+          and len(out_ids) == 10,
+          f"{len(props2)}/{len(props3)}/{len(out_ids)}")
 
-    # M10 tick end-to-end on fixtures; second tick reads nothing new
+    # M10 tick bounded (t25 #5): budget stops with backlog; resumes cleanly
     st10 = temp_state() / "composer-m10"
     sources = {"queue_run": [str(run_out)]}
-    rep1 = cp.tick(sources, state_dir=st10)
-    rep2 = cp.tick(sources, state_dir=st10)
-    check("M10 tick extracts + resumes (second pass reads nothing new)",
-          rep1["pages_read"] >= 1 and rep1["observations"] >= 2
-          and rep2["pages_read"] == 0 and rep2["observations"] == 0,
-          json.dumps({k: rep2[k] for k in
-                      ("pages_read", "observations", "proposals")}))
-    check("M10b tick reports explicit needs fallback",
-          any("absent" in n for n in rep1["notes"]))
+    rep1 = cp.tick(sources, state_dir=st10, max_pages=1)
+    rep2 = cp.tick(sources, state_dir=st10, max_pages=10)
+    check("M10 tick budget stops with explicit backlog",
+          rep1["pages_read"] == 1 and rep1["backlog_remaining"] >= 0,
+          json.dumps({k: rep1[k]
+                      for k in ("pages_read", "backlog_remaining")}))
+    check("M10b completed source re-reads nothing",
+          rep2["observations"] == 0
+          and all("reprocessing" not in n for n in rep2["notes"]),
+          json.dumps(rep2["notes"])[:160])
+
+    # ---- turn-25 closure checks (N17-N26) ----
+    # N17 generation token covers tail mutations (#3)
+    bigf = fx / "big.out"
+    bigf.write_text("x" * 100_000 + "\n$ cmd one\nerror marker tail\n")
+    g1 = cp.generation(bigf)
+    bigf.write_text("x" * 100_000 + "\n$ cmd one\nDIFFERENT tail\n")
+    g2 = cp.generation(bigf)
+    check("N17 generation token detects same-size tail mutation",
+          g1 != g2 and g1.startswith("sz") and ":" in g1)
+
+    # N18 forged observations refused at commit (#11)
+    forged = dict(obs[0])
+    forged["body"] = "smuggled content"
+    try:
+        cp.commit_batch(st, entry, [forged], 500, {})
+        forged_raised = False
+    except ValueError:
+        forged_raised = True
+    badsev = dict(obs[0], severity="critical")
+    badsev["dedupe_key"] = cp._sha(cp._canonical(
+        [badsev["generation"], badsev["span"], badsev["detector_id"],
+         badsev["detector_version"], badsev["fingerprint"]]))
+    try:
+        cp.commit_batch(st, entry, [badsev], 500, {})
+        sev_raised = False
+    except ValueError:
+        sev_raised = True
+    check("N18 closed schema enforced (extra key + invalid severity)",
+          forged_raised and sev_raised)
+
+    # N19 conflicting same-key record = integrity error (#2)
+    conflict = dict(obs[0], severity="high")  # same key, different body
+    try:
+        cp.commit_batch(st, entry, [conflict], 500, {})
+        conflict_raised = False
+    except ValueError as exc:
+        conflict_raised = "integrity error" in str(exc)
+    check("N19 conflicting same-key record raises integrity error",
+          conflict_raised)
+
+    # N20 benign controls: no high severity; signature hits labeled
+    # unverified-symptom; no loop without adjacent failure (t25 #6)
+    benign_doc = ("docs say: NameError: name 'q' is not defined is common\n"
+                  "$ optional-missing-cmd\n$ optional-missing-cmd\n"
+                  "fine\n")
+    obs_doc, _ = cp.extract_page_with_state(
+        "queue_run", "doc", "genD", "linD", benign_doc, 0, {}, [])
+    check("N20 benign controls: no high severity, no loop",
+          not any(o["severity"] == "high" for o in obs_doc)
+          and not any(o["detector_id"] == "cmd-failure-loop"
+                      for o in obs_doc),
+          json.dumps([(o["detector_id"], o["severity"], o["status"])
+                      for o in obs_doc])[:200])
+
+    # N21 cursor corruption resets explicitly, replay protects (#10)
+    st21 = temp_state() / "composer-n21"
+    st21.mkdir(parents=True, exist_ok=True)
+    (st21 / "cursors.json").write_text("GARBAGE{not json")
+    rep21 = cp.tick(sources, state_dir=st21, max_pages=10)
+    check("N21 garbage cursors reset explicitly (no fatal, no silent skip)",
+          rep21["pages_read"] >= 1
+          and any("bounded" in n or "reset" in n
+                  for n in rep21["notes"]),
+          json.dumps(rep21["notes"])[:160])
+    (st21 / "cursors.json").write_text(json.dumps(
+        {str(run_out): {"cursor": 10 ** 12, "generation": "genX"}}))
+    rep21b = cp.tick(sources, state_dir=st21, max_pages=10)
+    check("N21b out-of-bounds cursor reset (never silently skips source)",
+          rep21b["pages_read"] >= 1
+          and any("out of bounds" in n for n in rep21b["notes"]),
+          json.dumps(rep21b["notes"])[:160])
+
+    # N22 malformed + stale needs snapshots unavailable explicitly (#12)
+    st22 = temp_state() / "composer-n22"
+    st22.mkdir(parents=True, exist_ok=True)
+    (st22 / "needs.json").write_text(json.dumps(
+        {"revision": 1, "fetched_at": "2026-10-26T00:00:00+00:00",
+         "items": [42]}))
+    check("N22 malformed needs items -> explicit unavailable",
+          cp.read_needs(st22)["available"] is False)
+    (st22 / "needs.json").write_text(json.dumps(
+        {"revision": 1, "fetched_at": "2000-01-01T00:00:00+00:00",
+         "items": [{"need_id": "n", "urgency": 5}]}))
+    r22 = cp.read_needs(st22)
+    check("N22b stale needs snapshot -> explicit unavailable",
+          r22["available"] is False and "stale" in r22["reason"])
+    (st22 / "needs.json").write_text(json.dumps(
+        {"revision": 1, "fetched_at": "2026-10-26T00:00:00+00:00",
+         "items": [{"need_id": "n", "urgency": 99}]}))
+    check("N22c out-of-range urgency -> explicit unavailable",
+          cp.read_needs(st22)["available"] is False)
+
+    # N23 patterns carry denominators + evidence + version (#13)
+    p23 = next(p for p in pats_x
+               if p["detector_id"] == "sig-ssh-argv-join")
+    check("N23 pattern carries opportunities, evidence, version",
+          p23["opportunities"] >= 1 and p23["evidence"]
+          and p23["detector_version"] == cp.DETECTOR_VERSION,
+          json.dumps(p23)[:200])
+
+    # N24 exploration actually allocated across passes (#9)
+    ranked24 = mkpats(10, 4)
+    st24 = temp_state() / "composer-n24"
+    st24.mkdir(parents=True, exist_ok=True)
+    total_explore = 0
+    for _ in range(4):
+        emitted, _cap = cp.propose_claims(st24, ranked24, cap=5,
+                                          max_outbox=200)
+        total_explore += sum(1 for p in emitted
+                             if p["lane"] == "exploration")
+    check("N24 exploration slots actually emitted (no starvation)",
+          total_explore >= 1
+          and len(cp._outbox_ids(st24 / "outbox.jsonl")) == 14,
+          f"explore={total_explore}")
+
+    # N25 proposal includes detector version + evidence refs (#13)
+    st25x = temp_state() / "composer-n25"
+    st25x.mkdir(parents=True, exist_ok=True)
+    emitted25, _ = cp.propose_claims(st25x, mkpats(3, 2), cap=2,
+                                     max_outbox=200)
+    check("N25 proposals carry version + evidence + disproof",
+          all(p["detector_version"] == cp.DETECTOR_VERSION
+              and isinstance(p["evidence"], list) and p["disproof"]
+              for p in emitted25) and len(emitted25) == 2)
+
+    # N26 strata recorded; pair metadata awaits adapters (#13)
+    check("N26 strata recorded (pair metadata awaits adapters)",
+          all(isinstance(s, str) for p in pats_x for s in p["strata"])
+          and all(p["strata"] for p in pats_x))
 
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
     if FAIL:

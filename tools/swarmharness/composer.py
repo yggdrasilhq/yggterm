@@ -1,35 +1,46 @@
-"""composer — the fleet lesson miner (owner directive 2026-10-26; sol architecture 2026-10-26).
+"""composer — the fleet lesson miner (owner directive 2026-10-26; sol architecture
+2026-10-26; v2 per sol turn-25 conformance review, 13 findings closed).
 
 A sibling deterministic service (maintenance.py pattern) subordinate to the
 dream orchestrator: it mines enrolled session corpora for RECURRING fault
 patterns, shapes them into falsifiable claims, and proposes work — it never
 dispatches, never spawns workers, never publishes lessons by itself.
 
-Three-stage pipeline with honest limits (sol Q2):
-  1. deterministic extraction — tool/result joins, error signatures, edit
-     churn, recurrence counts. Proves nothing about root cause or intent.
-  2. Jev classification (LATER, bounded adapter) — classifies supplied
-     evidence only.
-  3. sweep dreams (LATER, through the existing dispatch authority) — full
-     agent investigation of candidate clusters.
+Identity model (sol t25 #1/#3): a source has a stable LINEAGE (enrolled
+path) and a content GENERATION token (size + head64KiB + tail64KiB hashes).
+Incidents are counted per LINEAGE — an appended line is the same lineage,
+never a second incident. Observations bind their generation; a generation
+change mid-read aborts that source with an enumerated gap, never records
+cross-generation evidence.
 
-Three linked records (sol Q3): Observation (immutable, trace-derived,
-deduped by H(source_revision, span, detector_id, detector_version)) ->
-Pattern (revisable hypothesis with incident/opportunity denominators) ->
-ClaimProposal (falsifiable assertion into the outbox; the existing falsify
-ledger stays the authoritative evaluator). Model/harness pair is an analysis
-STRATUM, not the fault key — the same shell-transport defect must not become
-three model-specific faults.
+Storage contract (sol t25 #2/#11): observations.jsonl enforces a closed
+typed schema, recomputed dedupe keys, and uniqueness at commit — identical
+replay is a no-op, conflicting same-key records are an integrity error.
 
-Privacy: extraction is host-local; observations carry fingerprints, counts,
-and source references — NEVER message bodies or user content. Transcript
-content is untrusted data; nothing recovered from a session is ever
-executed. The privacy gate runs before anything leaves the host.
+Detectors (sol t25 #6/#7/#8): lexical signature hits are UNVERIFIED SYMPTOM
+candidates (medium severity, never "high"); cmd-failure-loop requires the
+command fingerprint to co-occur with an error signature. Fingerprints are
+computed over NORMALIZED text (case/digits/whitespace collapsed — transport
+metadata excluded). Patterns partition by detector version. Pages carry
+incomplete trailing lines forward; spans are byte offsets.
 
-Zero model calls. State on local dev disk (~/.yggterm/swarm/composer/):
-append-only observations JSONL + atomic cursor commits. Disabled until
-enrolled and configured; `tick()` is one bounded pass with hard limits.
+Bounds (sol t25 #5/#9/#10/#12): every tick has page/byte budgets and
+backlog reporting; the outbox has a capacity cap; exploration lanes get
+RESERVED emission slots over the seen-filtered candidate list; cursors are
+validated (corruption resets explicitly — the deduping replay protects);
+needs snapshots are validated and freshness-checked.
+
+Privacy: host-local extraction; observations carry fingerprints, counts and
+byte spans — never message bodies. Zero model calls.
+
+Brain-pair attendance law (owner 2026-10-26): the dream orchestrator and
+the composer are the SWARM INTELLIGENCE area — the model/harness pair that
+attends to them (mining analysis, sweep dreams, editorial verdicts,
+orchestration decisions) is the brainiest pair in swarm-config.yaml,
+currently sol-high/codex, and nothing else. Mining SCOPE stays all sessions
+of all harnesses; attendance is brain-pair only.
 """
+import fcntl
 import hashlib
 import json
 import os
@@ -37,10 +48,15 @@ import re
 from datetime import datetime, timezone
 from pathlib import Path
 
+from swarmconfig import atomic_write_json
+from session_review import SessionReview
+
 DEFAULT_STATE = Path("~/.yggterm/swarm/composer")
-DETECTOR_VERSION = "det-v1"
+DETECTOR_VERSION = "det-v2"
 SUPPORTED_SOURCES = ("zcode_rollout", "codex_session", "queue_run",
                      "review_chain", "board")
+_SEVERITIES = ("high", "medium", "low")
+_MAX_CARRY = 65536  # oversized-event policy bound
 
 
 def _now():
@@ -57,22 +73,72 @@ def _sha(data):
     return hashlib.sha256(data).hexdigest()
 
 
-def _source_revision(path):
-    """Stable identity for an enrolled file: size + head-hash (cheap, not
-    cryptographic for large files — head covers the first 64KiB)."""
+_TRANSPORT_TOKEN = re.compile(
+    r"\b(ts|id|call|session|request_id|req_id|timestamp|trace|span|uid)"
+    r"\"?\s*[:=]\s*\"?\S*\"?", re.I)
+_BRACKET = re.compile(r"\[([^\]]*)\]")
+
+
+def _normalize(text):
+    """Normalized detector evidence. ONLY recognized transport tokens
+    (ts=, id=, call=, ...) and transport-looking brackets collapse —
+    substantive JSON content (api_key, endpoint, distinct names) is
+    PRESERVED so genuinely different faults fingerprint differently
+    (sol t26 #7/N2). Digits and case collapse after."""
+    s = text.strip().lower()
+    s = _TRANSPORT_TOKEN.sub("[M]", s)
+
+    def _br(m):
+        inner = m.group(1)
+        return "[M]" if _TRANSPORT_TOKEN.search(inner) else m.group(0)
+
+    s = _BRACKET.sub(_br, s)
+    s = re.sub(r"\d+", "N", s)
+    s = re.sub(r"\s+", " ", s)
+    return s
+
+
+def generation(path):
+    """Content generation token from ONE opened handle (fstat + reads off
+    the same fd) — no stat/read race can pair old bytes with a new size
+    (sol t26 #4). Covers tail mutations (sol t25 #3)."""
     path = Path(path)
-    try:
-        size = path.stat().st_size
-        with path.open("rb") as f:
-            head = f.read(65536)
-        return f"sz{size}:{_sha(head)[:16]}"
-    except OSError:
-        return "unavailable"
+    with path.open("rb") as f:
+        st = os.fstat(f.fileno())
+        head = f.read(65536)
+        if st.st_size > 65536:
+            f.seek(-65536, os.SEEK_END)
+            tail = f.read(65536)
+        else:
+            tail = b""
+    return f"sz{st.st_size}:{_sha(head)[:12]}:{_sha(tail)[:12]}"
+
+
+def generation_and_size(path):
+    """(generation_token, size) off ONE opened handle — census metadata can
+    never pair an old generation with a new byte count (sol t26 #4)."""
+    path = Path(path)
+    with path.open("rb") as f:
+        st = os.fstat(f.fileno())
+        head = f.read(65536)
+        if st.st_size > 65536:
+            f.seek(-65536, os.SEEK_END)
+            tail = f.read(65536)
+        else:
+            tail = b""
+    token = f"sz{st.st_size}:{_sha(head)[:12]}:{_sha(tail)[:12]}"
+    return token, st.st_size
+
+
+def lineage_id(path):
+    """Lineage identity from the INODE (st_dev:st_ino) after realpath —
+    symlinks AND hard links collapse to one physical source (sol t28 #1)."""
+    rp = Path(path).resolve()
+    st = os.stat(rp)
+    return _sha(f"{st.st_dev}:{st.st_ino}")[:16]
 
 
 # ------------------------------------------------------------ detector set
-# Versioned; each detector: (id, compiled signature or callable, severity).
-# A signature identifies a SYMPTOM class, not a cause (sol Q2).
 
 _HARNESS_SIGNATURES = [
     ("ssh-argv-join", re.compile(r"syntax error near unexpected token|bash: -c: line")),
@@ -82,36 +148,165 @@ _HARNESS_SIGNATURES = [
     ("pyc-stale", re.compile(r"Unsupported bytecode|bad marshal data")),
     ("param-shadow", re.compile(r"got an unexpected keyword argument")),
 ]
+_CMD_PREFIXES = ("$ ", "+ ")
+KNOWN_DETECTORS = (f"sig-{sid}" for sid in
+                   ("ssh-argv-join", "heredoc-expansion", "nameerror-typo",
+                    "kwarg-dup", "pyc-stale", "param-shadow"))
+KNOWN_DETECTORS = tuple(KNOWN_DETECTORS) + ("cmd-failure-loop",)
 
 
-def _detect_line(kind, line, path, lineno):
-    """Return (detector_id, severity, fingerprint) for interesting lines."""
-    if kind in ("queue_run_out", "codex_session", "zcode_rollout"):
-        for sig_id, rx in _HARNESS_SIGNATURES:
-            m = rx.search(line)
-            if m:
-                return (f"sig-{sig_id}", "high",
-                        _sha(line.strip())[:16])
+def _detect_line(line):
+    for sig_id, rx in _HARNESS_SIGNATURES:
+        if rx.search(line):
+            return sig_id
     return None
 
 
-def _failure_loops(commands):
-    """Same command fingerprint failing >=2 times in one lineage."""
-    seen = {}
-    for fp in commands:
-        seen[fp] = seen.get(fp, 0) + 1
-    return [fp for fp, n in seen.items() if n >= 2]
+def make_observation(detector_id, severity, source_kind, gen, span, fp,
+                     lineage, status="unverified-symptom"):
+    body = {"detector_id": detector_id, "detector_version": DETECTOR_VERSION,
+            "severity": severity, "status": status,
+            "source_kind": source_kind, "generation": gen,
+            "lineage_id": lineage, "span": span, "fingerprint": fp,
+            "at": _now()}
+    body["dedupe_key"] = _sha(_canonical(
+        [lineage, gen, span, detector_id, DETECTOR_VERSION, fp]))
+    return body
+
+
+_OBS_KEYS = {"detector_id", "detector_version", "severity", "status",
+             "source_kind", "generation", "lineage_id", "span",
+             "fingerprint", "at", "dedupe_key"}
+
+
+def validate_observation(obs):
+    """Closed schema + recomputed key (sol t25 #11). Storage refuses
+    anything else — forged fields, unknown severities, arbitrary bodies."""
+    if not isinstance(obs, dict) or set(obs) != _OBS_KEYS:
+        missing = _OBS_KEYS - set(obs or {})
+        extra = set(obs or {}) - _OBS_KEYS
+        return (f"schema violation: missing={sorted(missing)} "
+                f"extra={sorted(extra)}")
+    if obs["detector_version"] != DETECTOR_VERSION:
+        return f"foreign detector version {obs['detector_version']}"
+    if obs["severity"] not in _SEVERITIES:
+        return f"invalid severity {obs['severity']!r}"
+    if obs["status"] not in ("verified-symptom", "unverified-symptom"):
+        return f"invalid status {obs['status']!r}"
+    for k in ("detector_id", "source_kind", "generation", "span",
+              "fingerprint", "at", "dedupe_key", "lineage_id"):
+        if not isinstance(obs[k], str) or not obs[k]:
+            return f"{k} must be a nonempty string"
+    key = _sha(_canonical(
+        [obs["lineage_id"], obs["generation"], obs["span"],
+         obs["detector_id"], obs["detector_version"],
+         obs["fingerprint"]]))
+    if key != obs["dedupe_key"]:
+        return "dedupe key mismatch (forged or stale observation)"
+    return None
+
+
+def extract(source_kind, path, gen, lineage, page_text, byte_start):
+    """Single-page detector pass with ABSOLUTE byte-offset spans. Returns
+    (observations, sig_at). Command-loop state is handled by
+    extract_page_with_state."""
+    observations = []
+    lines = page_text.splitlines()
+    sig_at = {}
+    off = byte_start
+    for i, line in enumerate(lines):
+        sig = _detect_line(line)
+        if sig:
+            sig_at[i] = sig
+            observations.append(make_observation(
+                f"sig-{sig}", "medium", source_kind, gen,
+                f"bytes@{off}", _sha(_normalize(line))[:16],
+                lineage, status="unverified-symptom"))
+        off += len(line.encode("utf-8", errors="replace")) + 1
+    return observations, sig_at
+
+
+def extract_page_with_state(source_kind, path, gen, lineage, page_text,
+                            byte_start, cmd_fps, pending_fps=None):
+    """Detectors over one page of COMPLETE lines, with persistent per-source
+    loop state. Cross-page protocol (sol t26 #8): a fingerprint with >=2
+    instances and no observed adjacency rides in pending_fps; an error
+    signature in the next page's first two lines completes its loop. State
+    carries fingerprints only — never content (sol t26 N3)."""
+    pending_fps = list(pending_fps or [])
+    observations = []
+    lines = page_text.splitlines()
+    line_offs = []
+    off = byte_start
+    for line in lines:
+        line_offs.append(off)
+        off += len(line.encode("utf-8", errors="replace")) + 1
+
+    # 1. signature observations (unverified symptom candidates, medium)
+    sig_at = {}
+    for i, line in enumerate(lines):
+        sig = _detect_line(line)
+        if sig:
+            sig_at[i] = sig
+            observations.append(make_observation(
+                f"sig-{sig}", "medium", source_kind, gen,
+                f"bytes@{line_offs[i]}", _sha(_normalize(line))[:16],
+                lineage, status="unverified-symptom"))
+
+    # 2. cross-page completion: carried loops close on a boundary error
+    head_error = any(_detect_line(lines[j])
+                     for j in range(0, min(2, len(lines))))
+    if head_error and pending_fps:
+        for fp in pending_fps:
+            observations.append(make_observation(
+                "cmd-failure-loop", "medium", source_kind, gen,
+                f"bytes@{byte_start}", fp, lineage,
+                status="unverified-symptom"))
+        pending_fps = []
+
+    # 3. count instances and check adjacency across every instance
+    instances = {}
+    for i, line in enumerate(lines):
+        s = line.strip()
+        if not s.startswith(_CMD_PREFIXES):
+            continue
+        fp = _sha(_normalize(s))[:16]
+        cmd_fps[fp] = cmd_fps.get(fp, 0) + 1
+        instances.setdefault(fp, []).append(i)
+    recorded = set()
+    for fp, count in cmd_fps.items():
+        if count < 2:
+            continue
+        hit = next((i for i in instances.get(fp, [])
+                    if any(_detect_line(lines[j])
+                           for j in range(i + 1, min(i + 4, len(lines))))),
+                   None)
+        if hit is not None:
+            recorded.add(fp)
+            observations.append(make_observation(
+                "cmd-failure-loop", "medium", source_kind, gen,
+                f"bytes@{line_offs[hit]}", fp, lineage,
+                status="unverified-symptom"))
+        elif (fp in pending_fps or fp in instances) and fp not in recorded:
+            pending_fps.append(fp)  # still hunting adjacency
+
+    # 4. dedupe observations by dedupe key (a fingerprint both carried and
+    # locally looped emits once)
+    uniq = {}
+    for o in observations:
+        uniq[o["dedupe_key"]] = o
+    return list(uniq.values()), pending_fps
 
 
 # ------------------------------------------------------------ census
 
 def census(sources, cutoff=None, state_dir=None):
-    """Enumerate enrolled corpora frozen at cutoff -> CensusManifest dict.
-    sources: {source_kind: [paths]}. Every record gets exactly one
-    disposition; missing/unreadable files are enumerated, never skipped."""
+    """Enumerate enrolled corpora frozen at cutoff. Nonregular/unreadable
+    sources are gaps — a directory or unavailable stat is NEVER 'ok'
+    (sol t25 #4)."""
     manifest = {"kind": "census", "cutoff": cutoff or _now(),
                 "created_at": _now(), "sources": [], "gaps": [],
-                "total_bytes": 0}
+                "total_bytes": 0, "lineages": 0, "_lineage_set": set()}
     for kind, paths in (sources or {}).items():
         if kind not in SUPPORTED_SOURCES:
             manifest["gaps"].append(
@@ -124,98 +319,91 @@ def census(sources, cutoff=None, state_dir=None):
                 entry["status"] = "missing"
                 manifest["gaps"].append(entry)
                 continue
+            if not p.is_file():
+                entry["status"] = "not-a-regular-file"
+                manifest["gaps"].append(entry)
+                continue
+            try:
+                entry["lineage_id"] = lineage_id(p)
+            except OSError as exc:
+                entry["status"] = f"error: {exc}"[:80]
+                manifest["gaps"].append(entry)
+                manifest["sources"].append(entry)
+                continue
             try:
                 entry["status"] = "ok"
-                entry["revision"] = _source_revision(p)
-                entry["bytes"] = p.stat().st_size
+                entry["generation"], entry["bytes"] = \
+                    generation_and_size(p)
                 manifest["total_bytes"] += entry["bytes"]
+                manifest.setdefault("_lineage_set", set())
+                manifest["_lineage_set"].add(entry["lineage_id"])
+                manifest["lineages"] = len(manifest["_lineage_set"])
             except OSError as exc:
                 entry["status"] = f"error: {exc}"[:80]
                 manifest["gaps"].append(entry)
             manifest["sources"].append(entry)
+    manifest["_lineage_count"] = len(manifest.get("_lineage_set", set()))
+    manifest["lineages"] = manifest["_lineage_count"]
+    manifest.pop("_lineage_set", None)
     return manifest
 
 
-# ------------------------------------------------------------ read + extract
+# ------------------------------------------------------------ read
 
 def read_page(path, cursor=0, max_bytes=262144):
-    """Bounded byte page from a source revision. Returns (page_text,
-    next_cursor, done). Cursor = byte offset; never re-reads committed
-    bytes."""
+    """Bounded page of COMPLETE lines. Internally reads until the buffer
+    ends with a newline, EOF, or the oversized-event bound — a trailing
+    partial line is never emitted half-baked (detection correctness), and
+    the cursor only ever advances over EMITTED bytes (progress guaranteed,
+    sol t28 V3-N1). Returns (text, next_cursor, done)."""
     p = Path(path)
+    size = p.stat().st_size
+    buf = ""
+    pos = cursor
     with p.open("rb") as f:
-        f.seek(cursor)
-        chunk = f.read(max_bytes)
-    if not chunk:
-        return "", cursor, True
-    next_cursor = cursor + len(chunk)
-    # trim to last complete line to avoid splitting events
-    if not next_cursor >= p.stat().st_size:
-        nl = chunk.rfind(b"\n")
-        if nl > 0:
-            chunk = chunk[:nl + 1]
-            next_cursor = cursor + len(chunk)
-    text = chunk.decode("utf-8", errors="replace")
-    done = next_cursor >= p.stat().st_size
+        f.seek(pos)
+        while True:
+            chunk = f.read(max_bytes)
+            if not chunk:
+                done = True  # EOF: emit whatever remains as final lines
+                break
+            buf += chunk.decode("utf-8", errors="replace")
+            pos += len(chunk)
+            if buf.endswith("\n") or "\n" in buf:
+                done = pos >= size
+                break
+            if len(buf) > _MAX_CARRY:
+                marker = f"<<oversized-event dropped at bytes@{cursor}>>\n"
+                return marker, pos, False
+    nl = buf.rfind("\n")
+    if nl >= 0:
+        text = buf[:nl + 1]
+        # un-emitted trailing partial line stays unread: cursor rewinds to
+        # the start of that partial line so the next pass re-reads it whole
+        next_cursor = cursor + len(text.encode("utf-8", errors="replace"))
+        return text, min(next_cursor, size), done
+    text = buf
+    next_cursor = pos
     return text, next_cursor, done
-
-
-def extract(source_kind, path, revision, page_text, lineno_base):
-    """Run the versioned detector set over one page. Returns
-    (observations, stats). Observations carry fingerprints and references —
-    never message bodies."""
-    observations = []
-    stats = {"lines": 0, "eligible_sessions": 0}
-    kind_line = {"queue_run": "queue_run_out",
-                 "queue_run_out": "queue_run_out",
-                 "codex_session": "codex_session",
-                 "zcode_rollout": "zcode_rollout",
-                 "board": "board"}.get(source_kind, source_kind)
-    cmd_failures = []
-    for i, line in enumerate(page_text.splitlines()):
-        stats["lines"] += 1
-        hit = _detect_line(kind_line, line, path, lineno_base + i)
-        if hit:
-            detector_id, severity, fp = hit
-            observations.append({
-                "detector_id": detector_id,
-                "detector_version": DETECTOR_VERSION,
-                "severity": severity,
-                "source_kind": source_kind,
-                "source_revision": revision,
-                "span": f"{Path(path).name}:{lineno_base + i}",
-                "dedupe_key": _sha(_canonical(
-                    [revision, f"{lineno_base + i}", detector_id,
-                     DETECTOR_VERSION])),
-                "fingerprint": fp,
-                "at": _now(),
-            })
-    # failure-loop detection over command-shaped lines (deterministic:
-    # identical stripped command text >=2 in one page of one lineage)
-    for line in page_text.splitlines():
-        s = line.strip()
-        if s.startswith("$ ") or s.startswith("+ "):
-            cmd_failures.append(_sha(s)[:16])
-    for fp in _failure_loops(cmd_failures):
-        observations.append({
-            "detector_id": "cmd-failure-loop",
-            "detector_version": DETECTOR_VERSION,
-            "severity": "medium",
-            "source_kind": source_kind,
-            "source_revision": revision,
-            "span": f"{Path(path).name}:page@{lineno_base}",
-            "dedupe_key": _sha(_canonical(
-                [revision, "loop", fp, DETECTOR_VERSION])),
-            "fingerprint": fp, "at": _now()})
-    return observations, stats
 
 
 # ------------------------------------------------------------ store
 
-def _atomic_write_jsonl(path, rows):
-    """Append-preserving atomic write: existing durable lines + new rows
-    land together in the replacement file. (A naive tmp-append + replace
-    CLOBBERS history — the tmp is consumed by replace each call.)"""
+def load_observations(state_dir=None):
+    path = (Path(state_dir).expanduser() if state_dir
+            else DEFAULT_STATE.expanduser()) / "observations.jsonl"
+    if not path.exists():
+        return []
+    out = []
+    for line in path.read_text().splitlines():
+        try:
+            out.append(json.loads(line))
+        except Exception:
+            continue
+    return out
+
+
+def _atomic_append_jsonl(path, rows):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     existing = []
@@ -232,76 +420,146 @@ def _atomic_write_jsonl(path, rows):
     os.replace(tmp, path)
 
 
-def load_observations(state_dir=None):
-    path = (Path(state_dir).expanduser() if state_dir
-            else DEFAULT_STATE.expanduser()) / "observations.jsonl"
-    if not path.exists():
-        return []
-    out = []
-    for line in path.read_text().splitlines():
-        try:
-            out.append(json.loads(line))
-        except Exception:
-            continue
-    return out
+def _atomic_write_json(path, obj):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + f".tmp{os.getpid()}")
+    tmp.write_text(_canonical(obj))
+    os.replace(tmp, path)
 
 
-def commit_batch(state_dir, source_entry, observations, cursor, stats):
-    """Atomically commit extracted observations + cursor advancement.
-    Crash between the two files loses nothing: cursor advances only after
-    observations are durable; replay dedupes by dedupe_key."""
+def commit_batch(state_dir, entry, observations, cursor, stats):
+    """Atomically commit observations + cursor. Storage enforces the closed
+    schema and KEY UNIQUENESS: identical replay is a no-op; a conflicting
+    same-key record is an integrity error (sol t25 #2/#11)."""
     state = Path(state_dir).expanduser()
     state.mkdir(parents=True, exist_ok=True)
-    if observations:
-        _atomic_write_jsonl(state / "observations.jsonl", observations)
-    cursors = {}
-    cpath = state / "cursors.json"
-    if cpath.exists():
-        try:
-            cursors = json.loads(cpath.read_text())
-        except Exception:
-            cursors = {}
-    cursors[source_entry["path"]] = {
-        "cursor": cursor, "revision": source_entry.get("revision"),
-        "lines_seen": stats["lines"], "at": _now()}
-    tmp = cpath.with_name(cpath.name + f".tmp{os.getpid()}")
-    tmp.write_text(_canonical(cursors))
-    os.replace(tmp, cpath)
-
-
-# ------------------------------------------------------------ patterns + rank
-
-def group_patterns(observations, min_incidents=2):
-    """Group observations by detector_id + fingerprint -> Pattern records
-    with incident/opportunity denominators (sol: one loop with 100 failures
-    is ONE incident)."""
-    groups = {}
+    existing = {o["dedupe_key"]: o for o in load_observations(state)}
+    to_append = []
     for obs in observations:
-        key = (obs["detector_id"], obs.get("fingerprint"))
+        fault = validate_observation(obs)
+        if fault:
+            raise ValueError(f"observation rejected: {fault}")
+        if obs["detector_id"] not in KNOWN_DETECTORS:
+            raise ValueError(
+                f"unknown detector id {obs['detector_id']!r}")
+        if obs["generation"] != entry.get("generation") or \
+                obs["lineage_id"] != entry.get("lineage_id"):
+            raise ValueError(
+                "observation contradicts its source entry "
+                "(generation/lineage mismatch)")
+        if not entry["path"].startswith(obs["source_kind"]) and \
+                obs["source_kind"] not in SUPPORTED_SOURCES:
+            raise ValueError(f"unknown source kind {obs['source_kind']!r}")
+        prev = existing.get(obs["dedupe_key"])
+        if prev is not None:
+            # `at` is observation time, not identity: replay after a cursor
+            # reset re-derives the same key with a fresh timestamp and MUST
+            # stay a no-op. Everything else must match exactly.
+            ident = lambda o: {k: o[k] for k in o if k != "at"}
+            if _canonical(ident(prev)) != _canonical(ident(obs)):
+                raise ValueError(
+                    f"integrity error: conflicting record for "
+                    f"{obs['dedupe_key'][:12]}")
+            continue  # identical replay -> no-op
+        to_append.append(obs)
+        existing[obs["dedupe_key"]] = obs
+    if to_append:
+        _atomic_append_jsonl(state / "observations.jsonl", to_append)
+    cursors, _notes = _load_cursors(state)
+    cursors[entry["path"]] = {
+        "cursor": cursor, "generation": entry.get("generation"),
+        "lineage_id": entry.get("lineage_id"),
+        "carry_len": len(stats.get("carry", "")),
+        "cmd_fps": stats.get("cmd_fps", {}),
+        "lines_seen": stats.get("lines", 0), "at": _now()}
+    _atomic_write_json(state / "cursors.json", cursors)
+    return {"appended": len(to_append)}
+
+
+def _load_cursors(state):
+    """Cursor validation (sol t25 #10): structure, types, bounds checked by
+    the caller against file size; structurally invalid entries dropped with
+    an explicit reset (the deduping replay protects progress)."""
+    cpath = state / "cursors.json"
+    if not cpath.exists():
+        return {}, []
+    try:
+        raw = json.loads(cpath.read_text())
+    except Exception:
+        return {}, ["cursors.json unreadable — all cursors reset"]
+    if not isinstance(raw, dict):
+        return {}, ["cursors.json not a mapping — all cursors reset"]
+    clean, notes = {}, []
+    for k, v in raw.items():
+        if not isinstance(v, dict):
+            notes.append(f"cursor entry {k[:40]}: not a mapping — reset")
+            continue
+        c = v.get("cursor")
+        if not isinstance(c, int) or isinstance(c, bool) or c < 0:
+            notes.append(f"cursor entry {k[:40]}: invalid cursor — reset")
+            continue
+        if not isinstance(v.get("generation"), str):
+            notes.append(f"cursor entry {k[:40]}: invalid generation — reset")
+            continue
+        cl = v.get("carry_len", 0)
+        fps = v.get("cmd_fps", {})
+        rfps = v.get("recent_fps", [])
+        if (not isinstance(cl, int) or isinstance(cl, bool) or cl < 0
+                or not isinstance(fps, dict) or any(
+                not isinstance(fp, str) or not isinstance(n, int)
+                for fp, n in fps.items())
+                or not isinstance(rfps, list) or any(
+                not isinstance(fp, str) for fp in rfps)):
+            notes.append(f"cursor entry {k[:40]}: invalid detector state — "
+                         "reset")
+            continue
+        clean[k] = v
+    return clean, notes
+
+
+# ------------------------------------------------------------ patterns
+
+def group_patterns(observations, min_incidents=2, scanned_lineages=None):
+    """Patterns partition by (detector_id, detector_version, fingerprint) —
+    detector versions never mix silently (sol t25 #7). Incidents = distinct
+    LINEAGES; opportunities = ALL lineages scanned (symptomatic or clean —
+    sol t26 #13)."""
+    groups = {}
+    lineages = set()
+    for obs in observations:
+        lineages.add(obs.get("lineage_id"))
+        key = (obs["detector_id"], obs["detector_version"],
+               obs.get("fingerprint"))
         groups.setdefault(key, []).append(obs)
+    total = max(len(lineages), scanned_lineages or 0)
     patterns = []
-    for (detector_id, fp), obs_list in sorted(groups.items()):
-        incidents = len({o["source_revision"] for o in obs_list})
+    for (detector_id, version, fp), obs_list in sorted(groups.items()):
+        incidents = len({o["lineage_id"] for o in obs_list})
         severity = max((o.get("severity", "low") for o in obs_list),
-                       key=lambda s: {"high": 3, "medium": 2, "low": 1}[s])
+                       key=lambda s: {"high": 3, "medium": 2,
+                                      "low": 1}.get(s, 1))
         patterns.append({
-            "pattern_id": _sha(_canonical([detector_id, fp]))[:16],
-            "detector_id": detector_id,
-            "detector_version": DETECTOR_VERSION,
-            "fingerprint": fp,
-            "severity": severity,
+            "pattern_id": _sha(_canonical(
+                [detector_id, version, fp]))[:16],
+            "detector_id": detector_id, "detector_version": version,
+            "fingerprint": fp, "severity": severity,
             "independent_incidents": incidents,
+            "opportunities": total,
             "min_incidents": min_incidents,
             "eligible": incidents >= min_incidents,
             "strata": sorted({o.get("source_kind", "?")
                               for o in obs_list}),
+            "evidence": [o["dedupe_key"][:12] for o in obs_list[:8]],
         })
     return patterns
 
 
-def read_needs(state_dir=None):
-    """Read the dream orchestrator's versioned needs snapshot; absent or
-    stale is reported EXPLICITLY, never pretended away (sol Q4)."""
+# ------------------------------------------------------------ needs + rank
+
+def read_needs(state_dir=None, max_age_days=7):
+    """Validated needs snapshot; malformed, stale, or absent snapshots are
+    EXPLICITLY unavailable (sol t25 #12) — never silently presumed."""
     path = (Path(state_dir).expanduser() if state_dir
             else DEFAULT_STATE.expanduser()) / "needs.json"
     if not path.exists():
@@ -309,18 +567,45 @@ def read_needs(state_dir=None):
                 "reason": "needs snapshot absent — evidence-based fallback"}
     try:
         needs = json.loads(path.read_text())
-        if not isinstance(needs, dict) or "revision" not in needs:
-            return {"available": False, "reason": "malformed needs snapshot"}
-        return {"available": True, "needs": needs}
     except Exception as exc:
         return {"available": False, "reason": f"unreadable: {exc}"[:100]}
+    if not isinstance(needs, dict) or type(needs.get("revision")) is not int:
+        return {"available": False, "reason": "malformed needs snapshot"}
+    fetched = needs.get("fetched_at")
+    if not isinstance(fetched, str):
+        return {"available": False,
+                "reason": "needs snapshot has no fetch time"}
+    try:
+        age = datetime.now(timezone.utc) - datetime.fromisoformat(
+            fetched.replace("Z", "+00:00"))
+    except Exception:
+        return {"available": False, "reason": "needs fetch time unparsable"}
+    if age.total_seconds() > max_age_days * 86400:
+        return {"available": False,
+                "reason": f"needs snapshot stale "
+                          f"({age.total_seconds() / 86400:.1f}d)"}
+    items = needs.get("items")
+    if not isinstance(items, list):
+        return {"available": False, "reason": "needs items must be a list"}
+    clean = []
+    for n in items:
+        if (not isinstance(n, dict) or not isinstance(n.get("need_id"), str)
+                or not isinstance(n.get("urgency"), (int, float))
+                or isinstance(n.get("urgency"), bool)
+                or not 0 <= float(n["urgency"]) <= 10
+                or not isinstance(n.get("relevant_fault_families"), list)
+                or any(not isinstance(f, str) for f in
+                       (n.get("relevant_fault_families") or []))):
+            return {"available": False,
+                    "reason": "needs items failed validation"}
+        clean.append(n)
+    return {"available": True,
+            "needs": {"revision": needs["revision"], "items": clean}}
 
 
 def rank_patterns(patterns, needs, exploration_share=0.2):
-    """Rank: needs-linked boost + severity/incidents + age decay, with a
-    reserved exploration allocation for rare/low-signal strata (sol Q4).
-    Deterministic: ties break by pattern_id."""
-    now = _now()
+    """Needs-linked urgency multiplier + severity*incidents; deterministic
+    tie-break; exploration lane flagged for the reserved tail (sol Q4)."""
     need_families = {}
     if needs.get("available"):
         for n in (needs["needs"].get("items") or []):
@@ -332,15 +617,14 @@ def rank_patterns(patterns, needs, exploration_share=0.2):
     for pat in patterns:
         if not pat["eligible"]:
             continue
-        base = sev_w.get(pat.get("severity", "medium"), 2.0)
-        score = base * (1 + pat["independent_incidents"])
-        fam = pat["detector_id"]
-        if fam in need_families:
-            score *= (1 + need_families[fam])
+        score = sev_w.get(pat.get("severity", "medium"), 2.0) \
+            * (1 + pat["independent_incidents"])
+        if pat["detector_id"] in need_families:
+            score *= (1 + need_families[pat["detector_id"]])
         scored.append((score, pat))
     scored.sort(key=lambda sp: (-sp[0], sp[1]["pattern_id"]))
-    n_explore = max(1, int(len(scored) * exploration_share)) if scored else 0
     ranked = [{"score": round(s, 3), **pat} for s, pat in scored]
+    n_explore = max(1, int(len(ranked) * exploration_share)) if ranked else 0
     for i, pat in enumerate(ranked):
         pat["lane"] = ("exploration" if i >= len(ranked) - n_explore
                        else "demand")
@@ -349,96 +633,141 @@ def rank_patterns(patterns, needs, exploration_share=0.2):
 
 # ------------------------------------------------------------ outbox + tick
 
-def propose_claims(state_dir, ranked, cap=5):
-    """Emit ClaimProposals for eligible patterns into the outbox (idempotent
-    by pattern_id; the falsify ledger stays the authoritative evaluator).
-    Proposals are PROPOSALS — never dispatch, never promotion."""
-    state = Path(state_dir).expanduser()
-    outbox = state / "outbox.jsonl"
+def _outbox_ids(outbox):
     seen = set()
-    if outbox.exists():
-        for line in outbox.read_text().splitlines():
+    if Path(outbox).exists():
+        for line in Path(outbox).read_text().splitlines():
             try:
                 seen.add(json.loads(line).get("pattern_id"))
             except Exception:
                 continue
+    return seen
+
+
+def propose_claims(state_dir, ranked, cap=5, max_outbox=200):
+    """Emit ClaimProposals with RESERVED exploration slots over the
+    seen-filtered FULL candidate list (sol t25 #9): no permanent starvation.
+    Outbox capacity enforced with explicit reporting."""
+    state = Path(state_dir).expanduser()
+    outbox = state / "outbox.jsonl"
+    seen = _outbox_ids(outbox)
+    existing_n = len(seen)
+    if existing_n >= max_outbox:
+        return [], {"capacity": "outbox full", "existing": existing_n}
+    reserve = max(1, int(round(cap * 0.2))) if cap >= 2 else 1
+    unseen = [p for p in ranked if p["pattern_id"] not in seen]
+    demand = [p for p in unseen if p["lane"] == "demand"]
+    explore = [p for p in unseen if p["lane"] == "exploration"]
+    picked = demand[:max(0, cap - reserve)] + explore[:reserve]
+    for p in demand[max(0, cap - reserve):] + explore[reserve:]:
+        if len(picked) < cap:
+            picked.append(p)
+        else:
+            break
     emitted = []
-    for pat in ranked[:cap * 2]:
-        if pat["pattern_id"] in seen or len(emitted) >= cap:
-            continue
+    for pat in picked:
+        if existing_n + len(emitted) >= max_outbox:
+            break  # per-emission capacity: overflow impossible (t26#5)
         proposal = {
             "kind": "claim_proposal", "pattern_id": pat["pattern_id"],
             "detector_id": pat["detector_id"],
+            "detector_version": pat["detector_version"],
             "assertion": (f"Detector {pat['detector_id']} recurs across "
                           f"{pat['independent_incidents']} independent "
-                          f"sources (strata {pat['strata']}); a fixture "
-                          "reproducing the fingerprint will trip the same "
-                          "detector, and the control fixture will not."),
-            "disproof": "controls do not separate; incidents are one lineage",
+                          f"lineages of {pat['opportunities']} scanned "
+                          f"(strata {pat['strata']}); a fixture reproducing "
+                          "the normalized fingerprint trips the same "
+                          "detector and the control fixture does not."),
+            "disproof": "controls do not separate; incidents one lineage",
             "strata": pat["strata"], "lane": pat["lane"],
+            "evidence": pat.get("evidence", []),
             "created_at": _now(), "status": "proposed"}
-        _atomic_write_jsonl(outbox, [proposal])
-        seen.add(pat["pattern_id"])
+        _atomic_append_jsonl(outbox, [proposal])
         emitted.append(proposal)
-    return emitted
+    return emitted, {"capacity": "ok", "existing": existing_n}
 
 
 def tick(sources, state_dir=None, max_bytes_per_source=262144,
-         claim_cap=5):
-    """One bounded pass: census -> read uncommitted pages -> extract ->
-    commit atomically -> group -> rank -> propose. Returns TickReport.
-    Zero model calls. Hard limits; coverage gaps enumerated."""
+         claim_cap=5, max_pages=10, max_outbox=200):
+    """One BOUNDED pass (sol t25 #5): page budget stops the pass with
+    explicit backlog reporting; generation validated around every commit;
+    corrupted cursors reset explicitly; zero model calls."""
     state = Path(state_dir).expanduser() if state_dir \
         else DEFAULT_STATE.expanduser()
     report = {"at": _now(), "census_sources": 0, "gaps": 0,
               "pages_read": 0, "observations": 0, "patterns": 0,
-              "proposals": 0, "notes": []}
+              "proposals": 0, "backlog_remaining": 0, "notes": []}
     manifest = census(sources, state_dir=state)
     report["census_sources"] = len(manifest["sources"])
     report["gaps"] = len(manifest["gaps"])
-    cursors = {}
-    cpath = state / "cursors.json"
-    if cpath.exists():
-        try:
-            cursors = json.loads(cpath.read_text())
-        except Exception:
-            cursors = {}
-    all_obs = []
-    known = {o["dedupe_key"] for o in load_observations(state)}
-    fresh_count = 0
+    cursors, cursor_notes = _load_cursors(state)
+    report["notes"].extend(cursor_notes)
+    pages = 0
+    backlog = 0
     for entry in manifest["sources"]:
         if entry.get("status") != "ok":
             continue
-        cur = cursors.get(entry["path"], {}).get("cursor", 0)
-        revision = entry.get("revision")
-        if cursors.get(entry["path"], {}).get("revision") not in (
-                None, revision):
-            cur = 0  # source changed identity -> reprocess honestly
-        while True:
-            text, nxt, done = read_page(entry["path"], cur,
-                                        max_bytes_per_source)
+        if pages >= max_pages:
+            backlog += 1
+            continue
+        p = Path(entry["path"])
+        size = p.stat().st_size
+        cstate = cursors.get(entry["path"], {})
+        cur = cstate.get("cursor", 0)
+        carry = cstate.get("carry", "")
+        if not isinstance(cur, int) or cur < 0 or cur > size:
+            if cur:
+                report["notes"].append(
+                    f"cursor out of bounds on {entry['path']}: reset "
+                    "(replay dedupes)")
+            cur, carry = 0, ""
+        if cstate.get("generation") not in (None, entry["generation"]):
+            report["notes"].append(
+                f"source generation changed: {entry['path']} — reprocessing "
+                "with FRESH detector state")
+            cur, carry = 0, ""
+            cmd_fps = {}  # stale counters would manufacture loops (t26 N4)
+            recent_fps = []
+        gen = entry["generation"]
+        lineage = entry["lineage_id"]
+        cmd_fps = dict(cstate.get("cmd_fps", {}))
+        pending_fps = list(cstate.get("pending_fps", []))
+        while pages < max_pages and cur < size:
+            text, nxt, done = read_page(p, cur, max_bytes_per_source)
             if not text:
                 break
-            obs, stats = extract(entry["source_kind"], entry["path"],
-                                 revision, text, cur)
-            fresh_count += sum(1 for o in obs
-                               if o["dedupe_key"] not in known)
-            all_obs.extend(obs)
+            obs, pending_fps = extract_page_with_state(
+                entry["source_kind"], entry["path"], gen, lineage, text,
+                cur, cmd_fps, pending_fps)
+            pages += 1
             report["pages_read"] += 1
             report["observations"] += len(obs)
-            commit_batch(state, entry, obs, nxt, stats)
+            # generation validated BEFORE recording (sol t25 #3)
+            if generation(p) != gen:
+                report["notes"].append(
+                    f"generation flapped mid-read: {entry['path']} — "
+                    "page discarded, source deferred")
+                cur = size + 1  # force stop this source, commit nothing
+                break
+            commit_batch(state, entry, obs, nxt,
+                         {"cmd_fps": cmd_fps, "pending_fps": pending_fps})
             cur = nxt
             if done:
                 break
-    patterns = group_patterns(load_observations(state))
+        if cur < size and pages >= max_pages:
+            backlog += 1
+    report["backlog_remaining"] = backlog
+    patterns = group_patterns(load_observations(state),
+                              scanned_lineages=manifest.get("lineages", 0))
     report["patterns"] = sum(1 for p in patterns if p["eligible"])
     needs = read_needs(state)
     if not needs.get("available"):
         report["notes"].append(needs["reason"])
     ranked = rank_patterns(patterns, needs)
-    proposals = propose_claims(state, ranked, cap=claim_cap)
+    proposals, cap_note = propose_claims(state, ranked, cap=claim_cap,
+                                         max_outbox=max_outbox)
     report["proposals"] = len(proposals)
-    report["notes"].append(
-        f"fresh observations this pass: {fresh_count} "
-        f"(replayed duplicates are expected and deduped)")
+    if cap_note.get("capacity") != "ok":
+        report["notes"].append(f"outbox {cap_note['capacity']}")
+    report["notes"].append(f"pass bounded: {pages} pages this pass")
     return report
