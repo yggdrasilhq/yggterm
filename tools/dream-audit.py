@@ -105,10 +105,20 @@ def load_tasks(hours=48):
     return [dict(r) for r in rows]
 
 
+MAX_AUDITS_PER_ID = 3  # K1 repair: bound re-audit churn when evidence never arrives
+
+
 def audited_terminal_ids():
     """sol finding 1: only TERMINAL verdicts retire an id from the audit pool;
-    UNKNOWN (in-flight) rows stay eligible for re-audit next wake."""
-    last = {}
+    UNKNOWN (in-flight) rows stay eligible for re-audit next wake.
+    K1 repair (2026-10-26): retirement keys on the VERDICT (PASS/FAIL), not
+    the attempt-terminality flag — a terminal attempt audited with
+    insufficient evidence (verdict UNKNOWN, terminal=True) was previously
+    retired forever (66/97 attempts in the 2026-10-26 cohort stayed UNKNOWN
+    despite exhaustive passes). UNKNOWN rows stay eligible until
+    MAX_AUDITS_PER_ID audit rows accumulate (evidence that never arrives
+    ages out with the 48h ledger window instead of churning the pool)."""
+    last, counts = {}, {}
     if AUDIT_LEDGER.exists():
         for line in AUDIT_LEDGER.read_text().splitlines():
             try:
@@ -116,7 +126,15 @@ def audited_terminal_ids():
             except Exception:
                 continue
             last[r["id"]] = r
-    return {i for i, r in last.items() if r.get("terminal")}
+            counts[r["id"]] = counts.get(r["id"], 0) + 1
+    retired = set()
+    for i, r in last.items():
+        v = (r.get("verdict") or "")
+        if v.startswith(("PASS", "FAIL")):
+            retired.add(i)
+        elif counts.get(i, 0) >= MAX_AUDITS_PER_ID:
+            retired.add(i)  # audited MAX times, still UNKNOWN: evidence-expired
+    return retired
 
 
 def last_ledger_status():
