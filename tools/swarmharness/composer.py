@@ -39,6 +39,36 @@ attends to them (mining analysis, sweep dreams, editorial verdicts,
 orchestration decisions) is the brainiest pair in swarm-config.yaml,
 currently sol-high/codex, and nothing else. Mining SCOPE stays all sessions
 of all harnesses; attendance is brain-pair only.
+
+Retrieval-doors doctrine (owner 2026-10-26, after the self-improvement
+falsification report C2/C6): every proposal this kernel emits MUST name its
+DOOR — steer (law; routed as a yggsteer SSOT proposal, never a direct
+edit), ygg-memory (durable fact; NOW.md-first on recall), msgGraph board
+(conversation), ynpm skill note (routing fact), or the YGG-FHS placement
+oracle (where artifacts go). The kernel does NOT restate that law — the
+stamped steer files are the constitution and this file defers to them;
+proposals CITE the door + rule so consumers retrieve fast instead of
+re-deriving.
+
+Jev recon doctrine (owner 2026-10-26): mining sweep and triage passes MAY
+use Jev as System-1 (bounded classification/routing/tagging of candidate
+faults, per the steer Jev budget law) to get holistic vision fast; System-1
+output is candidate-shaping ONLY — never generation, never authority, never
+a published lesson. Due diligence on any claim this kernel elevates is
+System-2 (the brain pair) before it leaves the outbox.
+
+Stale-instruction GC (owner 2026-10-26, C6 falsified the claim that the
+fleet GCs stale instructions): proposing GC of stale instructions is a
+FIRST-CLASS maintenance proposal class — dated facts past the 30-day
+staleness law, dead paths (verify against origin/main first), superseded
+doors, unaged FAIL backlogs. Propose with evidence; never execute removal
+from this kernel.
+
+Enrollment gate (C2): a composer with no enrolled sources has no causal
+path to fleet improvement — conformance-green is not production. Until an
+owner-approved enrollment manifest exists (default-deny, per-source, per
+the privacy law), this kernel's outbox stays empty BY DESIGN and nothing
+may claim composer-driven improvement.
 """
 import fcntl
 import hashlib
