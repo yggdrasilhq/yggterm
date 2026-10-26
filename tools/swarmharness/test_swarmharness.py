@@ -1830,17 +1830,20 @@ def main():
     st30 = temp_state() / "composer-t30"
     st30.mkdir(parents=True, exist_ok=True)
     (st30 / "cursors.json").write_text(json.dumps({
-        "a.out": {"cursor": 5, "generation": "sz1", "carry_len": 0,
-                  "cmd_fps": {"x": 1}, "pending_fps": ["fp1"],
+        "a.out": {"cursor": 5, "generation": "sz1",
+                  "cmd_fps": {"x": 1},
+                  "pending_fps": [{"fp": "fp1", "window": 3, "byte_off": 9}],
                   "recent_fps": ["legacy"], "carry": "junk"},
-        "b.out": {"cursor": 3, "generation": "sz2", "carry_len": 0,
+        "b.out": {"cursor": 3, "generation": "sz2",
                   "cmd_fps": {"y": 1}, "pending_fps": [7]},
         "c.out": {"cursor": True, "generation": "sz3"}}))
     clean30, notes30 = cp._load_cursors(st30)
     check("T30-2 pending_fps validated; legacy keys dropped on load",
-          set(clean30) == {"a.out"} and "recent_fps" not in clean30["a.out"]
-          and "carry" not in clean30["a.out"]
-          and clean30["a.out"]["pending_fps"] == ["fp1"]
+          set(clean30) == {"a.out"}
+          and set(clean30["a.out"]) ==
+              {"cursor", "generation", "cmd_fps", "pending_fps"}
+          and clean30["a.out"]["pending_fps"] ==
+              [{"fp": "fp1", "window": 3, "byte_off": 9}]
           and len(notes30) == 2,
           json.dumps([sorted(clean30), notes30])[:200])
 
@@ -1855,6 +1858,92 @@ def main():
     n2 = cp._normalize('"call_id": "chatcmpl-xyz789"')
     check("T30-4 call_id tokens collapse to one fingerprint",
           n1 == n2 and "[M]" in n1, f"{n1!r} vs {n2!r}")
+
+    # =====================================================================
+    # T31 closure — sol turn-30 findings P1-P6 (fresh-probe verified);
+    # regressions for each fix.
+    # =====================================================================
+
+    # T31-1 pending_fps persists across commits (t30 P1)
+    st31 = temp_state() / "composer-t31"
+    st31.mkdir(parents=True, exist_ok=True)
+    ent31 = {"path": "q/a.out", "generation": "sz1", "lineage_id": "lin1",
+             "source_kind": "queue_run"}
+    cp.commit_batch(st31, ent31, [], 12,
+                    {"cmd_fps": {"ab": 2},
+                     "pending_fps": [{"fp": "ab", "window": 3,
+                                      "byte_off": 40}]})
+    cl31, _ = cp._load_cursors(st31)
+    check("T31-1 pending_fps round-trips through commit_batch",
+          cl31["q/a.out"]["pending_fps"] ==
+          [{"fp": "ab", "window": 3, "byte_off": 40}]
+          and cl31["q/a.out"]["cmd_fps"] == {"ab": 2},
+          json.dumps(cl31)[:220])
+
+    # T31-2 adjacency window (t30 P2)
+    ERR = "NameError: name 'q' is not defined\n"
+    adj = fx / "adj.txt"
+    adj.write_text("$ cmd\n$ cmd\nfiller\nfiller\nfiller\n" + ERR)
+    obsA, pendA = cp.extract_page_with_state(
+        "queue_run", str(adj), "sz1", "lin", adj.read_text(), 0, {}, [])
+    check("T31-2a error beyond the window after repeat -> expired, no loop",
+          not [o for o in obsA if o["detector_id"] == "cmd-failure-loop"]
+          and pendA == [],
+          json.dumps([(o["detector_id"], o["span"]) for o in obsA]))
+    adj.write_text("$ cmd\n$ cmd\nfiller\nfiller\n" + ERR)
+    obsB, pendB = cp.extract_page_with_state(
+        "queue_run", str(adj), "sz1", "lin", adj.read_text(), 0, {}, [])
+    check("T31-2b error 3 lines after repeat closes at the error line",
+          len([o for o in obsB if o["detector_id"] == "cmd-failure-loop"])
+          == 1 and obsB[-1]["span"] == "bytes@26" and not pendB,
+          json.dumps([(o["span"], o["detector_id"]) for o in obsB]))
+    adj.write_text("$ cmd\n$ cmd\n")
+    _, pendC = cp.extract_page_with_state(
+        "queue_run", str(adj), "sz1", "lin", adj.read_text(), 0, {}, [])
+    obsC, pendC2 = cp.extract_page_with_state(
+        "queue_run", str(adj), "sz1", "lin", ERR, 8, {}, pendC)
+    check("T31-2c hunt rides across pages, closes at the error line",
+          len([o for o in obsC if o["detector_id"] == "cmd-failure-loop"])
+          == 1 and obsC[-1]["span"] == "bytes@8" and not pendC2,
+          json.dumps([(o["span"], o["detector_id"]) for o in obsC]))
+
+    # T31-3 transport matcher preserves following JSON fields (t30 P3)
+    nA = cp._normalize('{"ts": "abc", "endpoint": "alpha"}')
+    nB = cp._normalize('{"ts": "abc", "endpoint": "beta"}')
+    check("T31-3 transport value bounded; following fields preserved",
+          nA != nB
+          and cp._normalize('{"call_id": "aaa", "endpoint": "alpha"}') ==
+              cp._normalize('{"call_id": "bbb", "endpoint": "alpha"}'),
+          f"{nA!r} vs {nB!r}")
+
+    # T31-4 boolean count rejected (t30 P4)
+    st31b = temp_state() / "composer-t31b"
+    st31b.mkdir(parents=True, exist_ok=True)
+    (st31b / "cursors.json").write_text(json.dumps({
+        "q/x.out": {"cursor": 4, "generation": "sz1",
+                    "cmd_fps": {"k": False}, "pending_fps": []}}))
+    clean31b, notes31b = cp._load_cursors(st31b)
+    check("T31-4 boolean count rejected (bool is not a count)",
+          not clean31b and len(notes31b) == 1, json.dumps(notes31b))
+
+    # T31-5 unterminated tail emitted before done (t30 P5)
+    tailf = fx / "tail.txt"
+    tailf.write_bytes(b"err one\nunterminated tail")
+    t1, c1, d1 = cp.read_page(tailf, 0, 262144)
+    t2, c2, d2 = cp.read_page(tailf, c1, 262144)
+    check("T31-5 tail record emitted; done only when cursor reaches EOF",
+          d1 is False and c1 == 8 and t2 == "unterminated tail"
+          and d2 and c2 == tailf.stat().st_size,
+          json.dumps([t1, c1, d1, t2, c2, d2]))
+
+    # T31-6 CRLF byte spans exact (t30 P6)
+    crlf = fx / "crlf.txt"
+    crlf.write_bytes(b"ok line\r\nNameError: name 'x' is not defined\r\n")
+    obs6, _ = cp.extract_page_with_state(
+        "queue_run", str(crlf), "sz1", "lin", crlf.read_text(), 0, {}, [])
+    check("T31-6 CRLF spans advance by full encoded line",
+          obs6 and obs6[0]["span"] == "bytes@8",
+          json.dumps([(o["span"], o["detector_id"]) for o in obs6]))
 
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
     if FAIL:

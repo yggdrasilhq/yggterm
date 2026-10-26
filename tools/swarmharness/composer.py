@@ -75,7 +75,7 @@ def _sha(data):
 
 _TRANSPORT_TOKEN = re.compile(
     r"\b(ts|id|call_id|call|session|request_id|req_id|timestamp|trace|span|uid)"
-    r"\"?\s*[:=]\s*\"?\S*\"?", re.I)
+    r"\"?\s*[:=]\s*(?:\"(?:\\.|[^\"\\])*\"|[^\s,\]\}]+)", re.I)
 _BRACKET = re.compile(r"\[([^\]]*)\]")
 
 
@@ -211,18 +211,19 @@ def extract(source_kind, path, gen, lineage, page_text, byte_start):
     (observations, sig_at). Command-loop state is handled by
     extract_page_with_state."""
     observations = []
-    lines = page_text.splitlines()
+    lines = page_text.splitlines(keepends=True)  # CRLF-exact offsets (P6)
     sig_at = {}
     off = byte_start
     for i, line in enumerate(lines):
-        sig = _detect_line(line)
+        bare = line.rstrip("\r\n")
+        sig = _detect_line(bare)
         if sig:
             sig_at[i] = sig
             observations.append(make_observation(
                 f"sig-{sig}", "medium", source_kind, gen,
-                f"bytes@{off}", _sha(_normalize(line))[:16],
+                f"bytes@{off}", _sha(_normalize(bare))[:16],
                 lineage, status="unverified-symptom"))
-        off += len(line.encode("utf-8", errors="replace")) + 1
+        off += len(line.encode("utf-8", errors="replace"))
     return observations, sig_at
 
 
@@ -233,64 +234,87 @@ def extract_page_with_state(source_kind, path, gen, lineage, page_text,
     instances and no observed adjacency rides in pending_fps; an error
     signature in the next page's first two lines completes its loop. State
     carries fingerprints only — never content (sol t26 N3)."""
-    pending_fps = list(pending_fps or [])
+    # Adjacency protocol (sol t30 P2, t25 #6): IN-PAGE, a repeated command
+    # with an error in the three lines after ANY of its instances closes at
+    # that error line (settled semantics). CROSS-PAGE, a repeated command
+    # with no in-page closure carries a HUNT {fingerprint, three-line
+    # window, byte offset}; every page line decrements the window; an error
+    # line closes the hunt while its window still reaches that line, AT THE
+    # ERROR LINE'S OFFSET; a hunt past its window expires (the old
+    # head-of-page shortcut matched pending fingerprints to distant,
+    # unrelated errors). State carries fingerprints + counters only — never
+    # content (sol t26 N3).
+    hunting = []
+    for p in pending_fps or []:
+        if isinstance(p, dict) and isinstance(p.get("fp"), str) \
+                and isinstance(p.get("window"), int) \
+                and isinstance(p.get("byte_off"), int):
+            hunting.append({"fp": p["fp"], "window": p["window"],
+                            "byte_off": p["byte_off"]})
     observations = []
-    lines = page_text.splitlines()
+    lines = page_text.splitlines(keepends=True)  # CRLF-exact offsets (P6)
     line_offs = []
     off = byte_start
     for line in lines:
         line_offs.append(off)
-        off += len(line.encode("utf-8", errors="replace")) + 1
+        off += len(line.encode("utf-8", errors="replace"))
+    bare = [line.rstrip("\r\n") for line in lines]
 
-    # 1. signature observations (unverified symptom candidates, medium)
-    sig_at = {}
-    for i, line in enumerate(lines):
+    # 1. signature observations; error lines are the closure anchors
+    err_lines = []
+    for i, line in enumerate(bare):
         sig = _detect_line(line)
         if sig:
-            sig_at[i] = sig
+            err_lines.append(i)
             observations.append(make_observation(
                 f"sig-{sig}", "medium", source_kind, gen,
                 f"bytes@{line_offs[i]}", _sha(_normalize(line))[:16],
                 lineage, status="unverified-symptom"))
 
-    # 2. cross-page completion: carried loops close on a boundary error
-    head_error = any(_detect_line(lines[j])
-                     for j in range(0, min(2, len(lines))))
-    if head_error and pending_fps:
-        for fp in pending_fps:
+    # 2. count command instances across the page
+    instances = {}
+    for i, line in enumerate(bare):
+        s = line.strip()
+        if s.startswith(_CMD_PREFIXES):
+            fp = _sha(_normalize(s))[:16]
+            cmd_fps[fp] = cmd_fps.get(fp, 0) + 1
+            instances.setdefault(fp, []).append(i)
+
+    # 3. previous-page hunts close while their window still reaches an
+    # error line of THIS page (every line here consumed one window line);
+    # the unspent remainder rides on
+    still = []
+    for h in hunting:
+        close = next((e for e in err_lines if h["window"] - (e + 1) >= 0),
+                     None)
+        if close is not None:
             observations.append(make_observation(
                 "cmd-failure-loop", "medium", source_kind, gen,
-                f"bytes@{byte_start}", fp, lineage,
+                f"bytes@{line_offs[close]}", h["fp"], lineage,
                 status="unverified-symptom"))
-        pending_fps = []
+        elif h["window"] - len(bare) > 0:
+            still.append({**h, "window": h["window"] - len(bare)})
 
-    # 3. count instances and check adjacency across every instance
-    instances = {}
-    for i, line in enumerate(lines):
-        s = line.strip()
-        if not s.startswith(_CMD_PREFIXES):
+    # 4. in-page closure (t25 #6, unchanged); with no in-page closure the
+    # lines AFTER the last instance have already spent their window, so
+    # only the unspent remainder carries across the boundary
+    for fp, idxs in instances.items():
+        if cmd_fps[fp] < 2:
             continue
-        fp = _sha(_normalize(s))[:16]
-        cmd_fps[fp] = cmd_fps.get(fp, 0) + 1
-        instances.setdefault(fp, []).append(i)
-    recorded = set()
-    for fp, count in cmd_fps.items():
-        if count < 2:
-            continue
-        hit = next((i for i in instances.get(fp, [])
-                    if any(_detect_line(lines[j])
-                           for j in range(i + 1, min(i + 4, len(lines))))),
+        hit = next((e for i in idxs for e in err_lines if i < e <= i + 3),
                    None)
         if hit is not None:
-            recorded.add(fp)
             observations.append(make_observation(
                 "cmd-failure-loop", "medium", source_kind, gen,
                 f"bytes@{line_offs[hit]}", fp, lineage,
                 status="unverified-symptom"))
-        elif (fp in pending_fps or fp in instances) and fp not in recorded:
-            pending_fps.append(fp)  # still hunting adjacency
-
-    # 4. dedupe observations by dedupe key (a fingerprint both carried and
+        else:
+            rem = 3 - (len(bare) - 1 - idxs[-1])
+            if rem > 0:
+                still.append({"fp": fp, "window": rem,
+                              "byte_off": line_offs[idxs[-1]]})
+    pending_fps = still
+    # dedupe observations by dedupe key (a fingerprint both carried and
     # locally looped emits once)
     uniq = {}
     for o in observations:
@@ -371,7 +395,6 @@ def read_page(path, cursor=0, max_bytes=262144):
             raw += chunk
             pos += len(chunk)
             if b"\n" in raw:
-                done = pos >= size
                 break
             if len(raw) > _MAX_CARRY:
                 marker = f"<<oversized-event dropped at bytes@{cursor}>>\n"
@@ -381,9 +404,11 @@ def read_page(path, cursor=0, max_bytes=262144):
         text = raw[:nl + 1].decode("utf-8", errors="replace")
         # un-emitted trailing partial line stays unread: cursor rewinds to
         # the start of that partial line so the next pass re-reads it whole
-        next_cursor = cursor + nl + 1  # byte-exact past the emitted lines
-        return text, min(next_cursor, size), done
-    return raw.decode("utf-8", errors="replace"), pos, done
+        next_cursor = min(cursor + nl + 1, size)  # byte-exact
+        # done means EMITTED everything (sol t30 P5): an unterminated tail
+        # record must still be read — the handle reaching EOF is not done
+        return text, next_cursor, next_cursor >= size
+    return raw.decode("utf-8", errors="replace"), pos, pos >= size
 
 
 # ------------------------------------------------------------ store
@@ -469,9 +494,8 @@ def commit_batch(state_dir, entry, observations, cursor, stats):
     cursors[entry["path"]] = {
         "cursor": cursor, "generation": entry.get("generation"),
         "lineage_id": entry.get("lineage_id"),
-        "carry_len": len(stats.get("carry", "")),
         "cmd_fps": stats.get("cmd_fps", {}),
-        "lines_seen": stats.get("lines", 0), "at": _now()}
+        "pending_fps": list(stats.get("pending_fps", [])), "at": _now()}
     _atomic_write_json(state / "cursors.json", cursors)
     return {"appended": len(to_append)}
 
@@ -501,22 +525,26 @@ def _load_cursors(state):
         if not isinstance(v.get("generation"), str):
             notes.append(f"cursor entry {k[:40]}: invalid generation — reset")
             continue
-        cl = v.get("carry_len", 0)
         fps = v.get("cmd_fps", {})
         pfps = v.get("pending_fps", [])
-        if (not isinstance(cl, int) or isinstance(cl, bool) or cl < 0
-                or not isinstance(fps, dict) or any(
-                not isinstance(fp, str) or not isinstance(n, int)
+        if (not isinstance(fps, dict) or any(
+                not isinstance(fp, str) or type(n) is not int or n < 0
                 for fp, n in fps.items())
                 or not isinstance(pfps, list) or any(
-                not isinstance(fp, str) for fp in pfps)):
+                not isinstance(p, dict) or not isinstance(p.get("fp"), str)
+                or type(p.get("window")) is not int or p["window"] < 0
+                or type(p.get("byte_off")) is not int or p["byte_off"] < 0
+                for p in pfps)):
             notes.append(f"cursor entry {k[:40]}: invalid detector state — "
                          "reset")
             continue
         # rebuilt with ONLY known keys: legacy/stale shapes (recent_fps,
-        # carry, ...) can never ride along into live cursor state (t30)
+        # carry, string pending entries) can never ride along (t30/t31)
         clean[k] = {"cursor": c, "generation": v["generation"],
-                    "carry_len": cl, "cmd_fps": fps, "pending_fps": pfps}
+                    "cmd_fps": fps,
+                    "pending_fps": [{"fp": p["fp"], "window": p["window"],
+                                     "byte_off": p["byte_off"]}
+                                    for p in pfps]}
     return clean, notes
 
 
