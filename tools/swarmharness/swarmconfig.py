@@ -710,6 +710,9 @@ def _validate_pressure(f, cfg):
     harnesses = catalog.get("harnesses") or {}
 
     # --- execution profiles
+    # typed local map: a faulted malformed profile record is reported and
+    # then EXCLUDED from every later consumer (F35.10rrr/F35.10rrrr)
+    profiles_ok = {k: v for k, v in profiles.items() if isinstance(v, dict)}
     defaults = {}
     aliases = {}
     resolver_supported = _REASONING_LEVELS
@@ -736,7 +739,8 @@ def _validate_pressure(f, cfg):
                 bref_ro = prof.get("binding_ref")
                 aref = ((harnesses.get(
                     (bindings.get(bref_ro) or {}).get("harness")) or {})
-                    .get("adapter_ref")) if bref_ro in bindings else None
+                    .get("adapter_ref")) if isinstance(bref_ro, str) and \
+                    bref_ro in bindings else None
                 support = _ADAPTER_REASONING_SUPPORT.get(aref)
                 if support is None:
                     _fault(f, "PRESSURE_REF",
@@ -749,6 +753,11 @@ def _validate_pressure(f, cfg):
                            f"reasoning_override: adapter {aref!r} does not "
                            f"support {ro.strip()!r}")
         bref = prof.get("binding_ref")
+        if not isinstance(bref, str) or not bref:
+            _fault(f, "PRESSURE_REF",
+                   f"catalog.execution_profiles.{pid}.binding_ref: string "
+                   f"required, got {bref!r}")
+            continue
         if bref not in bindings:
             _fault(f, "PRESSURE_REF",
                    f"catalog.execution_profiles.{pid}.binding_ref -> {bref}")
@@ -841,7 +850,13 @@ def _validate_pressure(f, cfg):
                    f"supply.pressure.ceilings.pools.{pid}.cooldown_after_refusal_seconds: int >= 0")
         pcs = pool.get("concurrent_slots")
         pcs_ok = pcs if type(pcs) is int else None
-        for b in (pool.get("binding_refs") or []):
+        pref_raw = pool.get("binding_refs")
+        if "binding_refs" in pool and not isinstance(pref_raw, list):
+            _fault(f, "PRESSURE_SCHEMA",
+                   f"supply.pressure.ceilings.pools.{pid}.binding_refs: "
+                   "list required")
+            pref_raw = []
+        for b in (pref_raw or []):
             if not isinstance(b, str):
                 # unhashable members fault structurally, never TypeError
                 _fault(f, "PRESSURE_REF",
@@ -882,13 +897,15 @@ def _validate_pressure(f, cfg):
         if not isinstance(n, int) or isinstance(n, bool) or n < 1:
             _fault(f, "PRESSURE_SCHEMA", f"{where}: positive int required, got {n!r}")
             return
-        prof = profiles.get(pid)
+        prof = profiles_ok.get(pid)
         if prof is None and isinstance(pid, str) and pid.endswith("/default"):
             prof = {"binding_ref": pid[:-len("/default")]}
         if prof is None:
             _fault(f, "PRESSURE_REF", f"{where}: unknown profile {pid}")
             return
         bref = prof.get("binding_ref")
+        if not isinstance(bref, str):
+            bref = None  # faulted at the profile; never sorts or hashes
         if n > _ceil_profile(pid):
             _fault(f, "PRESSURE_BOUNDS",
                    f"{where}: {n} exceeds profile ceiling {_ceil_profile(pid)}")
@@ -939,13 +956,16 @@ def _validate_pressure(f, cfg):
     # the canonical profile universe: explicit profiles plus every
     # synthesized <binding>/default that is not an alias (F35.10r —
     # one canonical fully expanded target calculation)
-    canon_universe = set(profiles.keys())
+    canon_universe = set(profiles_ok.keys())
     for bid in bindings:
         if f"{bid}/default" not in aliases:
             canon_universe.add(f"{bid}/default")
 
     def _expanded(lname):
-        lv = levels.get(lname) or {}
+        lv = levels.get(lname)
+        if not isinstance(lv, dict):
+            return {}  # faulted upstream; never reaches .get consumers
+        lv = dict(lv)
         slots = {}
         m = lv.get("profile_slots")
         if isinstance(m, dict):
@@ -976,10 +996,17 @@ def _validate_pressure(f, cfg):
     demand = demand or {}
     _pkeys(f, "supply.pressure.demand", demand, _DEMAND_KEYS, {"level"})
     lvl = demand.get("level")
-    if lvl is not None:
+    if lvl is None and "level" in demand:
+        # an explicit null faults — level is required and string-typed
+        # (F35.10rrrr)
+        _fault(f, "PRESSURE_REF",
+               "supply.pressure.demand.level: string required, got None")
+    elif lvl is not None:
         if not isinstance(lvl, str):
             _fault(f, "PRESSURE_REF",
-                   f"supply.pressure.demand.level: string required")
+                   f"supply.pressure.demand.level: string required, got "
+                   f"{lvl!r}")
+            lvl = None  # typed local: never reaches delegation lookups
         elif lvl not in levels:
             _fault(f, "PRESSURE_REF", f"supply.pressure.demand.level -> {lvl}")
     dem_over = _pmap(f, "supply.pressure.demand.profile_slot_overrides",
@@ -1004,9 +1031,12 @@ def _validate_pressure(f, cfg):
     control_ok = dict(control)  # normalize a LOCAL copy: input stays pure
     for lst_key in ("agent_role_refs", "agent_profile_refs", "agent_level_names"):
         lst = control.get(lst_key)
-        if lst is not None and not isinstance(lst, list):
+        if lst_key in control and not isinstance(lst, list):
+            # an explicit null or non-list faults — it is never accepted
+            # as an empty list (F35.10rrrr)
             _fault(f, "PRESSURE_SCHEMA",
-                   f"supply.pressure.control.{lst_key}: expected list")
+                   f"supply.pressure.control.{lst_key}: list required, got "
+                   f"{type(lst).__name__}")
             control_ok[lst_key] = []
     for lst_key in ("agent_role_refs", "agent_profile_refs", "agent_level_names"):
         for x in (control_ok.get(lst_key) or []):
@@ -1050,7 +1080,7 @@ def _validate_pressure(f, cfg):
         # delegation over the FULLY EXPANDED targets: a delegated level
         # must not raise any undelegated profile — explicit or synthesized
         # through the level default (F35.10r/F35.10rr)
-        base_name = demand.get("level")
+        base_name = lvl  # typed local: non-string levels never look up
         delegated_refs = {_ck(x) for x in
                           (control_ok.get("agent_profile_refs") or [])
                           if isinstance(x, str)}
@@ -1165,9 +1195,10 @@ def _validate_pressure(f, cfg):
         def _ref_binding(x):
             if not isinstance(x, str):
                 return None  # already faulted; unhashable never reaches `in`
-            prof = profiles.get(x)
+            prof = profiles_ok.get(x)
             if prof:
-                return prof.get("binding_ref")
+                b = prof.get("binding_ref")
+                return b if isinstance(b, str) else None
             if x.endswith("/default"):
                 return x[:-len("/default")]
             return None

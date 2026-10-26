@@ -75,6 +75,10 @@ from pathlib import Path
 
 PERMIT_TTL_SECONDS = 30
 MAX_LEASE_TTL_SECONDS = 900
+# evidence sampled mid-transaction can lead `now` by microseconds; a
+# one-millisecond skew absorbs that while any real future-dating (>= 1s)
+# still refuses
+HEALTH_CLOCK_SKEW_SECONDS = 0.001
 _REASONING_LEVELS = ("low", "medium", "high", "max")
 _SCHEMA_VERSION = 2  # store schema revision
 
@@ -688,49 +692,63 @@ class PressureAuthority:
                             (self.view.get("agent_role_refs") or []):
                         raise Contained(
                             f"role {issuer_role_ref} not delegated")
-                    clean = {}
+                    # normalize spellings BEFORE validating the complete
+                    # target set (F35.7rrrr): identical duplicates
+                    # deduplicate, conflicting duplicates refuse — never
+                    # sum
+                    norm = {}
                     for pid, n in (profile_slots or {}).items():
+                        if type(n) is not int or isinstance(n, bool) or \
+                                n < 0:
+                            raise Contained(
+                                f"profile_slots.{pid}: nonnegative int "
+                                "required")
                         canon = self._canonical_profile(pid)
+                        if canon in norm and norm[canon] != n:
+                            raise Contained(
+                                f"profile_slots: conflicting duplicate "
+                                f"spellings for {canon} "
+                                f"({norm[canon]} vs {n})")
+                        norm[canon] = n
+                    if not norm:
+                        raise Contained("profile_slots empty")
+                    clean = {}
+                    for canon, n in norm.items():
                         prof = (self.view.get("profiles") or {}).get(canon)
                         # delegation is checked on the CANONICAL profile —
                         # an alias key never dodges or breaks delegation
                         # (F35.7rr)
                         if canon not in (self.view.get("agent_profile_refs")
                                          or []):
-                            raise Contained(f"profile {pid} not delegated")
+                            raise Contained(f"profile {canon} not delegated")
                         if prof is None:
-                            raise Contained(f"unknown profile {pid}")
-                        if type(n) is not int or n < 0 or \
-                                n > prof.get("ceiling", 1):
+                            raise Contained(f"unknown profile {canon}")
+                        if n > prof.get("ceiling", 1):
                             raise Contained(
-                                f"profile_slots.{pid}: 0.."
+                                f"profile_slots.{canon}: 0.."
                                 f"{prof.get('ceiling', 1)}")
                         bind = prof.get("binding_ref")
                         bceil = (self.view.get("bindings") or {}).get(
                             bind, {}).get("ceiling", 1)
                         if n > bceil:
                             raise Contained(
-                                f"profile_slots.{pid}: {n} exceeds binding "
+                                f"profile_slots.{canon}: {n} exceeds binding "
                                 f"{bind} ceiling {bceil}")
                         for pool_id, pool in (
                                 self.view.get("pools") or {}).items():
                             if bind in (pool.get("binding_refs") or []):
                                 if n > pool.get("concurrent_slots", 1):
                                     raise Contained(
-                                        f"profile_slots.{pid}: {n} exceeds "
+                                        f"profile_slots.{canon}: {n} exceeds "
                                         f"pool {pool_id}")
                         g = self.view.get("global_ceiling")
                         if isinstance(g, int) and n > g:
                             raise Contained(
-                                f"profile_slots.{pid}: {n} exceeds global")
+                                f"profile_slots.{canon}: {n} exceeds global")
                         # leases persist CANONICAL keys so the raised
                         # target actually applies to the canonical profile
-                        # (F35.7rrr); the acknowledged spelling is kept for
-                        # idempotency under the original request bytes
-                        clean[canon] = clean.get(canon, 0) + n if \
-                            canon in clean else n
-                    if not clean:
-                        raise Contained("profile_slots empty")
+                        # (F35.7rrr)
+                        clean[canon] = n
                     now = _now()
                     active = db.execute(
                         "SELECT lease_id, revision FROM leases "
@@ -788,7 +806,16 @@ class PressureAuthority:
     def _resolve_principal(self, verified_principal, role_ref):
         if self.principal_verifier is None:
             raise Contained("principal-verifier-unavailable")
-        resolved = self.principal_verifier(verified_principal)
+        try:
+            resolved = self.principal_verifier(verified_principal)
+        except Contained:
+            raise
+        except Exception as exc:
+            # verifier unavailability is containment, never an exception
+            # escape and never an authorization (F35.2rrrr)
+            raise Contained(
+                f"principal verifier unavailable "
+                f"({type(exc).__name__})")
         if resolved != role_ref:
             raise Contained(
                 f"principal {verified_principal} does not verify as "
@@ -918,10 +945,66 @@ class PressureAuthority:
                                 "reason_codes": [
                                     f"health-evidence-unavailable {bind} "
                                     f"({type(exc).__name__})"]}
+                    def _finite(x):
+                        return (isinstance(x, (int, float))
+                                and not isinstance(x, bool)
+                                and x == x and x not in
+                                (float("inf"), float("-inf")))
+
+                    hc = ((self.view.get("planes") or {}).get(plane_ref, {})
+                          .get("health_contract") or {})
+                    ttl = hc.get("ttl_seconds")
+
+                    def _health_contracted(ok_ev):
+                        """The configured contract binds EVERY evidence
+                        shape (F35.6rrrr, ruling B): the source must match
+                        and the evidence must be dated + fresh. -> None
+                        when conforming, else a refusal reason string."""
+                        src_ref = hc.get("source_ref")
+                        if isinstance(src_ref, str) and src_ref and \
+                                ok_ev.get("source_ref") != src_ref:
+                            return f"health source mismatch on {bind}"
+                        if type(ttl) is int and \
+                                not _finite(ok_ev.get("observed_at")):
+                            # a contract requires a CURRENT OBSERVATION —
+                            # a null/absent observation is undated even
+                            # when an expiry assertion is present
+                            # (F35.6rrrr, ruling B)
+                            return (f"health undated on {bind} "
+                                    f"(contract ttl {ttl})")
+                        obs_ = ok_ev.get("observed_at")
+                        if obs_ is not None:
+                            if not _finite(obs_):
+                                return (f"health observation malformed on "
+                                        f"{bind}")
+                            if obs_ > now + HEALTH_CLOCK_SKEW_SECONDS:
+                                return (f"health observation in the future "
+                                        f"on {bind}")
+                            if type(ttl) is int and now - obs_ > ttl:
+                                return (f"health stale on {bind} "
+                                        f"(older than ttl {ttl})")
+                        exp_ = ok_ev.get("expires_at")
+                        if exp_ is not None:
+                            if not _finite(exp_):
+                                return f"health expiry malformed on {bind}"
+                            if exp_ <= now:
+                                return f"health expired on {bind}"
+                        return None
+
+                    bad = _health_contracted(ev) \
+                        if isinstance(ev, dict) else None
+                    if bad:
+                        return {"decision": "HOLD", "permit_ref": None,
+                                "reason_codes": [bad]}
                     if not isinstance(ev, dict) or \
                             ev.get("state") not in ("ok", "healthy"):
+                        # a refusal assertion that would mutate SHARED
+                        # cooldown state must itself satisfy the contract
+                        # first; invalid evidence still HOLDs this request
+                        # but installs nothing (F35.6rrrr)
                         if isinstance(ev, dict) and \
-                                isinstance(ev.get("pool_ref"), str):
+                                isinstance(ev.get("pool_ref"), str) and \
+                                _health_contracted(ev) is None:
                             # identified pool refusal persists a shared
                             # cooldown under the IDENTIFIED pool (never a
                             # first-membership neighbor, F35.6rrr): a
@@ -953,60 +1036,6 @@ class PressureAuthority:
                                     db, identified, rt_)
                         return {"decision": "HOLD", "permit_ref": None,
                                 "reason_codes": [f"health-unavailable {bind}"]}
-                    # dated evidence is validated strictly: finite numbers
-                    # only, and freshness against expiry and the plane's
-                    # configured TTL (F35.6rr)
-                    exp = ev.get("expires_at")
-
-                    def _finite(x):
-                        return (isinstance(x, (int, float))
-                                and not isinstance(x, bool)
-                                and x == x and x not in
-                                (float("inf"), float("-inf")))
-
-                    if exp is not None:
-                        if not _finite(exp):
-                            return {"decision": "HOLD", "permit_ref": None,
-                                    "reason_codes": [
-                                        f"health expiry malformed on {bind}"]}
-                        if exp <= now:
-                            return {"decision": "HOLD", "permit_ref": None,
-                                    "reason_codes": [f"health expired on {bind}"]}
-                    # dated evidence is validated unconditionally
-                    # (F35.6rrr): finite numbers, never in the future, and
-                    # fresh against the plane contract TTL. Source identity
-                    # is enforced when the evidence self-identifies — a
-                    # source_ref that contradicts the configured contract
-                    # is a refusal. (Fully undated bare-state evidence on
-                    # contract planes remains the ONE open conflict with
-                    # the frozen replay fixtures; re-baseline requested.)
-                    hc = ((self.view.get("planes") or {}).get(plane_ref, {})
-                          .get("health_contract") or {})
-                    ttl = hc.get("ttl_seconds")
-                    if isinstance(ev.get("source_ref"), str) and \
-                            isinstance(hc.get("source_ref"), str) and \
-                            hc.get("source_ref") and \
-                            ev["source_ref"] != hc["source_ref"]:
-                        return {"decision": "HOLD", "permit_ref": None,
-                                "reason_codes": [
-                                    f"health source mismatch on {bind}"]}
-                    obs = ev.get("observed_at")
-                    if obs is not None:
-                        if not _finite(obs):
-                            return {"decision": "HOLD", "permit_ref": None,
-                                    "reason_codes": [
-                                        f"health observation malformed on "
-                                        f"{bind}"]}
-                        if obs > now:
-                            return {"decision": "HOLD", "permit_ref": None,
-                                    "reason_codes": [
-                                        f"health observation in the future "
-                                        f"on {bind}"]}
-                        if type(ttl) is int and now - obs > ttl:
-                            return {"decision": "HOLD", "permit_ref": None,
-                                    "reason_codes": [
-                                        f"health stale on {bind} "
-                                        f"(older than ttl {ttl})"]}
                     limit = ev.get("concurrent_limit")
                     if limit is not None and type(limit) is not int:
                         return {"decision": "HOLD", "permit_ref": None,
@@ -1119,13 +1148,13 @@ class PressureAuthority:
                 return {"decision": "CONTAIN", "permit_ref": None,
                         "reason_codes": [f"store-error {exc}"]}
 
-    def redeem(self, permit_ref, *, dispatch_id, attempt_id, executor=None):
+    def redeem(self, permit_ref, *, dispatch_id, attempt_id, executor):
         """Fence immediately before launch. Only granted+unexpired+current
-        permits redeem (sol F2); the CALLER binds: an explicit executor is
-        verified through the injected verifier and must be the permit's
-        authorized principal (F35.2rr); omitted, the admit-time principal
-        continues in-process and is re-verified as the stored identity.
-        One-row update authorizes the launch."""
+        permits redeem (sol F2); the CURRENT executor identity is REQUIRED
+        and trusted: it must be the permit's authorized principal AND
+        re-verify through the injected verifier (F35.2rrrr — ruling A
+        retired the omitted-executor fallback). One-row update authorizes
+        the launch."""
         with self._lock:
             db2 = self._db
             try:
@@ -1140,10 +1169,10 @@ class PressureAuthority:
                     if state != "granted":
                         raise Contained(
                             f"permit not redeemable (state={state})")
-                    if executor is not None and executor != principal:
+                    if executor is None or executor != principal:
                         raise Contained(
-                            "executor is not the permit's authorized "
-                            "principal")
+                            "redeem requires the current executor identity "
+                            "of the permit's authorized principal")
                     # re-verified NOW — a verifier that stopped authorizing
                     # stops all redemption (F35.2r/F35.2rr)
                     self._resolve_principal(principal, prole)
@@ -1227,9 +1256,12 @@ class PressureAuthority:
                         raise Contained(
                             "permit not uncertain (nothing to reconcile)")
                     d_id, a_id, principal, prole = row
-                    # omitted identity requires authenticated evidence
-                    # (F35.2rrr): dispatch_id AND attempt_id, or evidence
-                    if dispatch_id is None and attempt_id is None \
+                    # reconciliation authorization requires COMPLETE
+                    # attempt identity (BOTH ids) or authenticated
+                    # evidence — a partial identity without evidence
+                    # refuses (F35.2rrrr)
+                    if not (dispatch_id is not None
+                            and attempt_id is not None) \
                             and evidence is None:
                         raise Contained(
                             "reconciliation requires complete attempt "

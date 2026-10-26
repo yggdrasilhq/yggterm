@@ -2298,7 +2298,12 @@ def main():
     import pressure as pr
 
     def healthy(binding):
-        return {"state": "ok", "source": "test", "concurrent_limit": None}
+        # dated evidence: conforms on contract planes too (the source_ref
+        # matches the suite's probe contracts; observed_at follows the
+        # suite's clock — real before T36, frozen within it)
+        return {"state": "ok", "source_ref": "probe-health",
+                "observed_at": pr._now(), "expires_at": pr._now() + 3600,
+                "concurrent_limit": None}
 
     PRINCIPALS = {"orch-intel": "intelligence", "orch-intel-2": "intelligence",
                   "orch-editor": "editor"}
@@ -2658,7 +2663,7 @@ def main():
                      plane_ref="intelligence-consult")
     auth5.mark_uncertain(pm["permit_ref"], "ack lost")
     rd = auth5.redeem(pm["permit_ref"], dispatch_id="dU",
-                      attempt_id="aU")
+                      attempt_id="aU", executor="orch-intel")
     auth5.reconcile(pm["permit_ref"], launched=True,
                     dispatch_id="dU", attempt_id="aU")
     occU = auth5.status()["occupancy"]
@@ -2708,6 +2713,7 @@ def main():
     # =====================================================================
     clock = [1800000000.0]
     real_now = pr._now
+    real_now_holder = {"real": real_now}
     pr._now = lambda: clock[0]
     suite_principals2 = {"worker": "intelligence", "editor2": "editor",
                          "dreamer": "dreamers"}
@@ -2741,7 +2747,8 @@ def main():
     def t36_launch(a, d, **kw):
         x = t36_admit(a, d, **kw)
         assert x["decision"] == "ALLOW", (d, x)
-        r = a.redeem(x["permit_ref"], dispatch_id=d, attempt_id="a")
+        r = a.redeem(x["permit_ref"], dispatch_id=d, attempt_id="a",
+                     executor=kw.get("principal", "worker"))
         assert r.get("ok"), r
         return x["permit_ref"]
 
@@ -2805,9 +2812,11 @@ def main():
     a4 = t36_auth("authz")
     pref4 = t36_admit(a4, "authz-d")["permit_ref"]
     a4.principal_verifier = lambda p: None
-    r = a4.redeem(pref4, dispatch_id="authz-d", attempt_id="a")
+    r = a4.redeem(pref4, dispatch_id="authz-d", attempt_id="a",
+                  executor="worker")
     a4.principal_verifier = suite_verifier2
-    r2 = a4.redeem(pref4, dispatch_id="authz-d", attempt_id="a")
+    r2 = a4.redeem(pref4, dispatch_id="authz-d", attempt_id="a",
+                   executor="worker")
     a4.mark_uncertain(pref4)
     a4.principal_verifier = lambda p: None
     rc = a4.reconcile(pref4, launched=False, dispatch_id="authz-d",
@@ -3132,9 +3141,11 @@ def main():
 
     def refusing2(b):
         seen2[0] += 1
+        base = {"source_ref": "probe-health", "observed_at": clock[0]}
         if seen2[0] == 1:
-            return {"state": "refused", "pool_ref": "codex-sol"}
-        return {"state": "ok"}
+            return dict(base, state="refused", pool_ref="codex-sol",
+                        retry_at=clock[0] + 60)
+        return dict(base, state="ok")
 
     hc36.health_evidence = refusing2
     x = t36_admit(hc36, "cd2-first")
@@ -3179,7 +3190,8 @@ def main():
     r36 = t36_auth("restart2")
     prefR = t36_admit(r36, "rs2-live")["permit_ref"]
     rs = r36.restart()
-    r = r36.redeem(prefR, dispatch_id="rs2-live", attempt_id="a")
+    r = r36.redeem(prefR, dispatch_id="rs2-live", attempt_id="a",
+                   executor="worker")
     check("T36-17 restart invalidates unexpired unredeemed grants",
           rs.get("ok") and not r.get("ok")
           and r36._db.execute(
@@ -3396,6 +3408,139 @@ def main():
           x["decision"] == "HOLD"
           and any("dreamers" in rc for rc in x["reason_codes"]),
           json.dumps(x.get("reason_codes"))[:160])
+
+
+    # =====================================================================
+    # T36d — pressure repair v6 (round-5 residuals F35.2/6/7/10-rrrr).
+    # =====================================================================
+    # F35.2rrrr: partial identity without evidence refuses; redeem
+    # requires the current executor; verifier exceptions contained
+    d6 = t36_auth("d6")
+    pd6 = t36_admit(d6, "d6-partial")["permit_ref"]
+    d6.mark_uncertain(pd6)
+    r = d6.reconcile(pd6, launched=False, dispatch_id="d6-partial",
+                     attempt_id=None)
+    r2 = d6.reconcile(pd6, launched=False, dispatch_id=None,
+                      attempt_id="a")
+    r3 = d6.reconcile(pd6, launched=False, dispatch_id="d6-partial",
+                      attempt_id="a", reconciler="worker")
+    check("T36-24 partial identity without evidence refuses; complete ok",
+          not r.get("ok") and not r2.get("ok") and r3.get("ok"),
+          json.dumps([r, r2, r3])[:240])
+    pd7 = t36_admit(d6, "d6-noexec")["permit_ref"]
+    try:
+        rx = d6.redeem(pd7, dispatch_id="d6-noexec", attempt_id="a")
+        missing_executor = not rx.get("ok")
+    except TypeError:
+        missing_executor = True  # required keyword refused at the signature
+    rx2 = d6.redeem(pd7, dispatch_id="d6-noexec", attempt_id="a",
+                    executor="worker")
+    check("T36-24b redeem requires the current executor (ruling A)",
+          missing_executor and rx2.get("ok"))
+    def boom(who):
+        raise RuntimeError("verifier down")
+    d6b = t36_auth("d6-verifier", verifier=boom)
+    try:
+        x = t36_admit(d6b, "d6-verify-d")
+        exc = x["decision"]
+    except Exception as e:
+        exc = f"ESCAPED {type(e).__name__}"
+    pd8 = t36_admit(d6, "d6-verify")["permit_ref"]
+    d6.mark_uncertain(pd8)
+    d6.principal_verifier = boom
+    try:
+        rr = d6.reconcile(pd8, launched=False, dispatch_id="d6-verify",
+                          attempt_id="a")
+        rexc = "contained" if not rr.get("ok") else "AUTHORIZED"
+    except Exception as e:
+        rexc = f"ESCAPED {type(e).__name__}"
+    check("T36-24c verifier unavailability contained at the boundary",
+          exc == "CONTAIN" and rexc == "contained",
+          json.dumps([exc, rexc])[:160])
+    # F35.6rrrr: the contract binds every shape; refusal-side validation
+    # precedes shared-state writes
+    bad_shapes = [
+        ("bare", {"state": "ok"}),
+        ("wrong-source", {"state": "ok", "source_ref": "other",
+                          "observed_at": clock[0]}),
+        ("undated-matching-source", {"state": "ok",
+                                     "source_ref": "probe-health"}),
+        ("future-obs", {"state": "ok", "source_ref": "probe-health",
+                        "observed_at": clock[0] + 10})]
+    for name, evd in bad_shapes:
+        h6 = t36_auth(f"c6-{name}", cfg_hc, health=lambda b, _e=evd: _e)
+        x = t36_admit(h6, f"c6-{name}-d")
+        check(f"T36-25 contract binds {name}",
+              x["decision"] == "HOLD", json.dumps(x)[:120])
+    # a WRONG-source refusal must not install a shared cooldown
+    h6 = t36_auth("c6-badrefusal", cfg_hc)
+    seen5 = [0]
+
+    def bad_refusal(b):
+        seen5[0] += 1
+        if seen5[0] == 1:
+            return {"state": "refused", "pool_ref": "codex-sol",
+                    "source_ref": "other", "retry_at": clock[0] + 600}
+        return healthy(b)
+
+    h6.health_evidence = bad_refusal
+    x = t36_admit(h6, "c6-br-first")
+    y = t36_admit(h6, "c6-br-peer", profile="sol-medium")
+    check("T36-25b invalid refusal evidence installs no cooldown",
+          x["decision"] == "HOLD" and y["decision"] == "ALLOW",
+          json.dumps([x.get("reason_codes"), y["decision"]])[:160])
+    # F35.7rrrr: identical duplicate spellings dedupe; conflicting refuse
+    vlow6 = sc.pressure_view(v3)
+    vlow6["baseline"]["sol-high"] = 1
+    l6 = t36_auth("c6-lease", view=vlow6, config_hash="c6-lease")
+    lr = l6.lease(request_id="c6-dup-ok",
+                  expected_config_hash=l6.config_hash,
+                  verified_principal="worker",
+                  issuer_role_ref="intelligence",
+                  profile_slots={"sol-high": 5, "sol-editor/default": 5},
+                  ttl_seconds=60, expected_lease_revision=0)
+    eff = l6.status()["desired"].get("sol-high")
+    lr2 = l6.lease(request_id="c6-dup-bad",
+                   expected_config_hash=l6.config_hash,
+                   verified_principal="worker",
+                   issuer_role_ref="intelligence",
+                   profile_slots={"sol-high": 5, "sol-editor/default": 7},
+                   ttl_seconds=60, expected_lease_revision=lr["revision"])
+    check("T36-26 duplicate spellings dedupe; conflicts refuse",
+          lr.get("ok") and lr["profile_slots"] == {"sol-high": 5}
+          and eff == 5 and not lr2.get("ok"),
+          json.dumps([lr.get("profile_slots"), eff, lr2])[:220])
+    # F35.10rrrr: remaining structural escapes + invalid-shape acceptances
+    for name, mut in [
+            ("demand-level-list", lambda c: c["supply"]["pressure"]
+             ["demand"].update({"level": [1]})),
+            ("demand-level-null", lambda c: c["supply"]["pressure"]
+             ["demand"].update({"level": None})),
+            ("level-record-string", lambda c: c["supply"]["pressure"]
+             ["levels"].update({"high": "wrong"})),
+            ("pool-refs-int", lambda c: c["supply"]["pressure"]["ceilings"]
+             ["pools"]["codex-sol"].update({"binding_refs": 1})),
+            ("pool-refs-null", lambda c: c["supply"]["pressure"]["ceilings"]
+             ["pools"]["codex-sol"].update({"binding_refs": None})),
+            ("profile-record-list", lambda c: c["catalog"]
+             ["execution_profiles"].update({"sol-high": []})),
+            ("binding-ref-list", lambda c: c["catalog"]["execution_profiles"]
+             ["sol-high"].update({"binding_ref": []})),
+            ("agent-levels-null", lambda c: c["supply"]["pressure"]
+             ["control"].update({"agent_level_names": None}))]:
+        bad = json.loads(json.dumps(v3))
+        mut(bad)
+        before = json.dumps(bad, sort_keys=True)
+        try:
+            faults = sc.validate(bad)
+        except Exception as e:
+            faults = [{"code": f"RAISED {type(e).__name__}"}]
+        pure = json.dumps(bad, sort_keys=True) == before
+        check(f"T36-27 {name} -> structural fault, pure, no raise",
+              bool(faults) and pure
+              and not any(str(x["code"]).startswith("RAISED")
+                          for x in faults),
+              json.dumps(faults)[:140])
 
     pr._now = real_now
 
