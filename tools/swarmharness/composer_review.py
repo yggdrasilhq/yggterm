@@ -38,9 +38,14 @@ MODEL = os.environ.get("COMPOSER_REVIEW_MODEL", "gpt-6.1-sol")
 EFFORT = os.environ.get("COMPOSER_REVIEW_EFFORT", "medium")
 
 
+SILENT = os.environ.get("COMPOSER_REVIEW_SILENT") == "1"
+
+
 def post_board(body, host):
     """One warning/note post per review cycle; board append via the shared
     dataset file (msgboard may be absent on this host)."""
+    if SILENT:
+        return "silent(test)"
     try:
         p = Path.home() / "data/msggraph/boards/infra/meta/board.jsonl"
         if not p.exists():
@@ -60,9 +65,11 @@ def post_board(body, host):
 def main():
     host = os.uname().nodename.split(".")[0].lower()
     if not OUTBOX.exists():
-        return 0  # nothing ever proposed — silent no-op
+        print(json.dumps({"review": "noop", "why": "outbox-absent"}))
+        return 0
     rows = [json.loads(l) for l in OUTBOX.read_text().splitlines() if l.strip()]
     if not rows:
+        print(json.dumps({"review": "noop", "why": "outbox-empty"}))
         return 0
     ids = sorted(r.get("id") or r.get("dedupe_key", "?") for r in rows)
     batch = hashlib.sha256("\n".join(ids).encode()).hexdigest()[:16]
