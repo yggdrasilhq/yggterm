@@ -1041,7 +1041,11 @@ def fetch_remote(host, harness, slug, activate=False):
                          writer_updated_at=writer_updated_at,
                          source="fetch", fetched_from=used_dest)
         if activate:
-            return {**switch(harness, slug, lock_held=True), "fetched_from": used_dest}
+            # "activated": True — dream ACK-0b31f4f3f5: without it the success
+            # printer fell into the stored-not-live branch and KeyError'd on
+            # 'slug' AFTER a fully successful fetch+switch (exit 1 on success).
+            return {**switch(harness, slug, lock_held=True), "fetched_from": used_dest,
+                    "activated": True}
     return {"fetched_from": used_dest, "slug": slug,
             "writer": writer, "activated": False}
 
@@ -1751,7 +1755,7 @@ def main(argv=None):
             idt = out["identity"]
             print(f"📥 imported {idt['email']} ({idt['plan']}) as {out['imported']} — stored, not live (use `switch`)")
         elif args.verb == "fetch":
-            if out.get("activated"):
+            if out.get("switched_to") is not None:  # the discriminator that actually exists on the activated path
                 idt = out["identity"]
                 print(f"📡 fetched {out['switched_to']} from {out['fetched_from']} and activated: {idt['email']} ({idt['plan']})")
             else:
