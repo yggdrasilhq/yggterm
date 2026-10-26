@@ -418,6 +418,7 @@ def validate(cfg):
     if cat.get("execution_profiles") is not None and v != 3:
         _fault(f, "unknown_field",
                "catalog.execution_profiles requires schema_version 3")
+    cat = dict(cat)  # never repair the caller's input while rejecting it
     for space in ("harnesses", "providers", "accounts", "plans", "bindings"):
         if cat.get(space) is not None and not isinstance(cat[space], dict):
             _fault(f, "type_mismatch", f"catalog.{space}: expected mapping")
@@ -798,23 +799,26 @@ def _validate_pressure(f, cfg):
            {"global_concurrent_slots"})
     g = ceilings.get("global_concurrent_slots")
     _slots_int(f, "supply.pressure.ceilings.global_concurrent_slots", g)
-    bceil = _pmap(f, "supply.pressure.ceilings.binding_concurrent_slots",
-                  ceilings.get("binding_concurrent_slots"))
-    for k, n in bceil.items():
+    bceil_raw = _pmap(f, "supply.pressure.ceilings.binding_concurrent_slots",
+                      ceilings.get("binding_concurrent_slots"))
+    for k, n in bceil_raw.items():
         _slots_int(f, f"supply.pressure.ceilings.binding_concurrent_slots.{k}", n)
         if k not in bindings:
             _fault(f, "PRESSURE_REF",
                    f"supply.pressure.ceilings.binding_concurrent_slots -> {k}")
+    # only valid typed values reach bounds math (F35.10rr)
+    bceil = {k: v for k, v in bceil_raw.items() if type(v) is int}
     if "default_binding_concurrent_slots" in ceilings:
         _slots_int(f, "supply.pressure.ceilings.default_binding_concurrent_slots",
                    ceilings.get("default_binding_concurrent_slots"))
-    pceil = _pmap(f, "supply.pressure.ceilings.profile_concurrent_slots",
-                  ceilings.get("profile_concurrent_slots"))
-    for k, n in pceil.items():
+    pceil_raw = _pmap(f, "supply.pressure.ceilings.profile_concurrent_slots",
+                      ceilings.get("profile_concurrent_slots"))
+    for k, n in pceil_raw.items():
         _slots_int(f, f"supply.pressure.ceilings.profile_concurrent_slots.{k}", n)
         if k not in profiles:
             _fault(f, "PRESSURE_REF",
                    f"supply.pressure.ceilings.profile_concurrent_slots -> {k}")
+    pceil = {k: v for k, v in pceil_raw.items() if type(v) is int}
     if "default_profile_concurrent_slots" in ceilings:
         _slots_int(f, "supply.pressure.ceilings.default_profile_concurrent_slots",
                    ceilings.get("default_profile_concurrent_slots"))
@@ -835,17 +839,29 @@ def _validate_pressure(f, cfg):
                                or cd < 0):
             _fault(f, "PRESSURE_SCHEMA",
                    f"supply.pressure.ceilings.pools.{pid}.cooldown_after_refusal_seconds: int >= 0")
+        pcs = pool.get("concurrent_slots")
+        pcs_ok = pcs if type(pcs) is int else None
         for b in (pool.get("binding_refs") or []):
+            if not isinstance(b, str):
+                # unhashable members fault structurally, never TypeError
+                _fault(f, "PRESSURE_REF",
+                       f"supply.pressure.ceilings.pools.{pid}.binding_refs: "
+                       "string refs required")
+                continue
             if b not in bindings:
                 _fault(f, "PRESSURE_REF",
                        f"supply.pressure.ceilings.pools.{pid}.binding_refs -> {b}")
-            pool_of.setdefault(b, []).append((pid, pool.get("concurrent_slots")))
+            if pcs_ok is not None:
+                pool_of.setdefault(b, []).append((pid, pcs_ok))
 
     def _ceil_profile(pid):
-        if pid in pceil:
-            return pceil[pid]
-        if isinstance(pid, str) and pid.endswith("/default"):
-            b = pid[:-len("/default")]
+        # ONE canonical resolver (F35.7rr): an alias resolves to its
+        # canonical profile's explicit ceiling before any fallback
+        canon = aliases.get(pid, pid) if isinstance(pid, str) else pid
+        if canon in pceil:
+            return pceil[canon]
+        if isinstance(canon, str) and canon.endswith("/default"):
+            b = canon[:-len("/default")]
             if b in bceil:
                 return bceil[b]
         return ceilings.get("default_profile_concurrent_slots", 1)
@@ -974,26 +990,31 @@ def _validate_pressure(f, cfg):
     if not isinstance(pae, bool):
         _fault(f, "PRESSURE_SCHEMA",
                "supply.pressure.control.persistent_agent_edits: bool required")
+    control_ok = dict(control)  # normalize a LOCAL copy: input stays pure
     for lst_key in ("agent_role_refs", "agent_profile_refs", "agent_level_names"):
         lst = control.get(lst_key)
         if lst is not None and not isinstance(lst, list):
             _fault(f, "PRESSURE_SCHEMA",
                    f"supply.pressure.control.{lst_key}: expected list")
-            control[lst_key] = []
+            control_ok[lst_key] = []
     for lst_key in ("agent_role_refs", "agent_profile_refs", "agent_level_names"):
-        for x in (control.get(lst_key) or []):
+        for x in (control_ok.get(lst_key) or []):
             if not isinstance(x, str) or not x.strip():
                 _fault(f, "PRESSURE_SCHEMA",
                        f"supply.pressure.control.{lst_key}: non-empty strings")
-    for x in (control.get("agent_level_names") or []):
+    for x in (control_ok.get("agent_level_names") or []):
         if x not in levels:
             _fault(f, "PRESSURE_DELEGATION",
                    f"supply.pressure.control.agent_level_names -> {x}")
-    for x in (control.get("agent_profile_refs") or []):
+    for x in (control_ok.get("agent_profile_refs") or []):
+        if not isinstance(x, str):
+            continue  # already faulted above; unhashable never reaches `in`
         if x not in profiles:
             _fault(f, "PRESSURE_DELEGATION",
                    f"supply.pressure.control.agent_profile_refs -> {x}")
-    for x in (control.get("agent_role_refs") or []):
+    for x in (control_ok.get("agent_role_refs") or []):
+        if not isinstance(x, str):
+            continue
         if x not in (cfg.get("roles") or {}):
             _fault(f, "PRESSURE_DELEGATION",
                    f"supply.pressure.control.agent_role_refs -> {x}")
@@ -1015,11 +1036,12 @@ def _validate_pressure(f, cfg):
     if control.get("persistent_agent_edits") is True:
         # delegation over the FULLY EXPANDED targets: a delegated level
         # must not raise any undelegated profile — explicit or synthesized
-        # through the level default (F35.10r)
+        # through the level default (F35.10r/F35.10rr)
         base_name = demand.get("level")
-        delegated_refs = {_ck(x)
-                          for x in (control.get("agent_profile_refs") or [])}
-        for lvl_name in (control.get("agent_level_names") or []):
+        delegated_refs = {_ck(x) for x in
+                          (control_ok.get("agent_profile_refs") or [])
+                          if isinstance(x, str)}
+        for lvl_name in (control_ok.get("agent_level_names") or []):
             if base_name and base_name != lvl_name:
                 eb = _expanded(base_name)
                 el = _expanded(lvl_name)
@@ -1036,6 +1058,8 @@ def _validate_pressure(f, cfg):
         """An explicit profile, or a synthesized <binding>/default for any
         EXISTING binding (declared bindings route but never launch — sol
         pressure design: kimi-editor/default remains a fallback reference)."""
+        if not isinstance(ref, str):
+            return False
         if ref in profiles:
             return True
         if isinstance(ref, str) and ref.endswith("/default"):
@@ -1054,7 +1078,7 @@ def _validate_pressure(f, cfg):
         _pkeys(f, f"roles.{rid}.routing", rt, _ROUTING_KEYS,
               {"preferred_profile_ref"})
         pref = rt.get("preferred_profile_ref")
-        if not _prof_ok(pref):
+        if not isinstance(pref, str) or not _prof_ok(pref):
             _fault(f, "PRESSURE_REF",
                    f"roles.{rid}.routing.preferred_profile_ref -> {pref}")
         fb_list = rt.get("fallback_profile_refs")
@@ -1063,8 +1087,13 @@ def _validate_pressure(f, cfg):
                    f"roles.{rid}.routing.fallback_profile_refs: expected list")
             fb_list = []
         # chain uniqueness after ALIAS resolution (F35.10r)
-        canon_seen = {_ck(pref)} if pref else set()
+        canon_seen = {_ck(pref)} if isinstance(pref, str) else set()
         for x in (fb_list or []):
+            if not isinstance(x, str):
+                _fault(f, "PRESSURE_REF",
+                       f"roles.{rid}.routing.fallback_profile_refs: string "
+                       "refs required")
+                continue
             if not _prof_ok(x):
                 _fault(f, "PRESSURE_REF",
                        f"roles.{rid}.routing.fallback_profile_refs -> {x}")
@@ -1102,7 +1131,7 @@ def _validate_pressure(f, cfg):
             _pkeys(f, f"roles.{rid}.routing.parallel.lanes[]", ln, _LANE_KEYS,
                   {"profile_ref", "weight"})
             lref = ln.get("profile_ref")
-            if not _prof_ok(lref):
+            if not isinstance(lref, str) or not _prof_ok(lref):
                 _fault(f, "PRESSURE_REF",
                        f"roles.{rid}.routing.parallel.lanes[] -> {lref}")
             else:
@@ -1119,10 +1148,12 @@ def _validate_pressure(f, cfg):
         # retained legacy projections must agree with routing (C24)
 
         def _ref_binding(x):
+            if not isinstance(x, str):
+                return None  # already faulted; unhashable never reaches `in`
             prof = profiles.get(x)
             if prof:
                 return prof.get("binding_ref")
-            if isinstance(x, str) and x.endswith("/default"):
+            if x.endswith("/default"):
                 return x[:-len("/default")]
             return None
 
@@ -1218,7 +1249,9 @@ def pressure_view(cfg):
         for pid, p in (cfg.get("planes") or {}).items()}
     out["planes"] = {
         pid: {"owner_policy": p.get("owner_policy"),
-              "binding_refs": p.get("binding_refs") or []}
+              "binding_refs": p.get("binding_refs") or [],
+              "health_contract": (p.get("health_contract") or {})
+              if isinstance(p.get("health_contract"), dict) else {}}
         for pid, p in (cfg.get("planes") or {}).items()}
     if not pr:
         # ---- legacy executable mode (F35.11r) ----
@@ -1226,6 +1259,19 @@ def pressure_view(cfg):
         per_family = (adm or {}).get("per_family") or {}
         out["legacy"] = {"global_concurrent_slots": g,
                          "per_family": per_family}
+
+        def _family_limit(rid, r):
+            """Original legacy limits: a direct role-id entry, else the
+            role's single declared profile-family (e.g. dreamers.profiles
+            key ux_parity) when per_family names families, not roles
+            (F35.11rr). No invented limits."""
+            lim = per_family.get(rid)
+            if lim is None:
+                fams = [k for k in per_family
+                        if k in (r.get("profiles") or {})]
+                if len(fams) == 1:
+                    lim = per_family[fams[0]]
+            return lim
         out["global_ceiling"] = g if isinstance(g, int) else None
         lim = out["global_ceiling"]
 
@@ -1264,7 +1310,7 @@ def pressure_view(cfg):
                     "preferred_profile_ref": rt.get("preferred_profile_ref"),
                     "fallback_profile_refs":
                         rt.get("fallback_profile_refs") or [],
-                    "max_concurrent_slots": per_family.get(rid),
+                    "max_concurrent_slots": _family_limit(rid, r),
                     "lanes": (rt.get("parallel") or {}).get("lanes") or [],
                     "strategy": (rt.get("parallel") or {}).get(
                         "strategy", "single"),
@@ -1273,12 +1319,14 @@ def pressure_view(cfg):
             else:
                 route = _derive_route(rid, r, bindings)
                 if route:
-                    route["max_concurrent_slots"] = per_family.get(rid)
+                    route["max_concurrent_slots"] = _family_limit(rid, r)
                     out["role_routing"][rid] = route
+        # legacy mode invents NO per-profile target: baseline None means
+        # only the ceilings and family/global limits constrain (F35.11rr)
         for pid in out["profiles"]:
-            out["baseline"][pid] = 1
+            out["baseline"][pid] = None
         for synth in out["profile_aliases"]:
-            out["baseline"][synth] = 1
+            out["baseline"][synth] = None
         return out
     ceilings = pr.get("ceilings") or {}
     levels = pr.get("levels") or {}

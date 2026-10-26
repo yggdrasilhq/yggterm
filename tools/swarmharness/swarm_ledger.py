@@ -437,6 +437,19 @@ def _adjudicate_one(state, area, p):
     if head is not None:
         prev = _read_release_cfg(state, head_hash)
     endorsed = verify_endorsement(env, state)
+    # F35.4rr: the authenticated context is resolved BEFORE preauthorization
+    # and the SAME verified resolution drives both the precheck and accept.
+    # The sync transport vouches for the captured principal (claimed
+    # principal, else the origin host); the vouched role is "owner" for
+    # endorsed captures, "agent" otherwise. A config enables ledger-carried
+    # demand edits by listing "agent" in pressure control agent_role_refs.
+    verified_agent = ("owner" if endorsed
+                      else env.get("claimed_principal") or p.get("origin_host"))
+    _vouched_role = "owner" if endorsed else "agent"
+
+    def _ledger_verifier(who, _v=verified_agent, _r=_vouched_role):
+        return _r if who == _v else None
+
     if endorsed:
         authority_class, principal = "owner", "owner"
     elif prev is None:
@@ -444,12 +457,12 @@ def _adjudicate_one(state, area, p):
                 "detail": "no accepted baseline (bootstrap): only an endorsed owner proposal may commit",
                 "preserved": True}
     else:
-        bad = _agent_unauthorized(prev, cfg)
+        bad = _agent_unauthorized(prev, cfg, issuer_role_ref=_vouched_role)
         if bad:
             return {**base_detail, "decision": "pending_authorization",
                     "detail": f"raw edit; owner endorsement required for {bad[:5]}",
                     "preserved": True}
-        authority_class, principal = "agent", f"agent:{env.get('claimed_principal') or p.get('origin_host')}"
+        authority_class, principal = "agent", f"agent:{verified_agent}"
 
     # dev constructs the final release with machine-owned identity fields
     final = dict(cfg)
@@ -462,19 +475,6 @@ def _adjudicate_one(state, area, p):
         "proposed_by": principal,
         "reason": env.get("reason") or f"sync batch accept from {p.get('origin_host')}",
     }
-    # F35.4r: the ledger supplies the authenticated context accept()
-    # requires. The sync transport vouches for the captured principal
-    # (claimed principal, else the origin host); the role is DERIVED from
-    # the vouch — "owner" for endorsed captures, "agent" otherwise (demand
-    # delegation in a config therefore lists "agent" among its
-    # agent_role_refs to enable ledger-carried demand edits).
-    verified_agent = ("owner" if endorsed
-                      else env.get("claimed_principal") or p.get("origin_host"))
-    _vouched_role = "owner" if endorsed else "agent"
-
-    def _ledger_verifier(who, _v=verified_agent, _r=_vouched_role):
-        return _r if who == _v else None
-
     final_bytes = canonical_json(final)  # canonical JSON form is valid YAML
     # COMMIT ORDER (sol t7#3/t9#1): seal -> journal (fsync = commit point) ->
     # activate. A journal failure leaves an uncommitted seal, never a moved
