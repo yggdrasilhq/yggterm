@@ -932,6 +932,61 @@ def cmd_supervise(cfg):
                         ledger["notes"].append({"spawn_failed": "ux-parity", "err": (out3 or "")[-120:]})
                 else:
                     ledger["notes"].append({"ux_watch": f"prompt file missing: {pf}"})
+    # reviewer succession (owner 2026-10-26): reviews spawn dreamers — the
+    # spool drains through the SAME v2 permission gate as every dispatch.
+    # The gate is checked at the EXACT effective route inside the enqueue
+    # wrapper (route aliases must not share a plane allowlist, sol t22#4);
+    # gate-refused packets stay pending with their diagnostics (sol t22#8).
+    # ONE hook only — a stacked duplicate re-opens the alias bypass (t23).
+    try:
+        _here = Path(__file__).resolve()
+        _cont = None
+        for _kp in [_here.parents[3] / "tools", _here.parent,
+                    HOME / "gh" / "yggterm" / "tools",
+                    HOME / ".yggterm" / "swarmkernel"]:
+            try:
+                if (_kp / "swarmharness" / "continuation.py").exists():
+                    if str(_kp) not in sys.path:
+                        sys.path.insert(0, str(_kp))
+                    from swarmharness import continuation as _cont
+                    break
+                if (_kp / "continuation.py").exists():
+                    if str(_kp) not in sys.path:
+                        sys.path.insert(0, str(_kp))
+                    import continuation as _cont
+                    break
+            except Exception:
+                continue
+        if _cont is None:
+            raise ImportError("continuation module not found on any kernel path")
+
+        def _enqueue_spawn(route, area, prompt):
+            blocked, _note = v2_blocked_routes([route])
+            if blocked:
+                return False, f"v2 gate blocks {route}"
+            return enqueue(cfg, route, area, "spawn", False, prompt)
+
+        _cont_allowed = {ROUTE_TO_PLANE.get(r, r)
+                         for r in list(ROUTE_TO_PLANE) + list(cfg["routes"])
+                         if not v2_blocked_routes([r])[0]}
+        _cont_rep = _cont.drain(None, enqueue_fn=_enqueue_spawn,
+                                allowed_routes=_cont_allowed,
+                                default_route="autoclaw",
+                                route_of=lambda r: ROUTE_TO_PLANE.get(r, r))
+        if _cont_rep["enqueued"] or _cont_rep["rejected"] or _cont_rep["failed"]:
+            print(f"orchestrator: continuations enqueued={_cont_rep['enqueued']} "
+                  f"suppressed={_cont_rep['suppressed']} "
+                  f"rejected={_cont_rep['rejected']} failed={_cont_rep['failed']}")
+        ledger["notes"].append({"continuations": {
+            "enqueued": _cont_rep["enqueued"],
+            "suppressed": _cont_rep["suppressed"],
+            "rejected": _cont_rep["rejected"],
+            "failed": _cont_rep["failed"],
+            "orphaned_claims": sum(1 for n in _cont_rep["notes"]
+                                   if n.startswith("orphaned claim")),
+            "notes": _cont_rep["notes"][:3]}})
+    except Exception as _exc:
+        ledger["notes"].append({"continuations_fault": str(_exc)[:160]})
     LEDGER.parent.mkdir(parents=True, exist_ok=True)
     with LEDGER.open("a") as f:
         f.write(json.dumps(ledger) + "\n")

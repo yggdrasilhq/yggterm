@@ -1193,6 +1193,246 @@ def main():
     # T18-11 (N10): debt rows retain the authority receipt for re-verification
     check("T18-11 debt row retains authority_receipt",
           ok_debt.get("authority_receipt") == debt["authority_receipt"])
+    # T18-12 (continuation): reviewer succession — reviews spawn dreamers
+    import continuation as cont
+    p1 = cont.build_packet(rv9.path.parent, rv9.review_id, work_area="-test-area",
+                           route_preference="opencode-free",
+                           notes="succession drill")
+    check("N1 packet from REVISE chain carries the reopened finding",
+          p1["outcome"] == "REVISE"
+          and any(i["id"] == "fA" and i["state"] == "open"
+                  for i in p1["open_items"])
+          and p1["packet_hash"], json.dumps(p1)[:160])
+    p2 = cont.build_packet(rv5.path.parent, rv5.review_id, work_area="-test-area")
+    debt_item = next((i for i in p2["open_items"] if i["id"] == "fW"), {})
+    check("N2 packet carries verified debt with tracking ref",
+          p2["outcome"] == "COMPLETE" and debt_item.get("state") == "deferred_accepted"
+          and debt_item.get("tracking_ref") == "ledger:T-99",
+          json.dumps(p2)[:160])
+    good9 = rv9.path.read_text()
+    rv9.path.write_text(good9.replace('"regressed again"', '"REGRESSED"'))
+    try:
+        cont.build_packet(rv9.path.parent, rv9.review_id, work_area="-test-area")
+        corrupt_ok = False
+    except ValueError:
+        corrupt_ok = True
+    rv9.path.write_text(good9)
+    check("N3 corrupt chain never yields a packet", corrupt_ok)
+    spool = temp_state() / "continuations"
+    cont.write_packet(p1, spool=spool)
+    seen = []
+    rep = cont.drain(spool, enqueue_fn=lambda r, w, pr: (seen.append((r, w, pr)) or (True, "queued")),
+                     allowed_routes=None)
+    check("N4 drain round-trip enqueues and processes",
+          rep["enqueued"] == 1 and rep["rejected"] == 0
+          and len(seen) == 1 and seen[0][1] == "-test-area",
+          json.dumps(rep)[:160])
+    check("N4b prompt carries finding, area, and route preference",
+          "fA" in seen[0][2] and "opencode-free" in seen[0][2]
+          and "-test-area" in seen[0][2], seen[0][2][:160])
+    drifted = dict(p1); drifted["work_area"] = "-tampered-area"
+    (spool / "pending").mkdir(parents=True, exist_ok=True)
+    (spool / "pending" / "drift.json").write_text(json.dumps(drifted))
+    rep2 = cont.drain(spool, enqueue_fn=lambda r, w, pr: (True, "queued"),
+                      allowed_routes=None)
+    check("N5 hash drift rejected, never enqueued",
+          rep2["rejected"] == 1 and rep2["enqueued"] == 0,
+          json.dumps(rep2)[:160])
+    other = dict(p1, work_area="-other")
+    other["packet_hash"] = cont._sha(cont._canonical(
+        {k: v for k, v in other.items() if k != "packet_hash"}))
+    cont.write_packet(other, spool=spool)
+    rep3 = cont.drain(spool, enqueue_fn=lambda r, w, pr: (True, "queued"),
+                      allowed_routes=set())
+    pend = list((spool / "pending").glob("*.json"))
+    check("N6 gate-suppressed packet stays pending",
+          rep3["suppressed"] == 1 and len(pend) == 1, json.dumps(rep3)[:160])
+    check("N7 validation refuses missing fields",
+          cont.validate_packet({"kind": "dreamer_spawn"})["ok"] is False)
+    try:
+        cont.build_packet(rv5.path.parent, "never-created", work_area="x")
+        unopened_ok = False
+    except ValueError:
+        unopened_ok = True
+    check("N8 unopened review refuses packets", unopened_ok)
+    # T18-13 (continuation v2): sol turn-22 closures
+    forged = {"kind": "dreamer_spawn", "v": 1, "work_area": "-evil",
+              "route_preference": None, "review_base": str(rv5.path.parent),
+              "review_id": "nonexistent", "review_head": "0" * 64,
+              "outcome": "COMPLETE", "open_items": [],
+              "completion_claim": "forged", "notes": "", "created_at": "x"}
+    forged["packet_hash"] = cont._sha(cont._canonical(
+        {k: v for k, v in forged.items() if k != "packet_hash"}))
+    sp2 = temp_state() / "cont-forged"
+    cont.write_packet(forged, spool=sp2)
+    repf = cont.drain(sp2, enqueue_fn=lambda r, w, pr: (True, "queued"),
+                      allowed_routes=None)
+    check("N9 forged packet (nonexistent review) rejected at drain",
+          repf["rejected"] == 1 and repf["enqueued"] == 0,
+          json.dumps(repf)[:160])
+    pstale = cont.build_packet(rv3.path.parent, rv3.review_id,
+                               work_area="-test-area")
+    rv3.stop_owner("stopped after packet built")
+    sp3 = temp_state() / "cont-stale"
+    cont.write_packet(pstale, spool=sp3)
+    reps = cont.drain(sp3, enqueue_fn=lambda r, w, pr: (True, "queued"),
+                      allowed_routes=None)
+    check("N10 stale packet after OWNER_STOPPED rejected",
+          reps["rejected"] == 1 and reps["enqueued"] == 0
+          and any("stale" in n or "terminal" in n for n in reps["notes"]),
+          json.dumps(reps)[:200])
+    sp4 = temp_state() / "cont-dup"
+    cont.write_packet(p1, spool=sp4)
+    cont.drain(sp4, enqueue_fn=lambda r, w, pr: (True, "queued"),
+               allowed_routes=None)
+    cont.write_packet(p1, spool=sp4)
+    repd = cont.drain(sp4, enqueue_fn=lambda r, w, pr: (True, "queued"),
+                      allowed_routes=None)
+    check("N11 rewritten processed packet dropped as duplicate",
+          repd["duplicates"] == 1 and repd["enqueued"] == 0,
+          json.dumps(repd)[:160])
+    badtyped = {"kind": "dreamer_spawn", "v": 1, "work_area": "-a",
+                "route_preference": ["codex"], "review_base": "b",
+                "review_id": "rid1", "review_head": "1" * 64,
+                "outcome": "REVISE", "open_items": [1],
+                "completion_claim": "", "notes": "", "created_at": "x"}
+    badtyped["packet_hash"] = cont._sha(cont._canonical(
+        {k: v for k, v in badtyped.items() if k != "packet_hash"}))
+    sp5 = temp_state() / "cont-starve"
+    (sp5 / "pending").mkdir(parents=True, exist_ok=True)
+    (sp5 / "pending" / "badtyped.json").write_text(json.dumps(badtyped))
+    cont.write_packet(p1, spool=sp5)
+    repm = cont.drain(sp5, enqueue_fn=lambda r, w, pr: (True, "queued"),
+                      allowed_routes=None)
+    check("N12 typed-malformed rejected without starving neighbors",
+          repm["rejected"] == 1 and repm["enqueued"] == 1,
+          json.dumps(repm)[:160])
+    sp6 = temp_state() / "cont-crash"
+    cont.write_packet(p1, spool=sp6)
+    def _boom(route, area, prompt):
+        raise RuntimeError("queue down")
+    repx = cont.drain(sp6, enqueue_fn=_boom, allowed_routes=None)
+    pend2 = list((sp6 / "pending").glob("*.json"))
+    check("N13 enqueue crash keeps packet pending, no escape",
+          repx["failed"] == 1 and len(pend2) == 1, json.dumps(repx)[:160])
+
+    # T18-14 (continuation v3): sol turn-23 closures
+    import fcntl as _fcntl
+    pstop = cont.build_packet(rv12.path.parent, rv12.review_id,
+                              work_area="-test-area")
+    sp7 = temp_state() / "cont-stoprace"
+    cont.write_packet(pstop, spool=sp7)
+    def _assert_lock_held(route, area, prompt):
+        lp = rv12.path.parent / f"{rv12.review_id}.jsonl.lock"
+        f = open(lp, "a+")
+        try:
+            _fcntl.flock(f, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+            _fcntl.flock(f, _fcntl.LOCK_UN)
+            return False, "lock NOT held during dispatch — serialization broken"
+        except OSError:
+            return True, "queued (review lock held — stop cannot interleave)"
+    rept = cont.drain(sp7, enqueue_fn=_assert_lock_held, allowed_routes=None)
+    check("N14 dispatch holds the review lock (owner-stop serialized)",
+          rept["enqueued"] == 1, json.dumps(rept)[:160])
+    sp8 = temp_state() / "cont-orphan"
+    cont.write_packet(p1, spool=sp8)
+    dead = [(sp8 / "pending").glob("*.json")][0].__iter__().__next__()
+    dead.rename(dead.with_name(dead.name + ".claim.999999999"))
+    rep_o = cont.drain(sp8, enqueue_fn=lambda r, w, pr: (True, "queued"),
+                       allowed_routes=None)
+    orphans = list((sp8 / "orphaned").glob("*claim*"))
+    check("N15 dead-claim reconciled loudly, never blind-retried",
+          len(orphans) == 1 and rep_o["enqueued"] == 0
+          and any("orphaned claim" in n for n in rep_o["notes"]),
+          json.dumps(rep_o)[:200])
+    import os as _os
+    cont.write_packet(p1, spool=sp8)
+    live = [(sp8 / "pending").glob("*.json")][0].__iter__().__next__()
+    live.rename(live.with_name(live.name + f".claim.{_os.getpid()}"))
+    rep_l = cont.drain(sp8, enqueue_fn=lambda r, w, pr: (True, "queued"),
+                       allowed_routes=None)
+    still = list((sp8 / "pending").glob("*claim*"))
+    check("N16 live-pid claim left alone",
+          len(still) == 1 and rep_l["enqueued"] == 0
+          and any("live claim" in n for n in rep_l["notes"]),
+          json.dumps(rep_l)[:160])
+
+    # T18-8 (N01): a valid receipt cannot be replayed after the head moves
+    rvr = mk_review()
+    snr1 = rvr.stage_snapshot(subject="replay-v1", completion_claim="done")
+    checksr = passing_checks(snr1)
+    edr = ed_ok(rvr, snr1, overall="accept", scope=crit, checks=checksr)
+    first = rvr.ingest_verdict(snapshot_digest=snr1["subject_digest"],
+                               editor=edr, findings=[], overall="accept",
+                               approval_scope=crit, checks_evidence=checksr)
+    check("T18-8 receipt valid at its own head", first["ok"])
+    replay = rvr.ingest_verdict(snapshot_digest=snr1["subject_digest"],
+                                editor=edr, findings=[], overall="accept",
+                                approval_scope=crit, checks_evidence=checksr)
+    check("T18-8b identical verdict replay after head move refused",
+          replay["ok"] is False
+          and "authenticated" in replay["faults"][0], json.dumps(replay)[:160])
+
+    # T18-9 (N04): suspension dominates the none tier
+    rvs = mk_review(tier="none")
+    snns = rvs.stage_snapshot(subject="suspended-subject",
+                              completion_claim="no-op reuse")
+    rcs = sr.exemption_receipt(
+        "rev-suspend-none", crit, snns["subject_digest"],
+        snns["subject_digest"], key=TKEY,
+        opened_context={"worker": {"session_uuid": "s", "harness": "zcode"},
+                        "tier": "none", "config_digest": None,
+                        "editor_binding": None},
+        snapshot_round=snns["round"])
+    rvs2 = sr.SessionReview.create(
+        worker={"session_uuid": "s", "harness": "zcode"},
+        acceptance_criteria=crit, tier="none", base=temp_state(),
+        review_id="rev-suspend-none", exemption_receipt=rcs,
+        provenance_verifier=t_prov, debt_verifier=t_debt,
+        exemption_verifier=t_exemp)
+    snns2 = rvs2.stage_snapshot(subject="suspended-subject",
+                                completion_claim="no-op reuse")
+    rvs2.suspend("quota wall")
+    ress = rvs2.resolve(current_subject_digest=snns2["subject_digest"])
+    check("T18-9 suspension dominates exemption",
+          ress["outcome"] == "SUSPENDED", json.dumps(ress)[:160])
+
+    # T18-10 (N09): restaging identical bytes cannot ride an older approval
+    rvq0 = mk_review()
+    snq0 = rvq0.stage_snapshot(subject="genuine", completion_claim="genuine")
+    checksq0 = passing_checks(snq0)
+    edq0 = ed_ok(rvq0, snq0, overall="accept", scope=crit, checks=checksq0)
+    rvq0.ingest_verdict(snapshot_digest=snq0["subject_digest"], editor=edq0,
+                        findings=[], overall="accept", approval_scope=crit,
+                        checks_evidence=checksq0)
+    resq0 = rvq0.resolve(current_subject_digest=snq0["subject_digest"])
+    check("T18-10 genuine approval completes", resq0["outcome"] == "COMPLETE")
+    rvq = mk_review()
+    snq1 = rvq.stage_snapshot(subject="same-bytes", completion_claim="claim-v1")
+    checksq = passing_checks(snq1)
+    edq = ed_ok(rvq, snq1, overall="accept", scope=crit, checks=checksq)
+    rvq.ingest_verdict(snapshot_digest=snq1["subject_digest"], editor=edq,
+                       findings=[], overall="accept", approval_scope=crit,
+                       checks_evidence=checksq)
+    rvq.stage_snapshot(subject="same-bytes", completion_claim="claim-v2-changed")
+    resq2 = rvq.resolve(current_subject_digest=snq1["subject_digest"])
+    check("T18-10b restage after approval -> REVISE",
+          resq2["outcome"] == "REVISE"
+          and any("not been reviewed" in r for r in resq2["reasons"]),
+          json.dumps(resq2)[:200])
+    snq2 = rvq.snapshots()[-1]
+    checksq2 = passing_checks(snq2)
+    edq2 = ed_ok(rvq, snq2, overall="accept", scope=crit, checks=checksq2)
+    rvq.ingest_verdict(snapshot_digest=snq2["subject_digest"], editor=edq2,
+                       findings=[], overall="accept", approval_scope=crit,
+                       checks_evidence=checksq2)
+    resq3 = rvq.resolve(current_subject_digest=snq2["subject_digest"])
+    check("T18-10c fresh verdict on the new round completes",
+          resq3["outcome"] == "COMPLETE", json.dumps(resq3)[:160])
+
+    # T18-11 (N10): debt rows retain the authority receipt for re-verification
+    check("T18-11 debt row retains authority_receipt",
+          ok_debt.get("authority_receipt") == debt["authority_receipt"])
 
     # T18-8 (N01): a valid receipt cannot be replayed after the head moves
     rvr = mk_review()
