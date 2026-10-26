@@ -58,6 +58,9 @@ VERBS:
                                    harness's shape and store it — seeds profiles
                                    without a browser login
   fetch   <host> <slug> [--harness H] [--activate]
+  give    <host> <slug> [--harness H] [--dest P]
+                                   export a stored profile VERBATIM to a consumer
+                                   host (llmproxy et al pick it up in-container)
                                    copy a profile from another fleet host's store
                                    over ssh (owner-authorized use; the record is
                                    pulled, never pushed) and optionally activate it.
@@ -155,6 +158,16 @@ def harness_auth_file(harness):
     if harness == "claude":
         home = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
         return os.path.join(home, ".credentials.json")
+    if harness == "zcode":
+        # 2.0.0 (owner 2026-10-25): the portable zcode auth is the PLAINTEXT
+        # provider_config.json — the enc:v1 credentials.json values are
+        # safeStorage-bound to the host keyring and cannot decrypt elsewhere
+        # (the retired zcode-tui startup sync shipped exactly this file).
+        override = os.environ.get("ZCODE_AUTH_FILE")
+        return override or os.path.join(os.path.expanduser("~"), ".zcode", "v2", "provider_config.json")
+    if harness == "autoclaw":
+        override = os.environ.get("AUTOCLAW_PLAN_FILE")
+        return override or os.path.join(os.path.expanduser("~"), ".config", "zcode-tui", "autoclaw-plan.json")
     raise KeyError(harness)
 
 
@@ -168,6 +181,23 @@ HARNESSES = {
         "auth_file": harness_auth_file,
         "login": None,
         "live_note": "swap supported; login flow not implemented (add when the need lands)",
+    },
+    # Plan harnesses (zcode-tui 2.0.0): the official apps are the SSOTs and
+    # login is a per-host, owner-performed step inside them; ygg-auth
+    # replicates the resulting portable auth records with lineage.
+    "zcode": {
+        "auth_file": harness_auth_file,
+        "login": None,
+        "live_note": "plaintext provider_config.json (the zai-api key that authenticates turns); "
+                     "credentials.json is host-keyring-bound and is NOT replicated — per-host "
+                     "desktop sign-in mints it; the coding-plan api key is picked up by consumers (llmproxy's internal seeder)",
+    },
+    "autoclaw": {
+        "auth_file": harness_auth_file,
+        "login": None,
+        "live_note": "the mined AutoClaw plan (identity+credential, host-agnostic — the "
+                     "agent-refresh pair answers from any machine); mined by "
+                     "`zcode-tui autoclaw setup` where the official app is signed in",
     },
 }
 
@@ -199,8 +229,10 @@ def decode_jwt_claims(token):
         return {}
 
 
-def identity_of(record):
+def identity_of(record, harness="codex"):
     """Claims only — this dict is what every verb is allowed to print."""
+    if harness in ("zcode", "autoclaw"):
+        return _plan_identity(record, harness)
     tokens = record.get("tokens") if isinstance(record.get("tokens"), dict) else record
     id_token = tokens.get("id_token") or ""
     access_token = tokens.get("access_token") or ""
@@ -225,6 +257,67 @@ def identity_of(record):
         "plan": plan or "unknown",
         "account_id": account_id or "none",
         "expires_at": expires_at,
+        "expired": expired,
+    }
+
+
+def _zcode_account_uuid(record):
+    """The zai account UUID, when the host also carries the (host-bound)
+    credentials.json — its account-provider key names carry it. Identity
+    hint only; the replicated record itself is provider_config.json."""
+    cred = os.path.join(os.path.dirname(HARNESSES["zcode"]["auth_file"]("zcode")), "credentials.json")
+    try:
+        doc = json.loads(open(cred, encoding="utf-8").read())
+    except (OSError, ValueError):
+        return None
+    for k in doc:
+        if k.startswith("account-provider:coding-plan:"):
+            parts = k.split(":")
+            if len(parts) >= 6:
+                return parts[5]
+    return None
+
+
+def _plan_identity(record, harness):
+    """Identity for the plan-harness records — claims/fingerprints only."""
+    if harness == "zcode":
+        # provider_config.json: the zai-api key is the identity-bearing part;
+        # never print it. Account UUID when the sibling credentials exist.
+        key = None
+        try:
+            for rule in (record.get("config", {}).get("providerConfigRules", {}).get("providerRules") or []):
+                access = rule.get("config", {}).get("access") or {}
+                if access.get("type") == "api-key" and access.get("apiKey"):
+                    key = access["apiKey"]
+                    break
+        except AttributeError:
+            key = None
+        uuid = _zcode_account_uuid(record)
+        return {
+            "slug": f"zai-{uuid[:8]}" if uuid else None,
+            "email": "unknown",
+            "plan": "zai-coding-plan",
+            "account_id": uuid or "none",
+            "key_fingerprint": hashlib.sha256(key.encode()).hexdigest()[:12] if key else None,
+            "expires_at": None,
+            "expired": False,
+        }
+    # autoclaw: the mined plan; the agentaccess JWT carries user_id + jti
+    # (the account email) + exp — measured live 2026-10-25.
+    auth = record.get("auth") or {}
+    claims = decode_jwt_claims(auth.get("accessToken") or "")
+    email = claims.get("jti") if "@" in str(claims.get("jti") or "") else None
+    exp = claims.get("exp") or 0
+    try:
+        expired = bool(exp) and time.time() > float(exp)
+    except (TypeError, ValueError):
+        expired = False
+    return {
+        "slug": slug_for(email) if email else (f"autoclaw-{claims.get('user_id')}" if claims.get("user_id") else None),
+        "email": email or "unknown",
+        "plan": "autoclaw-credits",
+        "account_id": str(claims.get("user_id") or "none"),
+        "expires_at": exp or None,
         "expired": expired,
     }
 
@@ -423,7 +516,7 @@ def live_record(harness, required=False):
 def capture(harness, name=None, lock_held=False):
     """Snapshot the live record verbatim into the store. Returns (slug, path)."""
     record = live_record(harness, required=True)
-    ident = identity_of(record)
+    ident = identity_of(record, harness)
     if not ident["slug"] and not name:
         raise AuthError(3, "live record carries no usable identity; pass --name to store it anyway")
     slug = name or ident["slug"]
@@ -456,7 +549,7 @@ def stored_profiles(harness):
             record = read_json(path)
         except (OSError, ValueError):
             continue
-        ident = identity_of(record)
+        ident = identity_of(record, harness)
         ident.update({"path": path, "filename": fname})
         profiles.append(ident)
     return profiles
@@ -483,6 +576,7 @@ def switch(harness, slug, lock_held=False):
         raise AuthError(6, f"no stored profile {slug!r} for {harness}; stored: {known}")
     live_path = HARNESSES[harness]["auth_file"](harness)
     target_record = read_json(target)
+    # (identity calls below are harness-scoped)
 
     captured = None
     if os.path.exists(live_path):
@@ -490,7 +584,7 @@ def switch(harness, slug, lock_held=False):
         for _ in range(3):
             before = _live_fingerprint(live_path)
             current = live_record(harness, required=True)
-            current_ident = identity_of(current)
+            current_ident = identity_of(current, harness)
             if current_ident["slug"] and current_ident["slug"] != slug:
                 captured = _capture_locked(harness, current, current_ident["slug"],
                                            os.path.join(store_dir(harness), f"{current_ident['slug']}.json"),
@@ -505,7 +599,7 @@ def switch(harness, slug, lock_held=False):
     else:
         atomic_write_json(live_path, target_record)
 
-    swapped = identity_of(live_record(harness, required=True))
+    swapped = identity_of(live_record(harness, required=True), harness)
     if swapped["slug"] and swapped["slug"] != slug:
         raise AuthError(5, f"post-switch verification failed: live file reports {swapped['slug']!r}")
     return {"switched_to": slug, "identity": swapped, "captured_before_leaving": captured}
@@ -593,9 +687,19 @@ def pick_rotate_target(harness, measure=True):
     return min(pool, key=lambda p: (cooldown_left(p), p["slug"])), False
 
 
+
+def require_token_harness(harness, verb):
+    """Plan harnesses (zcode-tui 2.0.0) have no OAuth refresh/redemption of
+    their own here: their credentials refresh inside the official apps and
+    replicate via capture/fetch. These verbs stay codex/claude-only."""
+    if harness in ("zcode", "autoclaw"):
+        raise AuthError(6, f"`{verb}` does not apply to plan harnesses — {harness} auth "
+                           f"refreshes inside its own app and replicates with "
+                           f"capture / fetch --activate / fleet / doctor")
+
 def cmd_status(args):
     harness = require_harness(args.harness)
-    ident = identity_of(live_record(harness)) if os.path.exists(HARNESSES[harness]["auth_file"](harness)) else None
+    ident = identity_of(live_record(harness), harness) if os.path.exists(HARNESSES[harness]["auth_file"](harness)) else None
     profiles = stored_profiles(harness)
     prov = load_provenance(harness)
     for p in profiles:
@@ -658,6 +762,8 @@ def cmd_switch(args):
 
 
 def cmd_rotate(args):
+    require_token_harness(require_harness(args.harness), "rotate")
+
     harness = require_harness(args.harness)
     with fleet_lock():
         target, _ = pick_rotate_target(harness, measure=not args.fast)
@@ -807,7 +913,7 @@ def device_login(harness, name=None, notify=True):
         captured = None
         if os.path.exists(live_path):
             current = live_record(harness, required=True)
-            current_ident = identity_of(current)
+            current_ident = identity_of(current, harness)
             if current_ident["slug"] and current_ident["slug"] != slug:
                 captured = _capture_locked(harness, current, current_ident["slug"],
                                            os.path.join(store_dir(harness), f"{current_ident['slug']}.json"),
@@ -818,6 +924,8 @@ def device_login(harness, name=None, notify=True):
 
 
 def cmd_login(args):
+    require_token_harness(require_harness(args.harness), "login")
+
     return device_login(require_harness(args.harness), name=args.name,
                         notify=not args.no_notify)
 
@@ -862,6 +970,8 @@ def import_foreign(path, harness, name=None, writer=None):
 
 
 def cmd_import(args):
+    require_token_harness(require_harness(args.harness), "import")
+
     if not args.file:
         raise AuthError(6, "import needs the path to the foreign auth record")
     return import_foreign(args.file, require_harness(args.harness), name=args.name)
@@ -904,7 +1014,7 @@ def fetch_remote(host, harness, slug, activate=False):
         raise AuthError(5, f"could not read {slug} from {host}: {last_err}")
     remember_ssh_dest(used_dest)
 
-    ident = identity_of(record)
+    ident = identity_of(record, harness)
     if ident["slug"] and ident["slug"] != slug:
         raise AuthError(6, f"record at {used_dest}:{remote_path} identifies as {ident['slug']!r}, not {slug!r}")
 
@@ -1047,6 +1157,8 @@ def cmd_assign(args):
 
 
 def cmd_redeem(args):
+    require_token_harness(require_harness(args.harness), "redeem")
+
     """Redeem the account's banked rate-limit-reset credit (fresh weekly + 5h).
     The same action as llmproxy's web "use reset" button — explicit call only."""
     harness = require_harness(args.harness)
@@ -1085,6 +1197,8 @@ def cmd_redeem(args):
 
 
 def cmd_usage(args):
+    require_token_harness(require_harness(args.harness), "usage")
+
     harness = require_harness(args.harness)
     profiles = stored_profiles(harness)
     targets = []
@@ -1373,7 +1487,41 @@ def cmd_litellm_switch(args):
     return {"litellm_switched": slug, "healthy": healthy, "note": "litellm owns this lineage now; re-adopt after its refreshes"}
 
 
+
+
+def cmd_give(args):
+    """Export a stored profile VERBATIM to an authorized consumer host over
+    ssh (owner 2026-10-25: llmproxy is INTERNAL — yggterm carries no llmproxy
+    config knowledge; ygg-auth hands the auth to `ssh llmproxy`, and the
+    llmproxy project picks it up inside its own container). The copy lands at
+    <host>:~/.yggterm/auth-given/<harness>/<slug>.json (0600) unless --dest;
+    provenance records the give. The consumer owns what happens next."""
+    harness = require_harness(args.harness)
+    if not args.host or not args.slug:
+        raise AuthError(6, "give needs <host> <slug>")
+    slug = slug_for(args.slug)
+    store_file = os.path.join(store_dir(harness), f"{slug}.json")
+    if not os.path.exists(store_file):
+        raise AuthError(6, f"no stored profile {slug!r} for {harness}")
+    record = read_json(store_file)
+    dest = args.dest or f"~/.yggterm/auth-given/{harness}/{slug}.json"
+    payload = (json.dumps(record, indent=2) + "\n").encode()
+    cmd = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", args.host,
+           f"mkdir -p ~/.yggterm/auth-given/{harness} && "
+           f"chmod 700 ~/.yggterm/auth-given ~/.yggterm/auth-given/{harness} 2>/dev/null; "
+           f"cat > {dest}.tmp && chmod 600 {dest}.tmp && mv {dest}.tmp {dest}"]
+    proc = subprocess.run(cmd, input=payload, capture_output=True, timeout=30)
+    if proc.returncode != 0:
+        raise AuthError(5, f"give to {args.host} failed: {proc.stderr.decode('utf-8', 'replace').strip()[:160]}")
+    stamp_provenance(harness, slug, record=record, writer=HOSTNAME, source="give",
+                     given_to=args.host, writer_updated_at=time.time())
+    return {"gave": slug, "harness": harness, "to": args.host, "dest": dest}
+
+
 def cmd_refresh(args):
+
+    require_token_harness(require_harness(args.harness), "refresh")
+
     harness = require_harness(args.harness)
     live_path = HARNESSES[harness]["auth_file"](harness)
     with fleet_lock():
@@ -1528,6 +1676,14 @@ def main(argv=None):
     p.add_argument("--activate", action="store_true", help="also switch the live account to it")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_fetch)
+
+    p = sub.add_parser("give", parents=[sub_parent],
+                       help="export a stored profile verbatim to a consumer host (llmproxy et al)")
+    p.add_argument("host", help="ssh destination that may consume the auth")
+    p.add_argument("slug", help="profile slug")
+    p.add_argument("--dest", default=None, help="remote path (default ~/.yggterm/auth-given/<harness>/<slug>.json)")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_give)
 
     p = sub.add_parser("usage", parents=[sub_parent], help="measured rate-limit state per profile")
     p.add_argument("--slug", help="one profile instead of all")
