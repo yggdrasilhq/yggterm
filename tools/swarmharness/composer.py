@@ -74,7 +74,7 @@ def _sha(data):
 
 
 _TRANSPORT_TOKEN = re.compile(
-    r"\b(ts|id|call|session|request_id|req_id|timestamp|trace|span|uid)"
+    r"\b(ts|id|call_id|call|session|request_id|req_id|timestamp|trace|span|uid)"
     r"\"?\s*[:=]\s*\"?\S*\"?", re.I)
 _BRACKET = re.compile(r"\[([^\]]*)\]")
 
@@ -351,14 +351,15 @@ def census(sources, cutoff=None, state_dir=None):
 # ------------------------------------------------------------ read
 
 def read_page(path, cursor=0, max_bytes=262144):
-    """Bounded page of COMPLETE lines. Internally reads until the buffer
-    ends with a newline, EOF, or the oversized-event bound — a trailing
-    partial line is never emitted half-baked (detection correctness), and
-    the cursor only ever advances over EMITTED bytes (progress guaranteed,
-    sol t28 V3-N1). Returns (text, next_cursor, done)."""
+    """Bounded page of COMPLETE lines. Bytes are buffered RAW and decoded
+    once per emitted block — a multibyte UTF-8 char split across a chunk
+    boundary is never half-decoded (t30 residue), and cursor arithmetic is
+    byte-exact (a decoded-text round-trip drifts when replacement chars
+    change byte lengths). The cursor only ever advances over EMITTED bytes
+    (progress guaranteed, sol t28 V3-N1). Returns (text, next_cursor, done)."""
     p = Path(path)
     size = p.stat().st_size
-    buf = ""
+    raw = bytearray()
     pos = cursor
     with p.open("rb") as f:
         f.seek(pos)
@@ -367,24 +368,22 @@ def read_page(path, cursor=0, max_bytes=262144):
             if not chunk:
                 done = True  # EOF: emit whatever remains as final lines
                 break
-            buf += chunk.decode("utf-8", errors="replace")
+            raw += chunk
             pos += len(chunk)
-            if buf.endswith("\n") or "\n" in buf:
+            if b"\n" in raw:
                 done = pos >= size
                 break
-            if len(buf) > _MAX_CARRY:
+            if len(raw) > _MAX_CARRY:
                 marker = f"<<oversized-event dropped at bytes@{cursor}>>\n"
                 return marker, pos, False
-    nl = buf.rfind("\n")
+    nl = raw.rfind(b"\n")
     if nl >= 0:
-        text = buf[:nl + 1]
+        text = raw[:nl + 1].decode("utf-8", errors="replace")
         # un-emitted trailing partial line stays unread: cursor rewinds to
         # the start of that partial line so the next pass re-reads it whole
-        next_cursor = cursor + len(text.encode("utf-8", errors="replace"))
+        next_cursor = cursor + nl + 1  # byte-exact past the emitted lines
         return text, min(next_cursor, size), done
-    text = buf
-    next_cursor = pos
-    return text, next_cursor, done
+    return raw.decode("utf-8", errors="replace"), pos, done
 
 
 # ------------------------------------------------------------ store
@@ -504,18 +503,32 @@ def _load_cursors(state):
             continue
         cl = v.get("carry_len", 0)
         fps = v.get("cmd_fps", {})
-        rfps = v.get("recent_fps", [])
+        pfps = v.get("pending_fps", [])
         if (not isinstance(cl, int) or isinstance(cl, bool) or cl < 0
                 or not isinstance(fps, dict) or any(
                 not isinstance(fp, str) or not isinstance(n, int)
                 for fp, n in fps.items())
-                or not isinstance(rfps, list) or any(
-                not isinstance(fp, str) for fp in rfps)):
+                or not isinstance(pfps, list) or any(
+                not isinstance(fp, str) for fp in pfps)):
             notes.append(f"cursor entry {k[:40]}: invalid detector state — "
                          "reset")
             continue
-        clean[k] = v
+        # rebuilt with ONLY known keys: legacy/stale shapes (recent_fps,
+        # carry, ...) can never ride along into live cursor state (t30)
+        clean[k] = {"cursor": c, "generation": v["generation"],
+                    "carry_len": cl, "cmd_fps": fps, "pending_fps": pfps}
     return clean, notes
+
+
+def _page_state(cstate, fresh):
+    """Detector state for one source's pages. Any reset (out-of-bounds
+    cursor, generation change) reads FRESH — stale counters or adjacency
+    fingerprints from old content would manufacture loops or fake
+    cross-page pairs (t26 N4; the v5 tick reset was clobbered by the
+    unconditional cstate reload — caught in t30)."""
+    if fresh:
+        return {}, []
+    return dict(cstate.get("cmd_fps", {})), list(cstate.get("pending_fps", []))
 
 
 # ------------------------------------------------------------ patterns
@@ -714,24 +727,21 @@ def tick(sources, state_dir=None, max_bytes_per_source=262144,
         size = p.stat().st_size
         cstate = cursors.get(entry["path"], {})
         cur = cstate.get("cursor", 0)
-        carry = cstate.get("carry", "")
+        fresh = False
         if not isinstance(cur, int) or cur < 0 or cur > size:
             if cur:
                 report["notes"].append(
                     f"cursor out of bounds on {entry['path']}: reset "
                     "(replay dedupes)")
-            cur, carry = 0, ""
+            cur, fresh = 0, True
         if cstate.get("generation") not in (None, entry["generation"]):
             report["notes"].append(
                 f"source generation changed: {entry['path']} — reprocessing "
                 "with FRESH detector state")
-            cur, carry = 0, ""
-            cmd_fps = {}  # stale counters would manufacture loops (t26 N4)
-            recent_fps = []
+            cur, fresh = 0, True
         gen = entry["generation"]
         lineage = entry["lineage_id"]
-        cmd_fps = dict(cstate.get("cmd_fps", {}))
-        pending_fps = list(cstate.get("pending_fps", []))
+        cmd_fps, pending_fps = _page_state(cstate, fresh)
         while pages < max_pages and cur < size:
             text, nxt, done = read_page(p, cur, max_bytes_per_source)
             if not text:

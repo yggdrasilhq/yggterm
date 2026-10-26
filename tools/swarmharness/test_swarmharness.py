@@ -1802,6 +1802,60 @@ def main():
           all(isinstance(s, str) for p in pats_x for s in p["strata"])
           and all(p["strata"] for p in pats_x))
 
+    # =====================================================================
+    # T30 residue closure — sol turn-29 named faults + the fresh-state
+    # clobber found in the t30 pass. Fresh checks only (the t26/t27 saved
+    # probe sets are stale-API artifacts, discarded per the packet).
+    # =====================================================================
+
+    # T30-1 read_page: multibyte UTF-8 intact across per-byte chunking;
+    # cursor arithmetic byte-exact
+    utf = fx / "utf8.txt"
+    utf.write_bytes("héllo wörld ✓ end\n".encode("utf-8"))
+    asm, curu, doneu, guard = "", 0, False, 0
+    while not doneu and guard < 200:
+        t, curu, doneu = cp.read_page(utf, curu, 1)
+        asm += t
+        guard += 1
+    check("T30-1 multibyte chars intact across 1-byte pages; cursor exact",
+          asm == "héllo wörld ✓ end\n" and "\ufffd" not in asm
+          and doneu and curu == utf.stat().st_size, repr(asm)[:120])
+    trunc = fx / "trunc.txt"
+    trunc.write_bytes("ok é".encode("utf-8")[:4])
+    tt, curt, donet = cp.read_page(trunc, 0, 64)
+    check("T30-1b truncated trailing char -> replacement, no stall",
+          donet and curt == 4 and "\ufffd" in tt, repr(tt))
+
+    # T30-2 cursors: pending_fps validated; legacy keys dropped on load
+    st30 = temp_state() / "composer-t30"
+    st30.mkdir(parents=True, exist_ok=True)
+    (st30 / "cursors.json").write_text(json.dumps({
+        "a.out": {"cursor": 5, "generation": "sz1", "carry_len": 0,
+                  "cmd_fps": {"x": 1}, "pending_fps": ["fp1"],
+                  "recent_fps": ["legacy"], "carry": "junk"},
+        "b.out": {"cursor": 3, "generation": "sz2", "carry_len": 0,
+                  "cmd_fps": {"y": 1}, "pending_fps": [7]},
+        "c.out": {"cursor": True, "generation": "sz3"}}))
+    clean30, notes30 = cp._load_cursors(st30)
+    check("T30-2 pending_fps validated; legacy keys dropped on load",
+          set(clean30) == {"a.out"} and "recent_fps" not in clean30["a.out"]
+          and "carry" not in clean30["a.out"]
+          and clean30["a.out"]["pending_fps"] == ["fp1"]
+          and len(notes30) == 2,
+          json.dumps([sorted(clean30), notes30])[:200])
+
+    # T30-3 fresh detector state on reset (the v5 tick clobber bug)
+    cs30 = {"cmd_fps": {"x": 9}, "pending_fps": ["old-fp"]}
+    check("T30-3 reset picks FRESH detector state; continuing reloads",
+          cp._page_state(cs30, True) == ({}, [])
+          and cp._page_state(cs30, False) == ({"x": 9}, ["old-fp"]))
+
+    # T30-4 call_id transport tokens collapse (same fault, different ids)
+    n1 = cp._normalize('"call_id": "chatcmpl-abc123"')
+    n2 = cp._normalize('"call_id": "chatcmpl-xyz789"')
+    check("T30-4 call_id tokens collapse to one fingerprint",
+          n1 == n2 and "[M]" in n1, f"{n1!r} vs {n2!r}")
+
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
     if FAIL:
         print("FAILED:", *FAIL, sep="\n  - ")
