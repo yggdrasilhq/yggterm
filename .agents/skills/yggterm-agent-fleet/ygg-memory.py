@@ -1967,7 +1967,10 @@ def _ji_refresh(root: Path, conn) -> None:
                 if not trailing:
                     last_line = blob[i - len(line) - 1 : i]  # line + its newline
     conn.execute("BEGIN IMMEDIATE")
-    conn.execute("DELETE FROM entries WHERE gen != ?", (gen,))
+    if gen != old_gen:
+        # only rebuilds can leave foreign-generation rows behind; the append
+        # path must not pay a full-table DELETE scan on every refresh
+        conn.execute("DELETE FROM entries WHERE gen != ?", (gen,))
     if rows:
         conn.executemany(
             "INSERT OR REPLACE INTO entries (gen, off, seq, ns, file, digest, payload)"
