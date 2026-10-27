@@ -20,6 +20,7 @@ deps instead). Run from any host: the hub door is local everywhere.
 """
 import argparse
 import datetime
+import hashlib
 import json
 import os
 import re
@@ -27,6 +28,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
+
+from booking_outbox import write_intent, update_intent, read_intents, default_path
 
 LEDGER = os.path.expanduser(
     "~/.yggterm/memory/namespaces/_global/fleet-task-ledger.md")
@@ -471,6 +474,8 @@ def main():
                     help="book a task done: rewrites the ledger door via "
                          "ygg-memory publish (hub doors are never edited "
                          "in place) + adds the §BOOK one-liner")
+    ap.add_argument("--from-outbox", action="store_true",
+                    help="guarded replay: do not recursively create an intent")
     ap.add_argument("--claim", metavar="TASK_ID",
                     help="book a claim (id-keyed, fail-closed on owned/"
                          "mid-grind statuses): rewrites the ledger door via "
@@ -490,12 +495,18 @@ def main():
     if a.selftest:
         return selftest()
 
-    def publish_ledger(new_text, ok_line):
+    publication_receipt = None
+
+    def publish_ledger(new_text, ok_line, base_text):
         """Publish via the ygg-memory runner. The PATH may carry a bash
         wrapper (ygg-memory, no .py — measured 2026-10-17: running it under
         sys.executable is a SyntaxError) — prefer the .py and exec wrappers
         directly. The ok_line prints ONLY on success: a booking that did not
-        publish is a failure, never a confirmation."""
+        publish is a failure, never a confirmation. base_text is the exact
+        pre-transformation door bytes: the publisher refuses (CAS, C2) when
+        the live door no longer matches, so a stale snapshot can never
+        silently erase a concurrent change."""
+        nonlocal publication_receipt
         tmp = tempfile.NamedTemporaryFile("w", suffix=".md", delete=False,
                                           encoding="utf-8")
         tmp.write(new_text)
@@ -506,14 +517,32 @@ def main():
             prefix = [sys.executable] if runner.endswith(".py") else []
             r = subprocess.run(prefix + [runner, "publish", "--file", tmp.name,
                                          "--ns=_global", "--as",
-                                         "fleet-task-ledger.md"],
+                                         "fleet-task-ledger.md",
+                                         "--expected-digest",
+                                         hashlib.sha256(base_text.encode("utf-8")).hexdigest(),
+                                         "--json"],
                                capture_output=True, text=True, timeout=120)
+        except Exception as e:
+            print(f"ledger publish FAILED ({type(e).__name__}) — the booking did NOT land")
+            return 1
         finally:
             os.unlink(tmp.name)
         print(r.stdout.strip() or r.stderr.strip())
         if r.returncode != 0:
             print("ledger publish FAILED — the booking did NOT land")
-            return r.returncode
+            return r.returncode or 1
+        try:
+            report = json.loads(r.stdout)
+            record = report["record"]
+            if (report.get("status") != "ok" or record.get("ns") != "_global"
+                    or record.get("file") != "fleet-task-ledger.md"
+                    or record.get("digest") != hashlib.sha256(new_text.encode()).hexdigest()
+                    or not record.get("event_id")):
+                raise ValueError("publication identity mismatch")
+            publication_receipt = "ygg-memory:event:" + record["event_id"]
+        except (ValueError, KeyError, TypeError):
+            print("ledger publish UNCERTAIN — no matching positive publication receipt")
+            return 1
         print(ok_line)
         return 0
 
@@ -525,29 +554,83 @@ def main():
             print(new)
             return 0
         return publish_ledger(
-            new, f"booked {a.claim} claimed({a.by}) — the task is taken; execution in flight")
+            new, f"booked {a.claim} claimed({a.by}) — the task is taken; execution in flight",
+            base_text=text)
     if a.done:
         if not a.proof:
             print("--done needs --proof \"<ref>\"")
             return 2
-        text = open(a.ledger, encoding="utf-8").read()
-        new = mark_done(text, a.done, a.proof, a.by, a.day)
-        if a.dry_run:
-            print(new)
-            return 0
-        return publish_ledger(
-            new,
-            f"booked {a.done} done({a.proof}) [by {a.by}] — §BOOK line added; "
-            "if the day's batch is exhausted, refresh §TODAY with a fresh plan run")
+        intent = None
+        # Retain BEFORE entering the contested publication path. Dry-run is pure.
+        if not a.dry_run and not a.from_outbox:
+            intent = write_intent(a.done, a.proof, a.by, ledger=a.ledger, day=a.day)
+        try:
+            text = open(a.ledger, encoding="utf-8").read()
+            try:
+                new = mark_done(text, a.done, a.proof, a.by, a.day)
+            except SystemExit:
+                # Crash after publish but before outbox acknowledgement: only
+                # exact task/proof/by + BOOK readback can establish idempotence.
+                matching = next((t for t in parse_ledger(text) if t["id"] == a.done), None)
+                book = f"{a.done} done({a.proof}) [by {a.by}]"
+                if not (a.from_outbox and matching and
+                        matching.get("status", "").startswith(f"done({a.proof}) [by {a.by},")
+                        and book in text.split("## §BOOK", 1)[-1]):
+                    raise
+                new = text
+            if a.dry_run:
+                print(new)
+                return 0
+            # Even replay of an already-booked subject uses the publisher;
+            # an unsynchronized local door alone cannot mint a receipt.
+            rc = publish_ledger(new, f"booked {a.done} done({a.proof}) [by {a.by}] — §BOOK line added", base_text=text)
+        except (Exception, SystemExit) as e:
+            print(f"booking FAILED ({type(e).__name__})")
+            rc = 1
+        if rc:
+            if intent:
+                print(f"booking RETAINED in the outbox: {intent['intent_id']}")
+            else:
+                print("booking replay pending — retained in the outbox")
+            return rc
+        receipt = publication_receipt
+        print("BOOKING_RECEIPT " + json.dumps({"task": a.done, "proof": a.proof,
+              "by": a.by, "receipt_ref": receipt}))
+        if intent:
+            update_intent(default_path(), intent["intent_id"], state="done",
+                          receipt_ref=receipt, next_attempt_at=None)
+        return 0
     if not os.path.exists(a.ledger):
         print(json.dumps({"error": f"ledger not found: {a.ledger}"}))
         return 2
-    p = plan(parse_ledger(open(a.ledger, encoding="utf-8").read()))
+    # Terminal-intent hold (C3): a durable pending/done completion intent
+    # means the work is performed or its booking is in flight — it is never
+    # executable supply, in any projection (queue AND §BATCH), even when a
+    # stale ledger row still says open. An unreadable outbox holds planning.
+    tasks = parse_ledger(open(a.ledger, encoding="utf-8").read())
+    try:
+        intents = read_intents(default_path())
+        terminal = set()
+        for row in intents:
+            if (not isinstance(row, dict) or row.get("state") not in ("pending", "done")
+                    or not isinstance(row.get("task"), str)):
+                raise ValueError("invalid terminal intent")
+            terminal.add(row["task"])
+    except Exception:
+        print(json.dumps({"error": "terminal intent source unavailable; planning held"}))
+        return 1
+    held = [t for t in tasks if t["id"] in terminal]
+    p = plan([t for t in tasks if t["id"] not in terminal])
+    p["booking_held"] = [{"id": t["id"], "title": t["title"]} for t in held]
     p["day"] = a.day
     if a.json:
         print(json.dumps(p, indent=1))
         return 0
     print(f"# fleet task plan — {a.day}")
+    if held:
+        print("\n## Booking held — terminal work is not executable supply")
+        for task in held:
+            print(f"- {task['id']}: retained completion intent")
     print(f"\n## GLM idle batch (1 big + 2 moderate — the 3/day allowance)")
     for t in p["glm_idle_batch"]["tasks"]:
         print(f"  {t['id']} [{t['size']}] (score {t['score']}) {t['title']}")

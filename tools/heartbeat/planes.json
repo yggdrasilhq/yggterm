@@ -1,0 +1,42 @@
+{
+  "planes": [
+    {
+      "id": "start-plan-grant",
+      "reader": {"cmd": ["zcode-tui", "plans", "--json"], "host": "dev", "timeout_s": 10, "parse": null},
+      "host_class": "server",
+      "notes": "Independent start-plan entitlements, including Flash-only grants. Missing remaining is null, verified-metadata. Full-model eligibility is not grant availability."
+    },
+    {
+      "id": "coding-plan",
+      "reader": {"cmd": ["zcode-tui", "usage", "--json"], "host": "dev", "timeout_s": 10, "parse": "quota"},
+      "host_class": "server",
+      "notes": "Existing coding-plan window reader. Values retain the reader's scope; no cross-product sum or entitlement inference."
+    },
+    {
+      "id": "autoclaw-wallet",
+      "reader": {"cmd": ["zcode-tui", "usage", "--json"], "host": "dev", "timeout_s": 10, "parse": "autoclaw"},
+      "host_class": "server",
+      "notes": "Existing wallet read, shared usage invocation. Balance has no verified expiry lots. No credentials handled here."
+    },
+    {
+      "id": "idle-allowance",
+      "reader": {"cmd": ["zcode-tui", "idle", "quota", "--json"], "host": "dev", "timeout_s": 10, "parse": null},
+      "host_class": "server",
+      "notes": "Availability only. Does not create/adopt/execute tickets or add policy slots."
+    },
+    {
+      "id": "free-tier",
+      "reader": {"cmd": ["zcode-tui", "queue", "status", "--json"], "host": "dev", "timeout_s": 5, "parse": "routes.opencode-free"},
+      "host_class": "server",
+      "notes": "Route health only: no authoritative free quota verb exists in the current client. Remaining stays null and quality unavailable; available route is not available funding."
+    }
+  ],
+  "watchers": [],
+  "ledger_path": "~/.yggterm/memory/namespaces/_global/fleet-task-ledger.md",
+  "outbox_path": "~/.yggterm/swarm/booking-outbox/intents.jsonl",
+  "queue_reader": {"cmd": ["zcode-tui", "queue", "status", "--json"], "host": "dev", "timeout_s": 5, "parse": null},
+  "expiry_risk_s": 43200,
+  "alarm_board": "infra/meta",
+  "board_cmd": ["msgboard"],
+  "monitor_conflict_paths": []
+}
