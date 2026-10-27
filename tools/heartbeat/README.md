@@ -41,11 +41,15 @@ restart. Board mutation uses the existing `msgboard post` verb, with a
 transition id and ACK receipt. Configure `board_cmd` to the registered
 privacy-gated publisher where required by enrollment. Only fixed finding
 codes, transition ids and the controller UUID leave this process. Failed
-delivery is retained and logged to stderr/journal. A timed-out append is
-reconciled against the board's transition id before retry; when readback
-cannot settle uncertainty, it holds pending instead of posting a duplicate.
-This does not claim exactly-once transport through an uncooperative remote
-publisher, independent observer coverage, or deployment acceptance.
+delivery is retained and logged to stderr/journal. Retries are safe because
+idempotency lives AT THE SINK (keyed sink, 2026-10-28): every post carries the
+retained transition id as `--idempotency-key`; the msgboard sink serializes
+keyed append + readback, returns the retained ACK for a same-key/same-body
+retry, and refuses a conflicting payload. There is NO unkeyed fallback: an
+installed publisher that predates `--idempotency-key` holds the alarm pending
+until the canonical tool is deployed. This does not claim exactly-once
+transport through an uncooperative remote publisher, independent observer
+coverage, or deployment acceptance.
 
 The outbox replayer is the separate explicit command
 `python3 ../task-ledger/booking_outbox.py replay --once`; this observation

@@ -143,11 +143,16 @@ def test_c3_terminal_intents_hold_planning(tmp_path):
     p = plan_json()
     assert [t["id"] for t in p["booking_held"]] == ["T-901"]
     assert "T-901" not in offered(p)
+    # The §BATCH task itself is held too (R14: terminal intent on the BATCH row).
+    intent("T-903", "pending")
+    p = plan_json()
+    assert "T-903" in {t["id"] for t in p["booking_held"]}
+    assert "T-903" not in {t["id"] for t in p["daily_batch"]["tasks"]}
     # A DONE intent also holds a spuriously reopened row (never re-executes).
     intent("T-902", "done")
     p = plan_json()
     held = {t["id"] for t in p["booking_held"]}
-    assert held == {"T-901", "T-902"}
+    assert held == {"T-901", "T-902", "T-903"}
     assert "T-902" not in offered(p)
     # Corrupt terminal-intent storage holds planning entirely (fail closed).
     intents.write_text('{"task": "T-9", "state": "pend')

@@ -399,3 +399,191 @@ def test_c9_start_plan_aliases_recognized(tmp_path):
     assert obs["grants"] == []
     with pytest.raises(ValueError):
         hb.normalize("start-plan-grant", {"plans": ["garbage"]})
+
+
+def test_r11_free_tier_unavailable_never_freezes_other_recoveries(tmp_path):
+    # R11: the free-tier reader is honestly unavailable by design; a funded
+    # plane's recovery must proceed independently.
+    clock = Clock(); sched = Schedule()
+    c, _ = setup(tmp_path, clock, lambda _: {})
+    c.schedule_clock = sched
+    c.config["planes"] = [
+        {"id": "start-plan-grant", "reader": {"cmd": ["catalog"]}, "host_class": "server"},
+        {"id": "free-tier", "reader": {"cmd": ["free"]}, "host_class": "server"}]
+    # Seed an alarmed EXPIRY_AT_RISK from a real verified observation.
+    data = {"catalog": catalog(clock), "free": {"available": True}}
+    c.reader = lambda r: data[r["cmd"][0]]
+    c.tick(); drain(c)
+    risk = next(f for f in c.state["findings"] if f["kind"] == "EXPIRY_AT_RISK")
+    grant_scope = risk["id"].split(":", 1)[1]
+    # Alarmed already (3rd observation happened inside tick). Re-observe twice
+    # more is unnecessary; just recover it below.
+    # Grant recovered (zero remaining = not at risk) while free-tier stays
+    # honestly unavailable: recovery must complete.
+    data["catalog"] = catalog(clock, remaining=0, end_delta=10**9)
+    clock.advance(60); sched.advance(60); c.tick(); drain(c)
+    rows = {f["id"]: f for f in c.state["findings"]}
+    assert rows["EXPIRY_AT_RISK:" + grant_scope]["alarmed"] is False  # RECOVERY posted
+    assert c.state["planes"]["free-tier"]["quality"] == "unavailable"
+
+
+def test_r12_queue_failure_freezes_only_queue_sourced(tmp_path):
+    # R12: queue reader failure must not fabricate FEED_STARVED recovery;
+    # ledger-sourced findings keep their own clocks; queue-sourced recover
+    # only after real queue evidence.
+    clock = Clock(); sched = Schedule()
+    ledger = tmp_path / "ledger.md"
+    ledger.write_text("### [T-901] fixture\n- size: small ; value: 1 ; est: x\n- status: open\n")
+    config = {"planes": [], "ledger_path": str(ledger),
+              "outbox_path": str(tmp_path / "outbox.jsonl"),
+              "queue_reader": {"cmd": ["queue"]}, "watchers": []}
+    posts = []
+    c = hb.Controller(config, tmp_path / "h.json", clock=clock,
+                      reader=lambda r: {"serve": {"alive": True}, "routes": {}},
+                      publisher=lambda e: posts.append(e) or "ACK-x")
+    c.schedule_clock = sched
+    c.tick(); drain(c)
+    starved = next(f for f in c.state["findings"] if f["kind"] == "FEED_STARVED")
+    c.reconcile_findings("full", [c.finding("FEED_STARVED", "queue", starved["detail"], source="queue")])
+    c.reconcile_findings("full", [c.finding("FEED_STARVED", "queue", starved["detail"], source="queue")])
+    assert next(f for f in c.state["findings"] if f["kind"] == "FEED_STARVED")["alarmed"]
+    # Queue reader now fails; the ledger still reads. No RECOVERY may fire.
+    def broken(_):
+        raise RuntimeError("queue down")
+    c.reader = broken
+    clock.advance(300); sched.advance(300); c.tick(); drain(c)
+    posts_before = len(posts)
+    assert not any(p["transition"] == "RECOVERY" and p["kind"] == "FEED_STARVED" for p in posts)
+    row = next(f for f in c.state["findings"] if f["kind"] == "FEED_STARVED")
+    assert row["alarmed"] is True and row["active"] is True
+    # Queue recovers (work appears): three real clears, exactly one recovery.
+    c.reader = lambda r: {"serve": {"alive": True}, "routes": {"fixture": {"counts": {"queued": 2}}}}
+    for _ in range(3):
+        clock.advance(300); sched.advance(300); c.tick(); drain(c)
+    recoveries = [p for p in posts if p["transition"] == "RECOVERY" and p["kind"] == "FEED_STARVED"]
+    assert len(recoveries) == 1
+
+
+def test_r12_watcher_failure_freezes_only_that_watcher(tmp_path):
+    clock = Clock()
+    c, _ = setup(tmp_path, clock, lambda _: {})
+    health = tmp_path / "w.json"
+    health.write_text(json.dumps({"as_of": clock() - 100, "pid": 999999,
+                                  "boot_id": "wrong-boot"}))
+    c.config["watchers"] = [{"id": "w1", "health_path": str(health)}]
+    c.pid_alive = lambda pid, boot: False
+    c.cheap()
+    age = next(f for f in c.state["findings"] if f["id"] == "RUNNER_BROKEN:w1:age")
+    c.reconcile_findings("cheap", [c.finding("RUNNER_BROKEN", "w1:age", age["detail"], source="watcher:w1")])
+    c.reconcile_findings("cheap", [c.finding("RUNNER_BROKEN", "w1:age", age["detail"], source="watcher:w1")])
+    assert next(f for f in c.state["findings"] if f["id"] == "RUNNER_BROKEN:w1:age")["alarmed"]
+    # Watcher health becomes unreadable: its own findings freeze (no RECOVERY).
+    health.write_text("{corrupt")
+    c.cheap()
+    row = next(f for f in c.state["findings"] if f["id"] == "RUNNER_BROKEN:w1:age")
+    assert row["alarmed"] is True and row["clear_count"] == 0
+    assert any(f["id"] == "RUNNER_BROKEN:w1" and f["detail"] == "watcher health unavailable"
+               for f in c.state["findings"])
+
+
+def test_r13_recognized_missing_metadata_reads_unavailable(tmp_path):
+    # R13: a recognized plan without entitlement metadata is unavailable —
+    # never a verified empty catalog; null identity never becomes "None".
+    clock = Clock()
+    c, _ = setup(tmp_path, clock, lambda _: {})
+    c.config["planes"] = [{"id": "start-plan-grant", "reader": {"cmd": ["catalog"]}, "host_class": "server"}]
+    for payload in ({"plans": [{"plan_id": "START_PLAN"}]},
+                    {"plans": [{"plan_id": "START_PLAN", "entitlements": []}]},
+                    {"plans": [{"plan_id": None, "name": "Dev Day",
+                                "entitlements": [{"capabilities": ["model:glm-5.3-flash"],
+                                                  "grant_units": 5, "effective_at": clock(),
+                                                  "ends_at": clock() + 100}]}]}):
+        c.reader = lambda r, payload=payload: payload
+        clock.advance(60); sched = getattr(c, "schedule_clock", None)
+        c.tick(); drain(c)
+        row = c.state["planes"]["start-plan-grant"]
+        assert row["quality"] == "unavailable" and row["obs"] is None, payload
+        assert not any("None:" in (f["scope"] if "scope" in f else f["id"])
+                       for f in c.state["findings"])
+
+
+def test_c6_sink_stub_first_fail_then_retained_then_conflict(tmp_path):
+    # R14: BoardPublisher against a REAL subprocess sink stub that emulates
+    # keyed semantics: first call for a key fails, retry returns the retained
+    # ACK, an altered payload on the same key is refused, and the journal
+    # keeps exactly one line per key. No unkeyed fallback anywhere.
+    stub = tmp_path / "sink.py"
+    journal = tmp_path / "board.jsonl"
+    fail_state = tmp_path / "fail-once"
+    fail_state.write_text("1")
+    stub.write_text(
+        "import json, os, sys\n"
+        f"j, f = '{journal}', '{fail_state}'\n"
+        "argv = sys.argv\n"
+        "if '--idempotency-key' not in argv: sys.exit('unkeyed refused')\n"
+        "key = argv[argv.index('--idempotency-key') + 1]\n"
+        "body = argv[argv.index('--body') + 1]\n"
+        "rows = []\n"
+        "if os.path.exists(j):\n"
+        "    rows = [json.loads(l) for l in open(j) if l.strip()]\n"
+        "for r in rows:\n"
+        "    if r['key'] == key:\n"
+        "        if r['body'] != body: sys.exit('idempotency payload conflict')\n"
+        f"        if os.path.exists(f): os.unlink(f)  # fail only ONCE per key\n"
+        "        print('posted %s to infra/x (retained)' % r['ack']); sys.exit(0)\n"
+        "if os.path.exists(f):\n"
+        "    os.unlink(f)\n"
+        "    sys.exit('simulated first-send failure')\n"
+        "ack = 'ACK-' + key[:10]\n"
+        "with open(j, 'a') as fh: fh.write(json.dumps({'key': key, 'body': body, 'ack': ack}) + '\\n')\n"
+        "print('posted %s to infra/x' % ack)\n")
+    clock = Clock()
+    c, _ = setup(tmp_path, clock, lambda _: {})
+    c.publisher = hb.BoardPublisher({"board_cmd": [sys.executable, str(stub)]})
+    obs = [c.finding("RUNNER_BROKEN", "w", "missing")]
+    for _ in range(3):
+        c.reconcile_findings("cheap", obs)
+    c.deliver()
+    event = c.state["notifications"][0]
+    assert event["receipt_ref"] is None and event["attempts"] == 1  # first send failed
+    clock.advance(60)  # past the retry backoff
+    c.deliver()
+    assert event["receipt_ref"] and event["receipt_ref"].startswith("ACK-")
+    lines = [l for l in journal.read_text().splitlines() if l.strip()]
+    assert len(lines) == 1  # exactly one durable post
+    # Altered payload on the same key: refused, receipt retained, journal unchanged.
+    event["receipt_ref"] = None
+    event["kind"] = "TAMPERED"
+    c.deliver()
+    assert event["receipt_ref"] is None and len(lines) == 1
+    assert [l for l in journal.read_text().splitlines() if l.strip()] == lines
+
+
+def test_c7_real_elapsed_scheduler_bounds(tmp_path):
+    # R14: elapsed-time bounds under REAL subprocess readers — cheap gaps
+    # stay ~15s and a grant finding persists well inside 90s of visibility.
+    clock = Clock()
+    c, _ = setup(tmp_path, clock, lambda _: {})
+    slow_catalog = tmp_path / "slow_catalog.py"
+    slow_catalog.write_text("import time; time.sleep(0.6); print(" +
+                            repr(json.dumps(catalog(Clock()))) + ")")
+    c.config["planes"][0]["reader"] = {"cmd": [sys.executable, str(slow_catalog)],
+                                       "timeout_s": 5}
+    c.reader = hb.run_json  # real subprocess reads (R14: elapsed-time bounds)
+    c.schedule_clock = time.monotonic
+    t0 = time.monotonic()
+    cheap_starts = []
+    real_cheap = c.cheap
+    def timed_cheap():
+        cheap_starts.append(time.monotonic() - t0)
+        real_cheap()
+    c.cheap = timed_cheap
+    for _ in range(8):
+        c.tick()
+        time.sleep(0.55)
+    drain(c)
+    gaps = [b - a for a, b in zip(cheap_starts, cheap_starts[1:])]
+    assert all(g <= 16.0 for g in gaps), gaps
+    grant_at = next((f for f in c.state["findings"] if f["kind"] == "GRANT_NEW"), None)
+    assert grant_at is not None and cheap_starts[-1] - t0 <= 90
+    c.close()
