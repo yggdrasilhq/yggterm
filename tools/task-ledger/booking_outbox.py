@@ -75,13 +75,9 @@ def write_intent(task, proof, by, *, path=None, ts=None, ledger=None, day=None):
                "task": task, "proof": proof, "by": by, "ts": ts,
                "state": "pending", "attempts": 0, "next_attempt_at": ts,
                "ledger": str(ledger) if ledger else None, "day": day, "receipt_ref": None}
-        # Append + file fsync + directory fsync before acknowledging retention.
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-        with os.fdopen(fd, "a") as f:
-            f.write(json.dumps(row, sort_keys=True) + "\n")
-            f.flush()
-            os.fsync(f.fileno())
-        sync_dir(path.parent)
+        # Logical JSONL append, atomically committed: a killed writer cannot
+        # poison the tail (C4). replace_intents fsyncs candidate and parent.
+        replace_intents(path, rows + [row])
         return row
 
 
@@ -91,6 +87,10 @@ def update_intent(path, intent_id, **changes):
         rows = read_intents(path)
         for row in rows:
             if row["intent_id"] == intent_id:
+                # Terminal done is absorbing (C5): a late failed replay must
+                # never downgrade a verified completion or lose its receipt.
+                if row.get("state") == "done" and changes.get("state") == "pending":
+                    return row
                 row.update(changes)
                 replace_intents(path, rows)
                 return row

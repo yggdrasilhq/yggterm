@@ -103,7 +103,16 @@ def run_json(reader):
         stdout, _ = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
         os.killpg(proc.pid, signal.SIGKILL)
-        proc.communicate()
+        try:
+            proc.communicate(timeout=1)
+        except subprocess.TimeoutExpired:
+            # An escaped descendant must not retain this reader through
+            # inherited pipes (C7-D).
+            if proc.stdout:
+                proc.stdout.close()
+            if proc.stderr:
+                proc.stderr.close()
+            proc.wait(timeout=1)
         raise
     if proc.returncode:
         # Never store stderr: it can include authentication material.
@@ -122,6 +131,10 @@ def normalize(plane_id, raw):
         raise ValueError("null observation")
     if isinstance(raw, dict) and raw.get("error"):
         raise RuntimeError(str(raw["error"]))
+    # Structured wallet auth refusal (C8): classify AUTH_BLOCKED, never a
+    # generic unknown. Only a structured cause from the owning reader counts.
+    if isinstance(raw, dict) and raw.get("kind") == "access_credential_rejected":
+        raise RuntimeError("authentication rejected")
     if plane_id == "start-plan-grant":
         if not isinstance(raw, dict) or not isinstance(raw.get("plans"), list):
             raise ValueError("missing plans")
@@ -129,8 +142,19 @@ def normalize(plane_id, raw):
             raise RuntimeError(raw["note"])
         grants, seen, conflicting = [], {}, False
         for plan in raw["plans"]:
-            if "start-plan" not in str(plan.get("plan_id", "")):
+            if not isinstance(plan, dict):
+                raise ValueError("invalid plan metadata")
+            plan_id = str(plan.get("plan_id", ""))
+            name = str(plan.get("name", ""))
+            # Same recognition predicate as the existing reader (C9):
+            # case-insensitive start[-_ ]?plan in the id, or start-plan /
+            # Dev Day naming. A narrower predicate silently drops
+            # supported start-plan aliases into an empty verified catalog.
+            if not (re.search(r"start[-_ ]?plan", plan_id, re.I)
+                    or re.search(r"start[-_ ]?plan|dev day", name, re.I)):
                 continue
+            if not plan_id:
+                raise ValueError("missing grant identity")
             for ent in plan.get("entitlements", []):
                 grant = {"id": str(plan["plan_id"]) + ":" + ",".join(ent.get("capabilities", [])),
                          "grant_units": number(ent.get("grant_units")),
@@ -152,6 +176,14 @@ def normalize(plane_id, raw):
     if plane_id == "coding-plan":
         if not isinstance(raw, dict) or not isinstance(raw.get("windows"), list) or not raw["windows"]:
             raise ValueError("missing quota windows")
+        # Missing quota counters are UNKNOWN, never verified (C8). Nulls
+        # survive; zeros are never supplied to satisfy validation.
+        required = ("remaining", "usage", "number", "nextResetTime")
+        if any(not isinstance(w, dict)
+               or not isinstance(w.get("window"), str) or not w["window"]
+               or any(number(w.get(k)) is None for k in required)
+               for w in raw["windows"]):
+            raise ValueError("incomplete quota windows")
         windows = [{key: (number(w.get(key)) if key != "window" else str(w.get(key, "unknown")))
                     for key in ("window", "remaining", "usage", "number", "nextResetTime")}
                    for w in raw["windows"]]
@@ -180,30 +212,27 @@ def normalize(plane_id, raw):
 class BoardPublisher:
     """Canonical msgboard transport with durable transition-id readback.
 
-    A timeout is uncertain: the next attempt first checks the board. No
-    readback means hold, not a second blind append. The controller is the
-    single writer (service flock), so a successful transition posts once.
+    Idempotency lives AT THE SINK (C6): every post carries the retained
+    transition id as --idempotency-key, and the msgboard sink serializes
+    keyed append + readback and rejects a duplicate key with a conflicting
+    payload. Retries of an uncertain transition are therefore safe without
+    any absent-marker certainty claim. No unkeyed fallback: an old sink
+    that rejects the flag holds the alarm (visible in deliver()), it never
+    silently double-posts. The controller is the single writer (service
+    flock), so a successful transition posts once.
     """
     def __init__(self, config):
         self.config = config
 
     def __call__(self, event):
         board = self.config.get("alarm_board", "infra/meta")
-        readback = Path(self.config.get("board_readback", str(
-            Path.home() / "data/msggraph/boards" / board / "board.jsonl"))).expanduser()
         marker = f"heartbeat-transition:{event['id']}"
-        # Reading is allowed; all mutation goes through the canonical verb.
-        for line in readback.read_text().splitlines():
-            row = json.loads(line)
-            if marker in str(row.get("body", "")) and row.get("ack_token"):
-                return row["ack_token"]
-        if event.get("uncertain"):
-            raise RuntimeError("uncertain publication requires reconciliation")
-        # Fixed vocabulary only: no source content or reader diagnostics egress.
         body = f"{marker} {event['transition']} {event['kind']}"
+        # Fixed vocabulary only: no source content or reader diagnostics egress.
         cmd = self.config.get("board_cmd", ["msgboard"]) + ["post", board,
                "--kind", "note", "--from-row", event["controller_id"],
-               "--harness", "heartbeat", "--ttl-days", "14", "--body", body]
+               "--harness", "heartbeat", "--ttl-days", "14", "--body", body,
+               "--idempotency-key", event["id"]]
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=2)
         if result.returncode:
             raise RuntimeError("board publication failed")
@@ -215,7 +244,7 @@ class BoardPublisher:
 
 class Controller:
     def __init__(self, config, state_path, *, clock=time.time, reader=run_json, publisher=None,
-                 pid_alive=None):
+                 pid_alive=None, schedule_clock=None):
         self.config, self.path, self.clock, self.reader = config, Path(state_path), clock, reader
         self.publisher = publisher or BoardPublisher(config)
         self.pid_alive = pid_alive or self._pid_alive
@@ -225,6 +254,13 @@ class Controller:
             self.state = {"as_of": None, "controller_id": str(uuid.uuid4()), "planes": {},
                           "findings": [], "notifications": [],
                           "loop": {"last_cheap": None, "last_urgent": None, "last_full": None}}
+        # Scheduling uses a monotonic start anchor; completion timestamps are
+        # recorded separately and never delay the next pass (C7). Reader I/O
+        # runs as retained futures; one loop alone mutates state.
+        self.schedule_clock = schedule_clock or time.monotonic
+        self._pool = concurrent.futures.ThreadPoolExecutor(max_workers=2)
+        self._jobs = {}
+        self._due = {"cheap": 0, "urgent": 0, "full": 0}
 
     @staticmethod
     def _pid_alive(pid, boot_id):
@@ -248,7 +284,12 @@ class Controller:
     def finding(self, kind, scope, detail, **extra):
         return {"id": f"{kind}:{scope}", "kind": kind, "detail": detail, **extra}
 
-    def reconcile_findings(self, domain, observations):
+    def reconcile_findings(self, domain, observations, freeze_absent=False):
+        """Hysteresis: 3 consecutive positive observations alarm, 3 clean
+        clears recover. freeze_absent (C7/R10): a pass whose observation
+        itself failed (reader down, source unreadable) never manufactures
+        clear samples — cached findings keep their counts and their
+        recovery clocks frozen; their absence is not evidence."""
         now = self.clock()
         current = {x["id"]: x for x in observations}
         rows = {x["id"]: x for x in self.state["findings"] if x["domain"] == domain}
@@ -263,6 +304,8 @@ class Controller:
                 self.transition(row, "ALARM")
         for key, row in rows.items():
             if key not in current:
+                if freeze_absent:
+                    continue
                 row["count"] = 0
                 row["clear_count"] += 1
                 row["active"] = False
@@ -334,8 +377,10 @@ class Controller:
             findings.append(self.finding("BOOKKEEPING_BACKLOG", "outbox", "booking outbox unreadable"))
         self.reconcile_findings("cheap", findings)
 
-    def urgent(self):
-        # Deduplicate shared usage command; independent parses retain scopes.
+    def _read_urgent(self):
+        # Reader I/O only — bounded futures, no state mutation (C7): the
+        # state-writing half must never wait on a slow reader inside the
+        # scheduling loop.
         readers = {}
         for plane in self.config["planes"]:
             base = {k: v for k, v in plane["reader"].items() if k != "parse"}
@@ -351,6 +396,11 @@ class Controller:
             for future in concurrent.futures.as_completed(futures):
                 key, raw, error = future.result()
                 results[key] = (raw, error)
+        return results
+
+    def urgent(self, results=None):
+        if results is None:
+            results = self._read_urgent()
         findings, now = [], self.clock()
         for plane in self.config["planes"]:
             pid = plane["id"]
@@ -383,7 +433,12 @@ class Controller:
             self.state["planes"][missing] = {"obs": None, "observed_at": now,
                                            "quality": "unavailable", "error": "funding reader not registered"}
             findings.append(self.finding("QUOTA_UNKNOWN", missing, "funding reader not registered"))
-        self.reconcile_findings("urgent", findings)
+        # A pass where any plane is unobservable never clears prior findings:
+        # absence of an expiry/grant finding under a broken reader is not
+        # recovery evidence (C7/R10).
+        freeze = any(r.get("quality") == "unavailable" and r.get("error")
+                     for r in self.state["planes"].values())
+        self.reconcile_findings("urgent", findings, freeze_absent=freeze)
 
     def grant_findings(self, prior, row, findings, now):
         grants = row["obs"]["grants"]
@@ -407,7 +462,13 @@ class Controller:
         row["grant_events"] = events
         findings.extend(self.finding(e["kind"], e["scope"], e["detail"]) for e in events)
 
-    def full(self):
+    def _read_queue(self):
+        try:
+            return self.reader(self.config["queue_reader"]), None
+        except Exception as e:
+            return None, e
+
+    def full(self, queue_observation=None):
         findings = []
         try:
             text = Path(self.config["ledger_path"]).expanduser().read_text()
@@ -436,7 +497,11 @@ class Controller:
             if Path(marker).expanduser().exists():
                 findings.append(self.finding("RUNNER_BROKEN", "monitor-conflict", "monitor conflict marker present"))
         try:
-            queue = self.reader(self.config["queue_reader"])
+            if queue_observation is None:
+                queue_observation = self._read_queue()
+            queue, error = queue_observation
+            if error is not None:
+                raise error
             if not isinstance(queue.get("serve", {}).get("alive"), bool) or not isinstance(queue.get("routes"), dict):
                 raise ValueError("invalid queue status")
             counts = [r["counts"] for r in queue["routes"].values()]
@@ -453,21 +518,53 @@ class Controller:
         except Exception:
             self.state["queue"] = None
             findings.append(self.finding("RUNNER_BROKEN", "queue-reader", "queue observation unavailable"))
-        self.reconcile_findings("full", findings)
+        # Ledger unreadable: the pass observed nothing; freeze clears (C7/R10).
+        self.reconcile_findings("full", findings, freeze_absent=opened is None)
 
-    def tick(self):
-        for domain, cadence in (("cheap", CHEAP_S), ("urgent", URGENT_S), ("full", FULL_S)):
-            last = self.state["loop"]["last_" + domain]
-            if last is None or self.clock() - last >= cadence or self.clock() < last:
-                try:
-                    getattr(self, domain)()
-                    self.state["loop"]["last_" + domain] = self.clock()
-                except Exception as e:
-                    # Failed observation is not a clear sample for prior faults.
-                    retained = [f for f in self.state["findings"] if f["domain"] == domain and f.get("active")]
-                    self.reconcile_findings(domain, retained + [self.finding("RUNNER_BROKEN", domain + "-pass", safe_error(e))])
-                self.flush()
+    def _complete_pass(self, domain, apply):
+        try:
+            apply()
+            self.state["loop"]["last_" + domain] = self.clock()
+            # A clean pass in this domain is a real clear sample for that
+            # domain's faults only — never for cached faults of other
+            # domains (C7/R10).
+            self.reconcile_findings(domain + "-failure", [])
+        except Exception as e:
+            # Failure is observed in its own failure domain; cached findings
+            # of the target domain keep their counts untouched (C7/R10).
+            self.reconcile_findings(domain + "-failure", [
+                self.finding("RUNNER_BROKEN", domain + "-pass", safe_error(e))])
+        self.flush()
+
+    def tick(self, schedule=True):
+        now = self.schedule_clock()
+        if schedule and now >= self._due["cheap"]:
+            self._due["cheap"] = now + CHEAP_S
+            self._complete_pass("cheap", self.cheap)
+        for domain in ("urgent", "full"):
+            future = self._jobs.get(domain)
+            if future is not None and future.done():
+                del self._jobs[domain]
+                def apply(domain=domain, future=future):
+                    value = future.result()
+                    if domain == "urgent":
+                        self.urgent(value)
+                    else:
+                        self.full(value)
+                self._complete_pass(domain, apply)
+        if schedule:
+            now = self.schedule_clock()
+            for domain, cadence, read in (
+                    ("urgent", URGENT_S, self._read_urgent),
+                    ("full", FULL_S, self._read_queue)):
+                if domain not in self._jobs and now >= self._due[domain]:
+                    self._due[domain] = now + cadence
+                    self._jobs[domain] = self._pool.submit(read)
         self.deliver()
+        self.flush()
+
+    def close(self):
+        self._pool.shutdown(wait=True, cancel_futures=True)
         self.flush()
 
 
@@ -496,11 +593,16 @@ def main():
             while not stopping:
                 controller.tick()
                 if args.once:
+                    # --once drains retained reader futures before exit: a
+                    # just-submitted read is not an observation yet (C7).
+                    while controller._jobs and not stopping:
+                        time.sleep(0.01)
+                        controller.tick(schedule=False)
                     break
                 # Short waits let SIGTERM flush promptly, even between due passes.
                 time.sleep(1)
         finally:
-            controller.flush()
+            controller.close()
     return 0
 
 

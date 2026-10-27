@@ -2671,6 +2671,17 @@ def cmd_publish(args):
             dest_filename = source_path.name
         dest_path = ns_dir / dest_filename
         dest_path.parent.mkdir(parents=True, exist_ok=True)
+        # Expected-base CAS (heartbeat C2, 2026-10-28): a stale prepared
+        # whole-door snapshot must never silently overwrite a concurrent
+        # change. Enforced inside the publisher's lock, before ANY
+        # copy/journal/watermark mutation; mismatch retains the operation
+        # for the caller's guarded replay.
+        expected = getattr(args, "expected_digest", None)
+        if expected is not None:
+            if (not re.fullmatch(r"[0-9a-f]{64}", expected)
+                    or not dest_path.is_file() or file_sha256(dest_path) != expected):
+                raise SystemExit(
+                    "PUBLISH_BASE_CHANGED: retain intent and reread current source")
         # Dream ACK-bccf702553: warn when minting a basename the namespace
         # has never seen — scratch-name publishes are how junk duplicate
         # doors get minted (ten of them in -home-pi-gh-yggterm alone).
@@ -8633,6 +8644,8 @@ def main():
     # publish
     p_pub = subparsers.add_parser("publish", parents=[common_parser], help="Publish a local file into unified memory")
     p_pub.add_argument("--file", required=True, help="Source markdown file to publish")
+    p_pub.add_argument("--expected-digest", default=None,
+                       help="refuse if the current destination differs from this SHA256")
     p_pub.add_argument("--dest", default=None, help="Door path relative to the namespace; may include subdirectories (e.g. campaign-cli-integration/codex.md). Defaults to the source basename.")
     p_pub.add_argument("--as", dest="as_name", default=None, help="Door basename shorthand (flat name only; mutually exclusive with --dest). Renames the published door instead of minting a scratch-name duplicate.")
     p_pub.add_argument("--kind", default=None, help="Kind (finding, campaign, spec, feedback, steer)")

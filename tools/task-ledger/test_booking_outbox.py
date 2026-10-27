@@ -1,3 +1,4 @@
+import pytest
 import fcntl
 import json
 import os
@@ -121,3 +122,52 @@ def test_append_during_publish_is_preserved(tmp_path):
         return "receipt:901"
     outbox.replay_once(path=path, publish=publish, clock=lambda: 2)
     assert [r["state"] for r in outbox.read_intents(path)] == ["done", "pending"]
+
+
+def test_c4_atomic_append_survives_mid_commit_crash(tmp_path, monkeypatch):
+    # A killed writer during the logical append leaves the previous file
+    # intact and the outbox still accepts later bookings (C4).
+    path = tmp_path / "intents.jsonl"
+    outbox.write_intent("T-1", "p1", "w", path=path, ts=1)
+    before = outbox.read_intents(path)
+    real_replace = outbox.replace_intents
+    def crash_mid_replace(p, rows):
+        real_replace(p, rows)          # commit lands...
+        raise RuntimeError("killed after commit, before ACK")
+    monkeypatch.setattr(outbox, "replace_intents", crash_mid_replace)
+    with pytest.raises(RuntimeError):
+        outbox.write_intent("T-2", "p2", "w", path=path, ts=2)
+    monkeypatch.setattr(outbox, "replace_intents", real_replace)
+    rows = outbox.read_intents(path)
+    assert [r["task"] for r in rows] == ["T-1", "T-2"]   # committed row survives
+    later = outbox.write_intent("T-3", "p3", "w", path=path, ts=3)
+    assert later["state"] == "pending" and len(outbox.read_intents(path)) == 3
+    # A pre-existing corrupt tail from an older writer still HOLDS (no silent skip).
+    path.write_text(path.read_text() + '{"task": "T-x", "state": "pend')
+    with pytest.raises(json.JSONDecodeError):
+        outbox.write_intent("T-4", "p4", "w", path=path, ts=4)
+    # Unchanged; a corrupt tail holds for explicit reconciliation, never
+    # silent truncation or skip (C4).
+    assert path.read_text().count('"task": "T-3"') == 1
+    assert "T-4" not in path.read_text()
+
+
+def test_c5_done_is_absorbing_against_late_failed_replay(tmp_path):
+    # R9: a concurrent normal booking marks the row done; a late FAILED
+    # replay must not downgrade it or lose the receipt.
+    path = tmp_path / "intents.jsonl"
+    row = outbox.write_intent("T-9", "proof", "w", path=path, ts=1)
+    outbox.update_intent(path, row["intent_id"], state="done", receipt_ref="r1")
+    outbox.update_intent(path, row["intent_id"], state="pending", attempts=2,
+                         next_attempt_at=5, last_error="RuntimeError")
+    after = outbox.read_intents(path)[0]
+    assert after["state"] == "done" and after["receipt_ref"] == "r1"
+    # A publish that marks done and THEN raises must preserve the receipt.
+    def publish_mark_then_raise(r):
+        outbox.update_intent(path, row["intent_id"], state="done",
+                             receipt_ref="r2", done_at=99)
+        raise RuntimeError("post-mark failure")
+    outbox.replay_once(path=path, publish=publish_mark_then_raise, clock=lambda: 2)
+    after = outbox.read_intents(path)[0]
+    assert after["state"] == "done" and after["receipt_ref"] in ("r1", "r2")
+    assert after["state"] == "done"  # never reverted to pending
