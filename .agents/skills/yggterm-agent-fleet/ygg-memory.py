@@ -1758,6 +1758,14 @@ def matches_target_harness(entry_target: str, query_harness: str) -> bool:
 # Appends extend coverage only after anchor validation (file head bytes plus
 # the previously covered last line), so a legacy writer that mutates the
 # journal without registering is still detected and triggers a rebuild.
+# Every in-fleet journal REWRITE is writer-lock-coordinated and registers
+# with the index (merge installs rows directly; append extends after tail
+# repair). The sampled anchors (head / midpoint / covered last line) are
+# defense-in-depth for foreign or legacy writers: they catch gross
+# mutations cheaply, and any anchor mismatch forces a full rebuild — a
+# rewrite that evades all sampled windows cannot be distinguished from
+# concurrent appends without reading the whole file, so writer
+# registration is the correctness boundary and sampling is the net.
 # _merge_journals (an in-place rewrite) bumps the generation explicitly.
 # The naive full scans above are kept verbatim as the fallback: any index
 # error degrades to today's behavior, never to wrong answers.
@@ -1922,6 +1930,7 @@ def _ji_refresh(root: Path, conn) -> None:
     n = len(blob)
     while True:
         nl = blob.find(b"\n", i)
+        line_start = base + i
         if nl >= 0:
             line = blob[i:nl]
             i = nl + 1
@@ -1934,6 +1943,7 @@ def _ji_refresh(root: Path, conn) -> None:
             if not line.strip():
                 break
             trailing = True
+            last_complete_end = base + n
             i = n
         if True:
             try:
@@ -1942,12 +1952,11 @@ def _ji_refresh(root: Path, conn) -> None:
                 rec = None
             if rec is not None:
                 if trailing:
-                    last_complete_end = base + n
                     last_line = line  # newline-less: anchors match its bytes
                 rows.append(
                     (
                         gen,
-                        base + (i - len(line) - 1),
+                        line_start,
                         int(rec.get("seq", 0) or 0),
                         rec.get("ns"),
                         rec.get("file"),
@@ -2084,10 +2093,16 @@ def _ji_install(root: Path, records, offsets, covered: int) -> None:
                     " VALUES (?, ?, ?, ?, ?, ?, ?)",
                     rows,
                 )
+            mid_off = max(0, size // 2 - 2048)
+            with open(jpath, "rb") as f:
+                f.seek(mid_off)
+                mid = f.read(4096)
             for k, v in {
                 "gen": str(gen),
                 "covered": str(covered),
                 "max_seq": str(max_seq),
+                "mid_off": str(mid_off),
+                "mid_hash": hashlib.sha256(mid).hexdigest() if len(mid) == 4096 else "",
                 **_ji_anchors(head, last_line),
             }.items():
                 conn.execute("INSERT OR REPLACE INTO meta (k, v) VALUES (?, ?)", (k, v))
