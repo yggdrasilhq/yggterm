@@ -162,12 +162,30 @@ def test_c5_done_is_absorbing_against_late_failed_replay(tmp_path):
                          next_attempt_at=5, last_error="RuntimeError")
     after = outbox.read_intents(path)[0]
     assert after["state"] == "done" and after["receipt_ref"] == "r1"
-    # A publish that marks done and THEN raises must preserve the receipt.
-    def publish_mark_then_raise(r):
-        outbox.update_intent(path, row["intent_id"], state="done",
-                             receipt_ref="r2", done_at=99)
-        raise RuntimeError("post-mark failure")
-    outbox.replay_once(path=path, publish=publish_mark_then_raise, clock=lambda: 2)
-    after = outbox.read_intents(path)[0]
-    assert after["state"] == "done" and after["receipt_ref"] in ("r1", "r2")
-    assert after["state"] == "done"  # never reverted to pending
+    # True concurrent shape (R14): the row is PENDING; a normal plan booking
+    # marks it done mid-replay; the replay's publish then fails. The late
+    # failed replay must not downgrade the concurrent done or lose its receipt.
+    concurrent = outbox.write_intent("T-11", "p11", "w", path=path, ts=3)
+    entered = []
+    def concurrent_booking_then_fail(r):
+        entered.append(r["intent_id"])
+        outbox.update_intent(path, r["intent_id"], state="done",
+                             receipt_ref="r4", done_at=99)
+        raise RuntimeError("replay publish failed after concurrent booking")
+    outbox.replay_once(path=path, publish=concurrent_booking_then_fail, clock=lambda: 4)
+    assert entered == [concurrent["intent_id"]], entered
+    after = next(i for i in outbox.read_intents(path) if i["intent_id"] == concurrent["intent_id"])
+    assert after["state"] == "done" and after["receipt_ref"] == "r4"
+    # R14: the SAME shape starting PENDING — the callback runs, marks done,
+    # then fails; the row keeps the receipt and is never downgraded.
+    fresh = outbox.write_intent("T-10", "p10", "w", path=path, ts=2)
+    calls = []
+    def publish_mark_raise_again(r):
+        calls.append(r["intent_id"])
+        outbox.update_intent(path, r["intent_id"], state="done",
+                             receipt_ref="r3", done_at=100)
+        raise RuntimeError("post-mark failure again")
+    outbox.replay_once(path=path, publish=publish_mark_raise_again, clock=lambda: 3)
+    assert calls == [fresh["intent_id"]], calls
+    got = next(i for i in outbox.read_intents(path) if i["intent_id"] == fresh["intent_id"])
+    assert got["state"] == "done" and got["receipt_ref"] == "r3"

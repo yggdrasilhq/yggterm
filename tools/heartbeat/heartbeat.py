@@ -102,7 +102,10 @@ def run_json(reader):
     try:
         stdout, _ = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
-        os.killpg(proc.pid, signal.SIGKILL)
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass  # exit raced the timeout cleanup (R14)
         try:
             proc.communicate(timeout=1)
         except subprocess.TimeoutExpired:
@@ -144,8 +147,9 @@ def normalize(plane_id, raw):
         for plan in raw["plans"]:
             if not isinstance(plan, dict):
                 raise ValueError("invalid plan metadata")
-            plan_id = str(plan.get("plan_id", ""))
-            name = str(plan.get("name", ""))
+            raw_id, raw_name = plan.get("plan_id"), plan.get("name")
+            plan_id = raw_id if isinstance(raw_id, str) else ""
+            name = raw_name if isinstance(raw_name, str) else ""
             # Same recognition predicate as the existing reader (C9):
             # case-insensitive start[-_ ]?plan in the id, or start-plan /
             # Dev Day naming. A narrower predicate silently drops
@@ -153,10 +157,19 @@ def normalize(plane_id, raw):
             if not (re.search(r"start[-_ ]?plan", plan_id, re.I)
                     or re.search(r"start[-_ ]?plan|dev day", name, re.I)):
                 continue
-            if not plan_id:
+            # Recognized plans must carry real metadata (R13): identity is an
+            # actual nonempty string (never a coerced None/number), and the
+            # entitlement container must be present and nonempty — a missing
+            # window must read unavailable, never a verified empty catalog.
+            if not isinstance(raw_id, str) or not raw_id.strip():
                 raise ValueError("missing grant identity")
-            for ent in plan.get("entitlements", []):
-                grant = {"id": str(plan["plan_id"]) + ":" + ",".join(ent.get("capabilities", [])),
+            ents = plan.get("entitlements")
+            if not isinstance(ents, list) or not ents:
+                raise ValueError("missing or empty entitlement metadata for recognized grant")
+            for ent in ents:
+                if not isinstance(ent, dict):
+                    raise ValueError("invalid entitlement metadata")
+                grant = {"id": plan_id + ":" + ",".join(ent.get("capabilities", [])),
                          "grant_units": number(ent.get("grant_units")),
                          "effective_at": epoch(ent.get("effective_at", plan.get("starts_at"))),
                          "ends_at": epoch(plan.get("ends_at")),
@@ -284,12 +297,15 @@ class Controller:
     def finding(self, kind, scope, detail, **extra):
         return {"id": f"{kind}:{scope}", "kind": kind, "detail": detail, **extra}
 
-    def reconcile_findings(self, domain, observations, freeze_absent=False):
+    def reconcile_findings(self, domain, observations, unavailable=frozenset()):
         """Hysteresis: 3 consecutive positive observations alarm, 3 clean
-        clears recover. freeze_absent (C7/R10): a pass whose observation
-        itself failed (reader down, source unreadable) never manufactures
-        clear samples — cached findings keep their counts and their
-        recovery clocks frozen; their absence is not evidence."""
+        clears recover. Scoped freeze (R11/R12): a finding sourced from an
+        observation source that failed THIS pass never receives a clear
+        sample — its absence is not evidence of recovery. Findings sourced
+        from successfully observed sources clear normally, so one broken
+        product can never hold unrelated recoveries hostage. Findings carry
+        their source via the `source` tag (None/absent = structural, always
+        clearable); cached counts are never incremented by a failed pass."""
         now = self.clock()
         current = {x["id"]: x for x in observations}
         rows = {x["id"]: x for x in self.state["findings"] if x["domain"] == domain}
@@ -304,8 +320,8 @@ class Controller:
                 self.transition(row, "ALARM")
         for key, row in rows.items():
             if key not in current:
-                if freeze_absent:
-                    continue
+                if row.get("source") in unavailable:
+                    continue  # scoped freeze: no clear sample without evidence
                 row["count"] = 0
                 row["clear_count"] += 1
                 row["active"] = False
@@ -352,30 +368,34 @@ class Controller:
         if not watchers:
             findings.append(self.finding("RUNNER_BROKEN", "observer-coverage", "no watchers registered; independent observer coverage unknown"))
         self.state["watchers"] = {}
+        dead_sources = set()
         for watcher in watchers:
             wid = str(watcher["id"])
             try:
                 health = json.loads(Path(watcher["health_path"]).expanduser().read_text()) if watcher.get("health_path") else watcher
                 stamp = epoch(health.get("as_of"))
                 if stamp is None or not 0 <= now - stamp <= watcher.get("max_age_s", 45):
-                    findings.append(self.finding("RUNNER_BROKEN", wid + ":age", "watcher heartbeat missing or stale"))
+                    findings.append(self.finding("RUNNER_BROKEN", wid + ":age", "watcher heartbeat missing or stale", source="watcher:" + wid))
                 alive = self.pid_alive(health.get("pid"), health.get("boot_id"))
                 fresh = stamp is not None and 0 <= now - stamp <= watcher.get("max_age_s", 45)
                 self.state["watchers"][wid] = {"alive": alive, "fresh": fresh, "task": watcher.get("task")}
                 if alive is not True:
-                    findings.append(self.finding("RUNNER_BROKEN", wid + ":pid", "watcher liveness unverified"))
+                    findings.append(self.finding("RUNNER_BROKEN", wid + ":pid", "watcher liveness unverified", source="watcher:" + wid))
             except Exception:
-                findings.append(self.finding("RUNNER_BROKEN", wid, "watcher health unavailable"))
+                # An unreadable watcher freezes only ITS OWN findings (R12).
+                dead_sources.add("watcher:" + wid)
+                findings.append(self.finding("RUNNER_BROKEN", wid, "watcher health unavailable", source="watcher:" + wid))
         outbox = Path(self.config.get("outbox_path", str(Path.home() / ".yggterm/swarm/booking-outbox/intents.jsonl"))).expanduser()
         try:
             pending = [r for r in read_intents(outbox) if r.get("state") != "done"]
             self.state["booking_pending"] = len(pending)
             if pending:
-                findings.append(self.finding("BOOKKEEPING_BACKLOG", "outbox", f"{len(pending)} retained booking intents"))
+                findings.append(self.finding("BOOKKEEPING_BACKLOG", "outbox", f"{len(pending)} retained booking intents", source="outbox"))
         except Exception:
             self.state["booking_pending"] = None
-            findings.append(self.finding("BOOKKEEPING_BACKLOG", "outbox", "booking outbox unreadable"))
-        self.reconcile_findings("cheap", findings)
+            dead_sources.add("outbox")
+            findings.append(self.finding("BOOKKEEPING_BACKLOG", "outbox", "booking outbox unreadable", source="outbox"))
+        self.reconcile_findings("cheap", findings, unavailable=frozenset(dead_sources))
 
     def _read_urgent(self):
         # Reader I/O only — bounded futures, no state mutation (C7): the
@@ -422,23 +442,27 @@ class Controller:
                        "grant_events": prior.get("grant_events", [])}
             self.state["planes"][pid] = row
             if row["quality"] == "unavailable":
-                findings.append(self.finding("QUOTA_UNKNOWN", pid, row["error"]))
+                findings.append(self.finding("QUOTA_UNKNOWN", pid, row["error"], source=pid))
                 if "authentication" in (row["error"] or ""):
-                    findings.append(self.finding("AUTH_BLOCKED", pid, "funding reader authentication unavailable"))
+                    findings.append(self.finding("AUTH_BLOCKED", pid, "funding reader authentication unavailable", source=pid))
             elif row["quality"] == "conflicting":
-                findings.append(self.finding("QUOTA_SCOPE_CONFLICT", pid, "funding observations conflict; availability held"))
+                findings.append(self.finding("QUOTA_SCOPE_CONFLICT", pid, "funding observations conflict; availability held", source=pid))
             if pid == "start-plan-grant" and row["quality"] == "verified":
                 self.grant_findings(prior, row, findings, now)
         for missing in PRODUCTS - {p["id"] for p in self.config["planes"]}:
             self.state["planes"][missing] = {"obs": None, "observed_at": now,
                                            "quality": "unavailable", "error": "funding reader not registered"}
-            findings.append(self.finding("QUOTA_UNKNOWN", missing, "funding reader not registered"))
-        # A pass where any plane is unobservable never clears prior findings:
-        # absence of an expiry/grant finding under a broken reader is not
-        # recovery evidence (C7/R10).
-        freeze = any(r.get("quality") == "unavailable" and r.get("error")
-                     for r in self.state["planes"].values())
-        self.reconcile_findings("urgent", findings, freeze_absent=freeze)
+            findings.append(self.finding("QUOTA_UNKNOWN", missing, "funding reader not registered", source=missing))
+        # Scoped freeze (R11): a failed product observation freezes only the
+        # findings sourced from THAT product. An honestly-unavailable product
+        # (e.g. free-tier, quality unavailable by design with a successful
+        # read) still yields a successful OBSERVATION for its own scope and
+        # never freezes anything: quality alone is not a reader failure —
+        # only rows that carry an error from THIS pass's read/normalize do.
+        dead = {p2 for p2, r2 in self.state["planes"].items()
+                if r2.get("quality") == "unavailable" and r2.get("error")
+                and r2.get("observed_at") == now and r2.get("obs") is None}
+        self.reconcile_findings("urgent", findings, unavailable=frozenset(dead))
 
     def grant_findings(self, prior, row, findings, now):
         grants = row["obs"]["grants"]
@@ -452,15 +476,16 @@ class Controller:
                 events.append({"at": now, "kind": "GRANT_NEW", "scope": grant["id"], "detail": "new or changed grant metadata observed; admission remains gated"})
             ends, effective = grant["ends_at"], grant["effective_at"]
             if ends <= now:
-                findings.append(self.finding("GRANT_EXPIRED", grant["id"], "grant expiry observed; availability held"))
+                findings.append(self.finding("GRANT_EXPIRED", grant["id"], "grant expiry observed; availability held", source="start-plan-grant"))
             elif effective <= now and ends - now <= self.config.get("expiry_risk_s", 12 * 3600) and (grant["remaining"] is None or grant["remaining"] > 0):
                 detail = "remaining unreadable" if grant["remaining"] is None else "verified remaining balance at risk"
-                findings.append(self.finding("EXPIRY_AT_RISK", grant["id"], detail))
+                findings.append(self.finding("EXPIRY_AT_RISK", grant["id"], detail, source="start-plan-grant"))
         present = {g["id"] for g in grants}
         for missing in old.keys() - present:
             events.append({"at": now, "kind": "GRANT_EXPIRED", "scope": missing, "detail": "grant removed from authoritative catalog; availability held"})
         row["grant_events"] = events
-        findings.extend(self.finding(e["kind"], e["scope"], e["detail"]) for e in events)
+        findings.extend(self.finding(e["kind"], e["scope"], e["detail"],
+                                     source="start-plan-grant") for e in events)
 
     def _read_queue(self):
         try:
@@ -469,30 +494,34 @@ class Controller:
             return None, e
 
     def full(self, queue_observation=None):
-        findings = []
+        findings, dead = [], set()
         try:
             text = Path(self.config["ledger_path"]).expanduser().read_text()
             tasks = parse_ledger(text)
             if not tasks and "T-" in text:
                 raise ValueError("ledger parse failed")
+            ledger_ok = True
             opened = [t for t in tasks if t.get("status", "").startswith("open")]
             claimed = [t for t in tasks if t.get("status", "").startswith("claimed")]
             self.state["ledger"] = {"open": len(opened), "claimed": len(claimed)}
             if not opened:
-                findings.append(self.finding("SOURCE_EMPTY", "ledger", "no open source tasks; no work inferred", severity="info"))
+                findings.append(self.finding("SOURCE_EMPTY", "ledger", "no open source tasks; no work inferred", severity="info", source="ledger"))
             watchers = {w.get("task"): w for w in self.config.get("watchers", []) if w.get("task")}
             for task in claimed:
                 watcher = watchers.get(task["id"], {})
                 observed = self.state.get("watchers", {}).get(watcher.get("id"), {})
                 live = observed.get("alive") is True and observed.get("fresh") is True
                 if not live:
-                    findings.append(self.finding("RUNNER_BROKEN", task["id"], "claimed task has no verified live watcher"))
+                    findings.append(self.finding("RUNNER_BROKEN", task["id"], "claimed task has no verified live watcher", source="ledger"))
             if re.search(r"monitor[-_ ]conflict", text, re.I):
-                findings.append(self.finding("RUNNER_BROKEN", "monitor-conflict", "monitor conflict marker in ledger"))
+                findings.append(self.finding("RUNNER_BROKEN", "monitor-conflict", "monitor conflict marker in ledger", source="ledger"))
         except Exception:
             self.state["ledger"] = None
             opened = None
-            findings.append(self.finding("SOURCE_EMPTY", "ledger-unreadable", "ledger source unavailable; source freshness unknown"))
+            # Ledger unreadable freezes only ledger-sourced findings (R12);
+            # an independently proven queue recovery still clears.
+            dead.add("ledger")
+            findings.append(self.finding("SOURCE_EMPTY", "ledger-unreadable", "ledger source unavailable; source freshness unknown", source="ledger"))
         for marker in self.config.get("monitor_conflict_paths", []):
             if Path(marker).expanduser().exists():
                 findings.append(self.finding("RUNNER_BROKEN", "monitor-conflict", "monitor conflict marker present"))
@@ -509,17 +538,19 @@ class Controller:
             running = sum(c.get("running", 0) for c in counts)
             self.state["queue"] = {"pending": pending, "running": running, "alive": queue["serve"]["alive"]}
             if not queue["serve"]["alive"]:
-                findings.append(self.finding("RUNNER_BROKEN", "queue", "queue owner not live"))
+                findings.append(self.finding("RUNNER_BROKEN", "queue", "queue owner not live", source="queue"))
             if opened and pending + running == 0:
-                findings.append(self.finding("FEED_STARVED", "queue", "open source tasks with no pending or running queue work; eligibility unverified"))
+                findings.append(self.finding("FEED_STARVED", "queue", "open source tasks with no pending or running queue work; eligibility unverified", source="queue"))
             for route, value in queue["routes"].items():
                 if "auth" in str(value.get("cooldown_reason", "")).lower():
-                    findings.append(self.finding("AUTH_BLOCKED", route, "queue route reports authentication hold"))
+                    findings.append(self.finding("AUTH_BLOCKED", route, "queue route reports authentication hold", source="queue"))
         except Exception:
             self.state["queue"] = None
-            findings.append(self.finding("RUNNER_BROKEN", "queue-reader", "queue observation unavailable"))
-        # Ledger unreadable: the pass observed nothing; freeze clears (C7/R10).
-        self.reconcile_findings("full", findings, freeze_absent=opened is None)
+            # Queue observation failed: freeze queue-sourced findings only;
+            # ledger-sourced findings keep their own recovery clocks (R12).
+            dead.add("queue")
+            findings.append(self.finding("RUNNER_BROKEN", "queue-reader", "queue observation unavailable", source="queue"))
+        self.reconcile_findings("full", findings, unavailable=frozenset(dead))
 
     def _complete_pass(self, domain, apply):
         try:
