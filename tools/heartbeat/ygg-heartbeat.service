@@ -1,0 +1,16 @@
+# Install on the server. On a laptop this service may observe/alert read-only;
+# it never executes idle or burn actions. No timer: the service loops internally.
+[Unit]
+Description=Fleet heartbeat discovery and retained alarms (observation only)
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 %h/.yggterm/bin/heartbeat/heartbeat.py
+Environment=PATH=%h/.local/bin:%h/.yggterm/ynpm/bin:%h/.bun/bin:/usr/local/bin:/usr/bin:/bin
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target
