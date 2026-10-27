@@ -343,6 +343,40 @@ def main():
             )
         )
 
+    # R5: hammer appends + merges concurrently — no record may be lost
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        (root / "journal.jsonl").write_text("", encoding="utf-8")
+        body = (
+            "from pathlib import Path\n"
+            "root=Path(sys.argv[3])\n"
+            "for i in range(15):\n"
+            "    m.append_journal_entry(root,'h','f.md','note','upsert','zcode',"
+            "'hammer-'+sys.argv[2]+str(i))\n"
+            "    if i%5==0:\n"
+            "        m._merge_journals(root/'journal.jsonl','')\n"
+        )
+        runner = (
+            "import importlib.util,sys;"
+            "spec=importlib.util.spec_from_file_location('ym',sys.argv[1]);"
+            "m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m);" + body
+        )
+        procs = [
+            subprocess.Popen([sys.executable, "-c", runner, str(MODULE_PATH), str(w), str(root)],
+                             stderr=subprocess.PIPE)
+            for w in range(3)
+        ]
+        rcs = [p.wait(timeout=180) for p in procs]
+        recs = mod.read_journal_entries(root)
+        hammers = [r for r in recs if str(r.get("summary", "")).startswith("hammer-")]
+        results.append(
+            check(
+                "append+merge hammer loses nothing",
+                rcs == [0, 0, 0] and len(hammers) == 45 and len(set(r["summary"] for r in hammers)) == 45,
+                f"rcs={rcs} hammers={len(hammers)}",
+            )
+        )
+
     print(f"\n{'ALL PASS' if all(results) else 'FAILURES PRESENT'} ({sum(results)}/{len(results)})")
     return 0 if all(results) else 1
 
