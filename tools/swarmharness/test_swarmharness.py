@@ -3277,10 +3277,11 @@ def main():
           json.dumps(x.get("reason_codes"))[:160])
     pr._now = real_now
 
-
     # =====================================================================
     # T36c — pressure repair v5 (round-4 residuals F35.2rrr-F35.11rrr).
+    # The frozen clock resumes: the round-5/6/7 fixtures pin clock[0].
     # =====================================================================
+    pr._now = lambda: clock[0]
     # F35.2rrr: caller-assertion consistency + the evidence gate
     # (a fresh uncertain permit per case — successful reconciliation
     # consumes the uncertainty)
@@ -3537,6 +3538,71 @@ def main():
             faults = [{"code": f"RAISED {type(e).__name__}"}]
         pure = json.dumps(bad, sort_keys=True) == before
         check(f"T36-27 {name} -> structural fault, pure, no raise",
+              bool(faults) and pure
+              and not any(str(x["code"]).startswith("RAISED")
+                          for x in faults),
+              json.dumps(faults)[:140])
+
+
+    # =====================================================================
+    # T36e — pressure repair v7 (round-6 residuals F35.6t / F35.10t).
+    # =====================================================================
+    # F35.6t: huge finite integer timestamps must HOLD, never escape
+    for name, ev in [
+            ("huge-negative-obs-ok", lambda b: {
+                "state": "ok", "source_ref": "probe-health",
+                "observed_at": -(10 ** 400),
+                "expires_at": clock[0] + 3600}),
+            ("huge-negative-obs-refusal", lambda b: {
+                "state": "refused", "pool_ref": "codex-sol",
+                "source_ref": "probe-health",
+                "observed_at": -(10 ** 400),
+                "retry_at": clock[0] + 60}),
+            ("huge-positive-obs", lambda b: {
+                "state": "ok", "source_ref": "probe-health",
+                "observed_at": 10 ** 400})]:
+        h7 = t36_auth(f"c7-{name}", cfg_hc, health=ev)
+        x = t36_admit(h7, f"c7-{name}-d")
+        check(f"T36-28 {name} HOLDs without escaping",
+              x["decision"] == "HOLD", json.dumps(x)[:140])
+    # and the ttl side: an absurd contract ttl must not overflow either
+    cfg_ttl = json.loads(json.dumps(cfg_hc))
+    cfg_ttl["planes"]["intelligence-consult"]["health_contract"] = {
+        "source_ref": "probe-health", "ttl_seconds": 10 ** 400}
+    h7 = t36_auth("c7-huge-ttl", cfg_ttl,
+                  health=lambda b: {"state": "ok",
+                                    "source_ref": "probe-health",
+                                    "observed_at": clock[0]})
+    x = t36_admit(h7, "c7-huge-ttl-d")
+    check("T36-28b huge contract ttl does not overflow",
+          x["decision"] == "ALLOW", json.dumps(x)[:140])
+    # F35.10t: the six value-level normalization paths
+    for name, mut in [
+            ("level-slot-value-string", lambda c: c["supply"]["pressure"]
+             ["levels"]["high"]["profile_slots"].update({"sol-high": "20"})),
+            ("level-default-null", lambda c: c["supply"]["pressure"]
+             ["levels"]["high"].update({"default_profile_slots": None})),
+            ("profiles-nonmapping", lambda c: c["catalog"]
+             .update({"execution_profiles": 7})),
+            ("adapter-ref-dict", lambda c: c["catalog"]["harnesses"]
+             ["codex"].update({"adapter_ref": {"x": 1}})),
+            ("role-refs-int", lambda c: c["roles"]["intelligence"]
+             .update({"binding_refs": 3})),
+            ("role-refs-dict-element", lambda c: c["roles"]["intelligence"]
+             ["binding_refs"].append({})),
+            ("plane-refs-dict-element", lambda c: c["planes"]
+             ["intelligence-consult"]["binding_refs"].append([])),
+            ("plane-health-contract-list", lambda c: c["planes"]
+             ["intelligence-consult"].update({"health_contract": [1]}))]:
+        bad = json.loads(json.dumps(v3))
+        mut(bad)
+        before = json.dumps(bad, sort_keys=True)
+        try:
+            faults = sc.validate(bad)
+        except Exception as e:
+            faults = [{"code": f"RAISED {type(e).__name__}"}]
+        pure = json.dumps(bad, sort_keys=True) == before
+        check(f"T36-29 {name} -> structural fault, pure, no raise",
               bool(faults) and pure
               and not any(str(x["code"]).startswith("RAISED")
                           for x in faults),

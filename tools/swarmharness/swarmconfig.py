@@ -492,9 +492,18 @@ def validate(cfg):
             _fault(f, "type_mismatch", f"planes.{plid}.binding_refs: list")
         else:
             for r in refs:
+                if not isinstance(r, str):
+                    _fault(f, "ref_missing",
+                           f"planes.{plid}.binding_refs: string refs required")
+                    continue
                 if r not in bindings:
                     _fault(f, "ref_missing", f"planes.{plid}.binding_refs -> {r}")
-        hc = pl.get("health_contract") or {}
+        hc = pl.get("health_contract")
+        if hc is not None and not isinstance(hc, dict):
+            _fault(f, "type_mismatch",
+                   f"planes.{plid}.health_contract: expected mapping")
+            hc = {}
+        hc = hc or {}
         _keys(f, f"planes.{plid}.health_contract", hc, {"source_ref", "ttl_seconds"})
         ttl = hc.get("ttl_seconds")
         if ttl is not None and (not isinstance(ttl, int) or ttl < 10):
@@ -521,7 +530,17 @@ def validate(cfg):
         if r.get("kind") == "deterministic" and r.get("model") not in (None, "none"):
             _fault(f, "invariant_violation", f"roles.{rid}: deterministic role must not declare a model")
         for key in ("binding_refs", "fallback_binding_refs"):
-            for ref in (r.get(key) or []):
+            refs_val = r.get(key)
+            if refs_val is not None and not isinstance(refs_val, list):
+                _fault(f, "type_mismatch",
+                       f"roles.{rid}.{key}: expected list")
+                continue
+            for ref in (refs_val or []):
+                if not isinstance(ref, str):
+                    # unhashable/malformed elements fault structurally
+                    _fault(f, "ref_missing",
+                           f"roles.{rid}.{key}: string refs required")
+                    continue
                 if ref not in bindings:
                     _fault(f, "ref_missing", f"roles.{rid}.{key} -> {ref}")
         dref = r.get("default_binding_ref")
@@ -532,7 +551,10 @@ def validate(cfg):
                 _fault(f, "invariant_violation",
                        f"role {rid} default binding {dref} must be admitted")
         caps = set(r.get("required_capabilities") or [])
-        for ref in (r.get("binding_refs") or []):
+        refs_val = r.get("binding_refs")
+        for ref in (refs_val if isinstance(refs_val, list) else []):
+            if not isinstance(ref, str):
+                continue  # faulted above; unhashable never reaches `in`
             bcaps = set((bindings.get(ref) or {}).get("capabilities") or [])
             missing = caps - bcaps
             if ref in bindings and (bindings[ref].get("status") == "admitted") and missing:
@@ -712,6 +734,10 @@ def _validate_pressure(f, cfg):
     # --- execution profiles
     # typed local map: a faulted malformed profile record is reported and
     # then EXCLUDED from every later consumer (F35.10rrr/F35.10rrrr)
+    if not isinstance(profiles, dict):
+        # faulted upstream by the catalog typecheck; normalize so the
+        # comprehension cannot .items() a nonmapping (F35.10t)
+        profiles = {}
     profiles_ok = {k: v for k, v in profiles.items() if isinstance(v, dict)}
     defaults = {}
     aliases = {}
@@ -741,6 +767,8 @@ def _validate_pressure(f, cfg):
                     (bindings.get(bref_ro) or {}).get("harness")) or {})
                     .get("adapter_ref")) if isinstance(bref_ro, str) and \
                     bref_ro in bindings else None
+                if not isinstance(aref, str):
+                    aref = None  # unhashable/malformed: no declared support
                 support = _ADAPTER_REASONING_SUPPORT.get(aref)
                 if support is None:
                     _fault(f, "PRESSURE_REF",
@@ -965,14 +993,17 @@ def _validate_pressure(f, cfg):
         lv = levels.get(lname)
         if not isinstance(lv, dict):
             return {}  # faulted upstream; never reaches .get consumers
-        lv = dict(lv)
         slots = {}
         m = lv.get("profile_slots")
         if isinstance(m, dict):
             for k, v in m.items():
-                slots[_ck(k)] = v
+                # VALUE-level normalization (F35.10t): a faulted non-int
+                # target is reported upstream and never reaches the
+                # delegation comparison
+                if type(v) is int and not isinstance(v, bool):
+                    slots[_ck(k)] = v
         dflt = lv.get("default_profile_slots")
-        if dflt is not None:
+        if type(dflt) is int and not isinstance(dflt, bool):
             for pid in canon_universe:
                 slots.setdefault(pid, dflt)
         return slots
@@ -1208,13 +1239,18 @@ def _validate_pressure(f, cfg):
             _fault(f, "PRESSURE_ROUTE_CONFLICT",
                    f"roles.{rid}: default_binding_ref disagrees with the "
                    "routing preferred profile's binding")
-        legacy_fb = r.get("fallback_binding_refs") or []
+        legacy_fb = r.get("fallback_binding_refs")
+        legacy_fb = legacy_fb if isinstance(legacy_fb, list) else []
         routed_fb = [_ref_binding(x)
                      for x in (fb_list or [])]
         if "fallback_binding_refs" in r and                 legacy_fb != [b for b in routed_fb if b]:
             _fault(f, "PRESSURE_ROUTE_CONFLICT",
                    f"roles.{rid}: fallback_binding_refs disagree with routing")
-        legacy_refs = r.get("binding_refs") or []
+        legacy_refs = r.get("binding_refs")
+        legacy_refs = legacy_refs if isinstance(legacy_refs, list) else []
+        # element-level typing: malformed elements were faulted upstream
+        # and never reach the set/hash consumers (F35.10t)
+        legacy_refs = [x for x in legacy_refs if isinstance(x, str)]
         needed = {b for b in ([pref_b] + [b for b in routed_fb if b]) if b}
         # presence-based: an EXPLICIT binding_refs projection must cover
         # the routed bindings even when the projection is empty (F35.10r)

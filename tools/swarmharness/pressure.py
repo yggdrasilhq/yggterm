@@ -977,12 +977,21 @@ class PressureAuthority:
                             if not _finite(obs_):
                                 return (f"health observation malformed on "
                                         f"{bind}")
+                            # int<->float comparisons are exact in CPython;
+                            # keep the arithmetic on the small float side so
+                            # huge finite integer timestamps cannot overflow
+                            # (F35.6t)
                             if obs_ > now + HEALTH_CLOCK_SKEW_SECONDS:
                                 return (f"health observation in the future "
                                         f"on {bind}")
-                            if type(ttl) is int and now - obs_ > ttl:
-                                return (f"health stale on {bind} "
-                                        f"(older than ttl {ttl})")
+                            if type(ttl) is int:
+                                try:
+                                    stale = obs_ < now - ttl
+                                except OverflowError:
+                                    stale = False  # ttl beyond float range
+                                if stale:
+                                    return (f"health stale on {bind} "
+                                            f"(older than ttl {ttl})")
                         exp_ = ok_ev.get("expires_at")
                         if exp_ is not None:
                             if not _finite(exp_):
