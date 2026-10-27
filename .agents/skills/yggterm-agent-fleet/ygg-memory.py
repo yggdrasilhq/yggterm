@@ -3268,11 +3268,13 @@ def migrate_legacy_store(root: Path) -> int:
         journal = get_journal_path(root)
         with journal_writer_lock(journal.parent):
             _ji_repair_partial_tail(journal)
-            payload = "".join(json.dumps(record) + "\n" for record in pending)
+            payload = "".join(json.dumps(record) + "\n" for record in pending).encode("utf-8")
+            pre_size = journal.stat().st_size if journal.exists() else 0
             fd = os.open(journal, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
             try:
-                if os.write(fd, payload.encode("utf-8")) != len(payload.encode("utf-8")):
-                    raise RuntimeError("migration journal append short-write; aborted")
+                if os.write(fd, payload) != len(payload):
+                    os.truncate(journal, pre_size)
+                    raise RuntimeError("migration journal append short-write; truncated back")
             finally:
                 os.close(fd)
     marker.write_text("content-addressed-event-store-v2\n", encoding="utf-8")
