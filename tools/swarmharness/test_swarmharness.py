@@ -3576,6 +3576,41 @@ def main():
     x = t36_admit(h7, "c7-huge-ttl-d")
     check("T36-28b huge contract ttl does not overflow",
           x["decision"] == "ALLOW", json.dumps(x)[:140])
+    # sol round-7 counterexample: huge ttl + STALE observation — exact
+    # arithmetic must HOLD (healthy) and install nothing (refusal)
+    ev_stale = lambda b: {"state": "ok", "source_ref": "probe-health",
+                          "observed_at": -2 * 10 ** 400,
+                          "expires_at": clock[0] + 60}
+    h7b = t36_auth("c7-huge-ttl-stale", cfg_ttl, health=ev_stale)
+    x = t36_admit(h7b, "c7-hts-d")
+    y = t36_admit(h7b, "c7-hts-peer", profile="sol-medium")
+    check("T36-28c huge-ttl stale observation HOLDs (exact arithmetic)",
+          x["decision"] == "HOLD"
+          and y["decision"] == "HOLD"
+          and any("stale" in rc for rc in x["reason_codes"]),
+          json.dumps([x.get("reason_codes"),
+                      y.get("reason_codes")])[:200])
+    h7c = t36_auth("c7-huge-ttl-refusal", cfg_ttl)
+    seen6 = [0]
+
+    def stale_refusal(b):
+        seen6[0] += 1
+        if seen6[0] == 1:
+            return {"state": "refused", "pool_ref": "codex-sol",
+                    "source_ref": "probe-health",
+                    "observed_at": -2 * 10 ** 400,
+                    "retry_at": clock[0] + 30}
+        return healthy(b)
+
+    h7c.health_evidence = stale_refusal
+    x = t36_admit(h7c, "c7-hts-refusal")
+    y = t36_admit(h7c, "c7-hts-refusal-peer", profile="sol-medium")
+    cd = json.loads(dict(h7c._db.execute(
+        "SELECT key, value FROM meta")).get("pool_cooldowns", "{}"))
+    check("T36-28d stale refusal HOLDs and installs no cooldown",
+          x["decision"] == "HOLD" and y["decision"] == "ALLOW"
+          and cd == {}, json.dumps([x["decision"], y["decision"],
+                                    cd])[:200])
     # F35.10t: the six value-level normalization paths
     for name, mut in [
             ("level-slot-value-string", lambda c: c["supply"]["pressure"]

@@ -70,6 +70,7 @@ import threading
 import time
 import uuid
 from contextlib import contextmanager
+from fractions import Fraction
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -985,10 +986,17 @@ class PressureAuthority:
                                 return (f"health observation in the future "
                                         f"on {bind}")
                             if type(ttl) is int:
+                                # EXACT freshness arithmetic (F35.6t):
+                                # Fraction is exact over the accepted
+                                # numeric domain (huge finite ints and
+                                # floats alike) — an overflow fallback
+                                # that asserts freshness is forbidden
                                 try:
-                                    stale = obs_ < now - ttl
-                                except OverflowError:
-                                    stale = False  # ttl beyond float range
+                                    stale = (Fraction(obs_) + Fraction(ttl)
+                                             < Fraction(now))
+                                except (ValueError, TypeError):
+                                    return (f"health observation malformed "
+                                            f"on {bind}")
                                 if stale:
                                     return (f"health stale on {bind} "
                                             f"(older than ttl {ttl})")
