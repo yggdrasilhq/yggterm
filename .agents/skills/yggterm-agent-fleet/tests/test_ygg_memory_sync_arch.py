@@ -246,6 +246,103 @@ def main():
             )
         )
 
+    # R1: same-size MIDDLE rewrite is detected (head + tail anchors unchanged)
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        jp = root / "journal.jsonl"
+        a = rand_records(random.Random(11), 40)
+        write_journal(jp, a)
+        mod.read_journal_entries(root)
+        b = [dict(r) for r in a]
+        b[20]["version_id"] = "BAD"  # same-size middle mutation
+        write_journal(jp, b)
+        got = mod.read_journal_entries(root)
+        results.append(
+            check(
+                "same-size middle rewrite detected",
+                got == mod._read_journal_entries_naive(root)
+                and any(r.get("version_id") == "BAD" for r in got),
+            )
+        )
+        # R1b: a stale max_seq must not survive a rebuild after truncation
+        lines = jp.read_text().splitlines()
+        jp.write_text("\n".join(lines[:5]) + "\n", encoding="utf-8")
+        results.append(
+            check(
+                "max_seq decreases after truncation",
+                mod.get_latest_seq(root) == max(int(json.loads(l)["seq"]) for l in lines[:5]),
+            )
+        )
+
+    # R3: unchanged refreshes preserve anchors — gen stays flat across reads
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        write_journal(root / "journal.jsonl", rand_records(random.Random(12), 30))
+        gens = []
+        for _ in range(5):
+            mod.read_journal_entries(root)
+            conn = mod._ji_connect(root)
+            gens.append(mod._ji_meta_get(conn).get("gen"))
+            conn.close()
+        results.append(check("unchanged refresh keeps gen flat", len(set(gens)) == 1, str(gens)))
+
+    # R2b: a long (100KB) unparsed tail is repaired without losing records
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        jp = root / "journal.jsonl"
+        write_journal(jp, rand_records(random.Random(13), 10))
+        with open(jp, "ab") as f:
+            f.write(b"x" * 100_000)  # >64KB debris, no newline
+        mod.append_journal_entry(root, "a", "x.md", "note", "upsert", "zcode", "t-long")
+        recs = mod.read_journal_entries(root)
+        results.append(
+            check(
+                "long tail repaired, records kept",
+                len(recs) == 11
+                and sum(1 for r in recs if r.get("summary") == "t-long") == 1
+                and recs == mod._read_journal_entries_naive(root),
+            )
+        )
+
+    # R6a: a valid unterminated final record is read, then newline-completed
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        jp = root / "journal.jsonl"
+        write_journal(jp, rand_records(random.Random(14), 5))
+        with open(jp, "a", encoding="utf-8") as f:
+            f.write(json.dumps({"seq": 6, "ns": "a", "file": "u.md", "digest": None,
+                                "version_id": "v-unterminated", "target_harness": "all"}))
+        got = mod.read_journal_entries(root)
+        seen = any(r.get("version_id") == "v-unterminated" for r in got)
+        mod.append_journal_entry(root, "a", "y.md", "note", "upsert", "zcode", "t-after")
+        still = mod._read_journal_entries_naive(root)
+        results.append(
+            check(
+                "unterminated final record read + preserved",
+                seen
+                and any(r.get("version_id") == "v-unterminated" for r in still)
+                and any(r.get("summary") == "t-after" for r in still),
+            )
+        )
+
+    # R6b: digest lookup excludes seq<=0 rows exactly like the naive scan
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        recs = rand_records(random.Random(15), 20)
+        recs[7]["seq"] = 0
+        write_journal(root / "journal.jsonl", recs)
+        results.append(
+            check(
+                "digest lookup skips seq=0",
+                mod.version_for_digest(root, recs[7]["ns"], recs[7]["file"], recs[7]["digest"])
+                == (
+                    [r.get("version_id") for r in mod._read_journal_entries_naive(
+                        root, namespace=recs[7]["ns"])
+                      if r.get("file") == recs[7]["file"] and r.get("digest") == recs[7]["digest"]] or [None]
+                )[-1],
+            )
+        )
+
     print(f"\n{'ALL PASS' if all(results) else 'FAILURES PRESENT'} ({sum(results)}/{len(results)})")
     return 0 if all(results) else 1
 
