@@ -437,6 +437,19 @@ def _adjudicate_one(state, area, p):
     if head is not None:
         prev = _read_release_cfg(state, head_hash)
     endorsed = verify_endorsement(env, state)
+    # F35.4rr: the authenticated context is resolved BEFORE preauthorization
+    # and the SAME verified resolution drives both the precheck and accept.
+    # The sync transport vouches for the captured principal (claimed
+    # principal, else the origin host); the vouched role is "owner" for
+    # endorsed captures, "agent" otherwise. A config enables ledger-carried
+    # demand edits by listing "agent" in pressure control agent_role_refs.
+    verified_agent = ("owner" if endorsed
+                      else env.get("claimed_principal") or p.get("origin_host"))
+    _vouched_role = "owner" if endorsed else "agent"
+
+    def _ledger_verifier(who, _v=verified_agent, _r=_vouched_role):
+        return _r if who == _v else None
+
     if endorsed:
         authority_class, principal = "owner", "owner"
     elif prev is None:
@@ -444,12 +457,12 @@ def _adjudicate_one(state, area, p):
                 "detail": "no accepted baseline (bootstrap): only an endorsed owner proposal may commit",
                 "preserved": True}
     else:
-        bad = _agent_unauthorized(prev, cfg)
+        bad = _agent_unauthorized(prev, cfg, issuer_role_ref=_vouched_role)
         if bad:
             return {**base_detail, "decision": "pending_authorization",
                     "detail": f"raw edit; owner endorsement required for {bad[:5]}",
                     "preserved": True}
-        authority_class, principal = "agent", f"agent:{env.get('claimed_principal') or p.get('origin_host')}"
+        authority_class, principal = "agent", f"agent:{verified_agent}"
 
     # dev constructs the final release with machine-owned identity fields
     final = dict(cfg)
@@ -468,7 +481,9 @@ def _adjudicate_one(state, area, p):
     # pointer; recovery reads committed releases exclusively.
     r = accept(final_bytes, proposed_by=principal, authority_class=authority_class,
                parent_expected=head_hash, state_dir=state, change_id=cid,
-               reason=final["identity"]["reason"], commit_point="seal-only")
+               reason=final["identity"]["reason"], commit_point="seal-only",
+               principal_verifier=_ledger_verifier,
+               verified_principal=verified_agent, issuer_role_ref="agent")
     if r["decision"] != "accepted":
         return {**base_detail, "decision": r["decision"],
                 "detail": "; ".join(x["detail"] for x in r["faults"])[:200]}
@@ -478,7 +493,9 @@ def _adjudicate_one(state, area, p):
     _journal_append(state, area, rec)  # COMMIT POINT (fsync)
     r = accept(final_bytes, proposed_by=principal, authority_class=authority_class,
                parent_expected=head_hash, state_dir=state, change_id=cid,
-               reason=final["identity"]["reason"], commit_point="activate-only")
+               reason=final["identity"]["reason"], commit_point="activate-only",
+               principal_verifier=_ledger_verifier,
+               verified_principal=verified_agent, issuer_role_ref="agent")
     _refresh_current_yaml(state)
     return {**base_detail, "decision": "accepted",
             "revision": r.get("revision"), "content_hash": r.get("content_hash")}

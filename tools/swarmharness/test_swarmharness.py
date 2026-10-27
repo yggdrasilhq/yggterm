@@ -59,6 +59,22 @@ def child_load_noyaml(state_dir):
 
 
 def main():
+    # suite-wide principal verifier for agent-class accept calls (F35.4r):
+    # a claimed role never authorizes — the resolved role does
+    SUITE_PRINCIPALS = {"agent:core-keeper": "core-keeper",
+                        "agent:x": "intelligence",
+                        "orchestrator-agent": "intelligence",
+                        "agent-x": "intelligence"}
+
+    def suite_verifier(p):
+        return SUITE_PRINCIPALS.get(p)
+
+    def agent_accept(payload, *, proposed_by, state_dir, **kw):
+        kw.setdefault("principal_verifier", suite_verifier)
+        kw.setdefault("verified_principal", proposed_by)
+        return sc.accept(payload, proposed_by=proposed_by,
+                         authority_class="agent", state_dir=state_dir, **kw)
+
     # ---- 1. genesis validates; semantic hash is stable and hex64
     cfg, pf = sc.parse_yaml_bytes(GENESIS)
     check("genesis parses", pf is None, str(pf))
@@ -124,7 +140,7 @@ def main():
     v2["identity"]["parent_hash"] = sc.content_hash(cfg)
     v2["identity"]["change_id"] = str(uuid.uuid4())
     v2["supply"]["schedules"] = {"wake_interval_min": 30}
-    ra = sc.accept(v2, proposed_by="agent:core-keeper", authority_class="agent", state_dir=sd)
+    ra = agent_accept(v2, proposed_by="agent:core-keeper", state_dir=sd)
     check("agent supply edit accepted", ra["decision"] == "accepted", json.dumps(ra["faults"]))
 
     v3 = json.loads(json.dumps(v2))
@@ -132,7 +148,7 @@ def main():
     v3["identity"]["parent_hash"] = ra["content_hash"]
     v3["identity"]["change_id"] = str(uuid.uuid4())
     v3["planes"]["plane1"]["owner_policy"] = "disabled"
-    ru = sc.accept(v3, proposed_by="agent:core-keeper", authority_class="agent", state_dir=sd)
+    ru = agent_accept(v3, proposed_by="agent:core-keeper", state_dir=sd)
     check("agent plane edit -> rejected_unauthorized",
           ru["decision"] == "rejected_unauthorized", ru["decision"])
     check("head after unauthorized == v2 head", sc.active_head(sd)["content_hash"] == ra["content_hash"])
@@ -149,7 +165,7 @@ def main():
     v4["identity"]["parent_hash"] = ro["content_hash"]
     v4["identity"]["change_id"] = str(uuid.uuid4())
     v4["catalog"]["bindings"]["bnew"] = {"status": "declared", "capabilities": ["dreamer"]}
-    radd = sc.accept(v4, proposed_by="agent:x", authority_class="agent", state_dir=sd)
+    radd = agent_accept(v4, proposed_by="agent:x", state_dir=sd)
     check("agent adds declared binding accepted", radd["decision"] == "accepted",
           json.dumps(radd["faults"]))
     v5 = json.loads(json.dumps(v4))
@@ -157,7 +173,7 @@ def main():
     v5["identity"]["parent_hash"] = radd["content_hash"]
     v5["identity"]["change_id"] = str(uuid.uuid4())
     v5["catalog"]["bindings"]["b1"]["model"] = "hijacked"
-    redit = sc.accept(v5, proposed_by="agent:x", authority_class="agent", state_dir=sd)
+    redit = agent_accept(v5, proposed_by="agent:x", state_dir=sd)
     check("agent edits existing binding rejected",
           redit["decision"] == "rejected_unauthorized", redit["decision"])
     sd2 = temp_state()
@@ -396,8 +412,8 @@ def main():
     pb = json.loads(json.dumps(cfg))
     pb["identity"].update(revision=2, parent_hash=hP, change_id=str(uuid.uuid4()))
     pb["supply"]["budgets"]["bud1"]["hard_limits"]["tokens"] = 999999999
-    rp = sc.accept(sc.canonical_json(pb), proposed_by="agent:x", authority_class="agent",
-                   parent_expected=hP, state_dir=sdP)
+    rp = agent_accept(sc.canonical_json(pb), proposed_by="agent:x",
+                      parent_expected=hP, state_dir=sdP)
     check("P1 agent budget increase rejected", rp["decision"] == "rejected_unauthorized",
           rp["decision"])
 
@@ -2282,7 +2298,12 @@ def main():
     import pressure as pr
 
     def healthy(binding):
-        return {"state": "ok", "source": "test", "concurrent_limit": None}
+        # dated evidence: conforms on contract planes too (the source_ref
+        # matches the suite's probe contracts; observed_at follows the
+        # suite's clock — real before T36, frozen within it)
+        return {"state": "ok", "source_ref": "probe-health",
+                "observed_at": pr._now(), "expires_at": pr._now() + 3600,
+                "concurrent_limit": None}
 
     PRINCIPALS = {"orch-intel": "intelligence", "orch-intel-2": "intelligence",
                   "orch-editor": "editor"}
@@ -2308,7 +2329,9 @@ def main():
     # three admitted bindings the profiles ride (conformance genesis has
     # only its own b1/b2 seed bindings)
     v3["catalog"]["harnesses"].update({
-        "codex": {"kind": "consult-cli"}, "agy": {"kind": "consult-cli"}, "zcode-tui": {"kind": "dispatch-queue"}})
+        "codex": {"kind": "consult-cli", "adapter_ref": "consult-codex-v1"},
+        "agy": {"kind": "consult-cli", "adapter_ref": "consult-agy-v1"},
+        "zcode-tui": {"kind": "dispatch-queue", "adapter_ref": "queue-serve-v2"}})
     v3["catalog"]["providers"].update({p: {"id": p} for p in ("openai", "google", "zai")})
     v3["catalog"]["accounts"].update({"openai-sol": {"provider": "openai"}, "google-bundled": {"provider": "google"}, "zai-primary": {"provider": "zai"}})
     v3["catalog"]["plans"].update({"openai-paid": {"provider": "openai", "kind": "subscription"}, "gemini-bundled": {"provider": "google", "kind": "subscription"}, "zai-coding-plan": {"provider": "zai", "kind": "subscription"}})
@@ -2514,29 +2537,29 @@ def main():
                              parent_hash=head9, change_id=change)
         return json.dumps(d)
 
-    ra = sc.accept(agent_variant(
+    ra = agent_accept(agent_variant(
         lambda d: d["supply"]["pressure"]["demand"].update(level="saturate"),
         "22222222-2222-4333-8444-555555555551"),
-        proposed_by="orchestrator-agent", authority_class="agent",
+        proposed_by="orchestrator-agent",
         state_dir=sd9, issuer_role_ref="intelligence")
     check("T35-9 delegated demand change accepted from an agent",
           ra["decision"] == "accepted", json.dumps(ra["faults"])[:200])
     head9 = sc.active_head(sd9)["content_hash"]
-    rc_ = sc.accept(agent_variant(
+    rc_ = agent_accept(agent_variant(
         lambda d: d["supply"]["pressure"]["ceilings"].update(
             global_concurrent_slots=256),
         "22222222-2222-4333-8444-555555555552"),
-        proposed_by="orchestrator-agent", authority_class="agent",
+        proposed_by="orchestrator-agent",
         state_dir=sd9)
     check("T35-9b agent raising a ceiling -> rejected_unauthorized",
           rc_["decision"] == "rejected_unauthorized", rc_["decision"])
     head9 = sc.active_head(sd9)["content_hash"]
-    rr = sc.accept(agent_variant(
+    rr = agent_accept(agent_variant(
         lambda d: d["supply"]["pressure"].update(
             control=dict(d["supply"]["pressure"]["control"],
                          agent_level_names=["normal"])),
         "22222222-2222-4333-8444-555555555553"),
-        proposed_by="agent-x", authority_class="agent", state_dir=sd9)
+        proposed_by="agent-x", state_dir=sd9)
     check("T35-9c undelegated level -> rejected_unauthorized",
           rr["decision"] == "rejected_unauthorized", rr["decision"])
 
@@ -2640,8 +2663,9 @@ def main():
                      plane_ref="intelligence-consult")
     auth5.mark_uncertain(pm["permit_ref"], "ack lost")
     rd = auth5.redeem(pm["permit_ref"], dispatch_id="dU",
-                      attempt_id="aU")
-    auth5.reconcile(pm["permit_ref"], launched=True)
+                      attempt_id="aU", executor="orch-intel")
+    auth5.reconcile(pm["permit_ref"], launched=True,
+                    dispatch_id="dU", attempt_id="aU")
     occU = auth5.status()["occupancy"]
     auth5.release(pm["permit_ref"])
     occR = auth5.status()["occupancy"]
@@ -2676,6 +2700,950 @@ def main():
           "GLM-5.3-Flash"
           and pv["profiles"]["glm-max"]["binding_ref"] == "glm-workhorse")
 
+
+
+    # =====================================================================
+    # T36 — pressure repair v3 (delta review F35.1r-F35.11r residuals).
+    # Each check pins one required repair from the sol delta review
+    # (2026-10-26): read-only open, explicit restart, executor
+    # re-verification, expired-grant terminalization, plane derivation,
+    # spent markers, atomic budget refresh, cooldown sharing, capability
+    # intersection, alias resolution, expanded-target bounds, and the
+    # legacy executable view.
+    # =====================================================================
+    clock = [1800000000.0]
+    real_now = pr._now
+    real_now_holder = {"real": real_now}
+    pr._now = lambda: clock[0]
+    suite_principals2 = {"worker": "intelligence", "editor2": "editor",
+                         "dreamer": "dreamers"}
+
+    def suite_verifier2(p):
+        return suite_principals2.get(p)
+
+    def t36_auth(tag, cfg=None, *, health=None, verifier=None, view=None,
+                 config_hash=None):
+        cfg = cfg if cfg is not None else v3
+        v = view if view is not None else sc.pressure_view(cfg)
+        return pr.PressureAuthority.provision(
+            v, config_hash or f"t36-{tag}",
+            state_dir=temp_state() / f"t36-{tag}",
+            health_evidence=health if health is not None else healthy,
+            principal_verifier=verifier or suite_verifier2,
+            budgets=(cfg.get("supply") or {}).get("budgets"),
+            plane_budgets={
+                pid: {"binding_refs": p.get("binding_refs") or [],
+                      "owner_policy": p.get("owner_policy"),
+                      "budget_refs": p.get("budget_refs") or []}
+                for pid, p in (cfg.get("planes") or {}).items()})
+
+    def t36_admit(a, d, attempt="a", role="intelligence",
+                  profile="sol-high", plane="intelligence-consult",
+                  principal="worker"):
+        return a.admit(dispatch_id=d, attempt_id=attempt,
+                       verified_principal=principal, role_ref=role,
+                       profile_ref=profile, plane_ref=plane)
+
+    def t36_launch(a, d, **kw):
+        x = t36_admit(a, d, **kw)
+        assert x["decision"] == "ALLOW", (d, x)
+        r = a.redeem(x["permit_ref"], dispatch_id=d, attempt_id="a",
+                     executor=kw.get("principal", "worker"))
+        assert r.get("ok"), r
+        return x["permit_ref"]
+
+    # F35.1r: ordinary open is read-only; the store identity is
+    # authoritative; every mutation fences
+    a = t36_auth("open-ro")
+    pref = t36_launch(a, "ro-launch")
+    b = pr.PressureAuthority(
+        a.view, a.config_hash, state_dir=a.db_path.parents[2],
+        health_evidence=a.health_evidence,
+        principal_verifier=a.principal_verifier, budgets=a.budgets,
+        plane_budgets=a.plane_budgets)
+    check("T36-1 reopening preserves replay identity (read-only open)",
+          b._db.execute("SELECT state FROM permits WHERE permit_ref=?",
+                        (pref,)).fetchone()[0] == "redeemed")
+    x = t36_admit(b, "ro-launch")
+    check("T36-1b replayed dispatch returns the same permit",
+          x["decision"] == "ALLOW" and x.get("permit_ref") == pref)
+    b.release(pref)
+    x = t36_admit(b, "ro-new")
+    check("T36-1c new dispatch on the reopened handle admits after release",
+          x["decision"] == "ALLOW", json.dumps(x)[:120])
+    stale = pr.PressureAuthority(
+        a.view, a.config_hash, state_dir=a.db_path.parents[2],
+        health_evidence=a.health_evidence,
+        principal_verifier=a.principal_verifier, budgets=a.budgets,
+        plane_budgets=a.plane_budgets)
+    act = b.activate(json.loads(json.dumps(b.view)), "t" * 64)
+    x2 = t36_admit(b, "post-act")
+    check("T36-1d activation ok; stale mark/reconcile/release fenced",
+          act.get("ok") and x2["decision"] == "ALLOW"
+          and not stale.mark_uncertain(x2["permit_ref"]).get("ok")
+          and not stale.release(x2["permit_ref"]).get("ok")
+          and not stale.reconcile(x2["permit_ref"], launched=False,
+                                  dispatch_id="post-act",
+                                  attempt_id="a").get("ok"),
+          json.dumps(act)[:120])
+    a2 = t36_auth("restart")
+    pref2 = t36_launch(a2, "rs-live")
+    rs = a2.restart()
+    check("T36-2 restart keeps launched history and sets the barrier",
+          rs.get("ok") and a2.status()["reconcile_barrier"]
+          and a2._db.execute(
+              "SELECT state FROM permits WHERE permit_ref=?",
+              (pref2,)).fetchone()[0] == "redeemed")
+    a2.release(pref2)
+    check("T36-2b release clears the barrier",
+          not a2.status()["reconcile_barrier"])
+    a3 = t36_auth("expiry")
+    pref3 = t36_admit(a3, "exp-dispatch")["permit_ref"]
+    clock[0] += 31
+    x = t36_admit(a3, "exp-dispatch", attempt="b")
+    check("T36-3 expired never-redeemed grant terminalizes and frees "
+          "the dispatch",
+          x["decision"] == "ALLOW"
+          and a3._db.execute(
+              "SELECT state FROM permits WHERE permit_ref=?",
+              (pref3,)).fetchone()[0] == "expired")
+    clock[0] = 1800000000.0
+    # F35.2r: executor re-verification and reconcile evidence
+    a4 = t36_auth("authz")
+    pref4 = t36_admit(a4, "authz-d")["permit_ref"]
+    a4.principal_verifier = lambda p: None
+    r = a4.redeem(pref4, dispatch_id="authz-d", attempt_id="a",
+                  executor="worker")
+    a4.principal_verifier = suite_verifier2
+    r2 = a4.redeem(pref4, dispatch_id="authz-d", attempt_id="a",
+                   executor="worker")
+    a4.mark_uncertain(pref4)
+    a4.principal_verifier = lambda p: None
+    rc = a4.reconcile(pref4, launched=False, dispatch_id="authz-d",
+                      attempt_id="a")
+    a4.principal_verifier = suite_verifier2
+    rc2 = a4.reconcile(pref4, launched=False, dispatch_id="wrong",
+                       attempt_id="a")
+    rc3 = a4.reconcile(pref4, launched=False, dispatch_id="authz-d",
+                       attempt_id="a")
+    check("T36-4 redeem/reconcile re-verify; supplied identity exact; "
+          "launched strict bool",
+          not r.get("ok") and r2.get("ok") and not rc.get("ok")
+          and not rc2.get("ok") and rc3.get("ok")
+          and not a4.reconcile(pref4, launched="no", dispatch_id="x",
+                               attempt_id="x").get("ok"))
+    # F35.3r: plane derivation, spending lifecycle, atomic refresh
+    cfg_b36 = json.loads(json.dumps(v3))
+    cfg_b36["supply"]["budgets"]["b-consult-daily"]["hard_limits"] = {
+        "consults": 1}
+    f36 = pr.authority_from_config(
+        cfg_b36, "t36-budget",
+        state_dir=temp_state() / "t36-budget",
+        health_evidence=healthy, principal_verifier=suite_verifier2)
+    check("T36-5 factory loads budgets from config",
+          f36.budgets.get("b-consult-daily", {}).get("hard_limits") ==
+          {"consults": 1})
+    p5 = t36_launch(f36, "bud-first")
+    f36.release(p5)
+    x = t36_admit(f36, "bud-second")
+    xn = t36_admit(f36, "bud-noplane", plane=None)
+    check("T36-5b spent work retains spending; omitted plane derives",
+          x["decision"] == "HOLD" and xn["decision"] == "HOLD")
+    f36b = pr.authority_from_config(
+        cfg_b36, "t36-budget2",
+        state_dir=temp_state() / "t36-budget2",
+        health_evidence=healthy, principal_verifier=suite_verifier2)
+    p5b = t36_launch(f36b, "bud-reconciled")
+    f36b.mark_uncertain(p5b)
+    f36b.reconcile(p5b, launched=True, dispatch_id="bud-reconciled",
+                   attempt_id="a")
+    f36b.release(p5b)
+    x = t36_admit(f36b, "bud-after-reconciled")
+    check("T36-5c reconciled launch keeps its spent marker",
+          x["decision"] == "HOLD", json.dumps(x)[:140])
+    cfg_mix = json.loads(json.dumps(v3))
+    cfg_mix["supply"]["budgets"]["b-consult-daily"]["hard_limits"] = {
+        "consults": 100, "tokens": 5}
+    m36 = t36_auth("mix", cfg_mix)
+    x = t36_admit(m36, "mix-d")
+    check("T36-5d mixed budget without token accounting CONTAINs",
+          x["decision"] == "CONTAIN", json.dumps(x)[:140])
+    p6 = t36_launch(b, "spent-refresh")
+    b.mark_uncertain(p6)
+    b.reconcile(p6, launched=True, dispatch_id="spent-refresh",
+                attempt_id="a")
+    b.release(p6)
+    newview = json.loads(json.dumps(b.view))
+    act = b.activate(newview, "u" * 64)
+    check("T36-5e activation refreshes budgets bound to the policy hash",
+          act.get("ok") and b.config_hash == "u" * 64
+          and b.budgets == newview["budgets"])
+    # F35.6r: health expiry, malformed limit, provider failure, binding
+    # intersection, cooldown sharing, capability intersection
+    for name, ev in [
+            ("expired", lambda b: {"state": "ok", "expires_at":
+                                   clock[0] - 1}),
+            ("badlimit", lambda b: {"state": "ok",
+                                    "concurrent_limit": "zero"}),
+            ("raise", lambda b: (_ for _ in ()).throw(OSError("x")))]:
+        h36 = t36_auth(f"health-{name}", health=ev)
+        x = t36_admit(h36, f"health-{name}-d")
+        check(f"T36-6 health {name} fail-closed",
+              x["decision"] == "HOLD", json.dumps(x)[:140])
+    h36 = t36_auth("health-bind",
+                   health=lambda b: {"state": "ok", "concurrent_limit": 1})
+    t36_launch(h36, "hb-first")
+    x = t36_admit(h36, "hb-second", profile="sol-medium")
+    check("T36-6b health limit binds the shared binding",
+          x["decision"] == "HOLD"
+          and any("health limit" in rc for rc in x["reason_codes"]),
+          json.dumps(x)[:140])
+    c36 = t36_auth("cooldown")
+    seen = [0]
+
+    def refusing(b):
+        seen[0] += 1
+        if seen[0] == 1:
+            return {"state": "refused", "pool_ref": "codex-sol",
+                    "retry_at": clock[0] + 60}
+        return {"state": "ok"}
+
+    c36.health_evidence = refusing
+    x = t36_admit(c36, "cd-first")
+    y = t36_admit(c36, "cd-peer", profile="sol-medium")
+    check("T36-6c pool refusal cooldown persists across member profiles",
+          x["decision"] == "HOLD" and y["decision"] == "HOLD"
+          and any("cooldown" in rc for rc in y["reason_codes"]),
+          json.dumps([x["reason_codes"], y["reason_codes"]])[:160])
+    cfg_cap = json.loads(json.dumps(v3))
+    cfg_cap["roles"]["editor"]["required_capabilities"] = ["implementation"]
+    cap36 = t36_auth("cap", cfg_cap)
+    x = cap36.admit(dispatch_id="cap-d", attempt_id="a",
+                    verified_principal="editor2", role_ref="editor",
+                    profile_ref="sol-high",
+                    plane_ref="intelligence-consult")
+    check("T36-6d required capability intersects at admission",
+          x["decision"] != "ALLOW", json.dumps(x)[:140])
+    # F35.7r: alias route resolution and alias override effect
+    al36 = t36_auth("alias")
+    x = t36_admit(al36, "alias-d", profile="sol-editor/default")
+    check("T36-7 canonical alias resolves the route to sol-high",
+          x["decision"] == "ALLOW" and x.get("profile_ref") == "sol-high",
+          json.dumps(x)[:140])
+    cfg_ov = json.loads(json.dumps(v3))
+    cfg_ov["supply"]["pressure"]["demand"]["profile_slot_overrides"][
+        "sol-editor/default"] = 1
+    check("T36-7b alias override lands on the canonical profile",
+          not sc.validate(cfg_ov)
+          and sc.pressure_view(cfg_ov)["baseline"]["sol-high"] == 1)
+    # F35.8r: activation counts PROPOSED pool membership over bindings
+    p36 = t36_auth("pools")
+    t36_launch(p36, "pool-1")
+    t36_launch(p36, "pool-2", profile="sol-medium")
+    vpool = json.loads(json.dumps(p36.view))
+    vpool["pools"]["codex-sol"]["binding_refs"].append("gemini-reviewer")
+    vpool["pools"]["codex-sol"]["concurrent_slots"] = 1
+    x = p36.activate(vpool, "p" * 64)
+    check("T36-8 activation bounds proposed pool membership",
+          not x.get("ok") and any("BELOW_INFLIGHT" in fl
+                                  for fl in x.get("faults", [])),
+          json.dumps(x)[:160])
+    # F35.9r: lost store CONTAINs; missing signer key CONTAINs
+    sd_lost = temp_state() / "t36-lost"
+    l36 = pr.authority_from_config(v3, "t36-lost", state_dir=sd_lost,
+                                   health_evidence=healthy,
+                                   principal_verifier=suite_verifier2)
+    t36_launch(l36, "lost-live")
+    l36._db.close()
+    (sd_lost / "runtime" / "pressure" / "state.sqlite").unlink()
+    l36b = pr.authority_from_config(v3, "t36-lost", state_dir=sd_lost,
+                                    health_evidence=healthy,
+                                    principal_verifier=suite_verifier2)
+    x = t36_admit(l36b, "after-lost")
+    check("T36-9 vacated store inside an initialized area CONTAINs",
+          x["decision"] == "CONTAIN", json.dumps(x)[:140])
+    s36 = t36_auth("signer")
+    s36._db.execute("DELETE FROM meta WHERE key='signer_key'")
+    s36._db.commit()
+    s36._db.close()
+    s36b = pr.PressureAuthority(
+        s36.view, s36.config_hash, state_dir=s36.db_path.parents[2],
+        health_evidence=s36.health_evidence,
+        principal_verifier=s36.principal_verifier, budgets=s36.budgets,
+        plane_budgets=s36.plane_budgets)
+    x = t36_admit(s36b, "after-signer-loss")
+    check("T36-9b missing signer key CONTAINs (no fallback key)",
+          x["decision"] == "CONTAIN", json.dumps(x)[:140])
+    # F35.10r schema closures
+    bad = json.loads(json.dumps(v3))
+    bad["supply"]["pressure"]["control"]["lease_max_active_per_issuer"] = True
+    check("T36-10 lease_max_active bool rejected (exact int)",
+          bool(sc.validate(bad)))
+    for name, mut in [
+            ("binding-ceilings", lambda c: c["supply"]["pressure"]
+             ["ceilings"].update({"binding_concurrent_slots": [1]})),
+            ("level-slots", lambda c: c["supply"]["pressure"]["levels"]
+             ["high"].update({"profile_slots": [1]})),
+            ("overrides", lambda c: c["supply"]["pressure"]["demand"]
+             .update({"profile_slot_overrides": [1]})),
+            ("routing", lambda c: c["roles"]["editor"]
+             .update({"routing": [1]}))]:
+        bad = json.loads(json.dumps(v3))
+        mut(bad)
+        try:
+            faults = sc.validate(bad)
+        except Exception as e:
+            faults = [{"code": f"RAISED {e}"}]
+        check(f"T36-10b malformed {name} -> structural fault, no raise",
+              bool(faults), json.dumps(faults)[:140])
+    bad = json.loads(json.dumps(v3))
+    bad["roles"]["intelligence"]["binding_refs"] = []
+    check("T36-10c empty binding_refs projection must still cover routes",
+          any(x["code"] == "PRESSURE_ROUTE_CONFLICT"
+              for x in sc.validate(bad)))
+    bad = json.loads(json.dumps(v3))
+    bad["supply"]["pressure"]["control"]["persistent_agent_edits"] = False
+    for lv_ in bad["supply"]["pressure"]["levels"].values():
+        lv_["default_profile_slots"] = 20
+        lv_["profile_slots"] = {}
+    check("T36-10d expanded default targets bound by profile ceilings",
+          any(x["code"] == "PRESSURE_BOUNDS" for x in sc.validate(bad)))
+    bad = json.loads(json.dumps(v3))
+    pr36 = bad["supply"]["pressure"]
+    pr36["levels"] = {"one": {"default_profile_slots": 1,
+                              "profile_slots": {}},
+                      "two": {"default_profile_slots": 2,
+                              "profile_slots": {}}}
+    pr36["ceilings"]["default_binding_concurrent_slots"] = 2
+    pr36["ceilings"]["default_profile_concurrent_slots"] = 2
+    pr36["demand"] = {"level": "one", "profile_slot_overrides": {}}
+    pr36["control"]["agent_level_names"] = ["one", "two"]
+    pr36["control"]["agent_profile_refs"] = [
+        "sol-high", "sol-medium", "gemini-high", "glm-max"]
+    check("T36-10e delegated default expansion faults on synthesized "
+          "profiles",
+          any(x["code"] == "PRESSURE_DELEGATION"
+              for x in sc.validate(bad)))
+    bad = json.loads(json.dumps(v3))
+    bad["catalog"]["harnesses"]["codex"]["adapter_ref"] = "unknown-adapter"
+    check("T36-10f unknown adapter refuses reasoning certification",
+          bool(sc.validate(bad)))
+    bad = json.loads(json.dumps(v3))
+    bad["roles"]["editor"]["routing"]["fallback_profile_refs"] = [
+        "kimi-editor/default", "sol-editor/default"]
+    check("T36-10g alias-resolved duplicate chain faults",
+          bool(sc.validate(bad)))
+    # F35.11r compatibility: executable legacy views and derived routes
+    v2cfg = sc.parse_yaml_bytes(GENESIS)[0]
+    v2v = sc.pressure_view(v2cfg)
+    check("T36-11 v2 compiles an executable legacy view",
+          v2v["profiles"] and v2v["bindings"] and v2v["role_routing"]
+          and v2v["role_routing"].get("editor", {}).get(
+              "preferred_profile_ref") == "b1/default")
+    leg = json.loads(json.dumps(v3))
+    leg["supply"].pop("pressure")
+    leg["supply"]["admission"] = {"global_max_concurrent": 1,
+                                  "per_family": {}}
+    check("T36-11b v3-without-pressure validates clean with legacy limits",
+          not sc.validate(leg)
+          and sc.pressure_view(leg)["global_ceiling"] == 1)
+    legauth = t36_auth("legacy", leg)
+    x = t36_admit(legauth, "leg-1")
+    y = t36_admit(legauth, "leg-2", profile="gemini-high", plane=None)
+    check("T36-11c legacy global limit enforces via derived routes",
+          x["decision"] == "ALLOW" and y["decision"] == "HOLD",
+          json.dumps([x["decision"], y["decision"],
+                      y.get("reason_codes")])[:160])
+    imp = json.loads(json.dumps(v3))
+    imp["roles"]["editor"].pop("routing")
+    imp["roles"]["dreamers"] = {
+        "kind": "execution",
+        "profiles": {"ux_parity": {"binding_ref": "glm-workhorse"}}}
+    iv = sc.pressure_view(imp)
+    check("T36-11d absent routing derives the role chain (D7)",
+          not sc.validate(imp) and "editor" in iv["role_routing"]
+          and iv["role_routing"]["editor"]["preferred_profile_ref"] ==
+          "sol-editor/default"
+          and iv["role_routing"]["editor"]["derived"] is True
+          and "dreamers" in iv["role_routing"])
+    alld = t36_admit(t36_auth("implicit", imp), "imp-d",
+                     profile="sol-editor/default")
+    check("T36-11e derived route admits through the alias",
+          alld["decision"] == "ALLOW", json.dumps(alld)[:140])
+
+    # =====================================================================
+    # T36b — pressure repair v4 (round-3 residuals F35.2rr-F35.11rr).
+    # =====================================================================
+    # F35.2rr: mutations bind the CURRENT caller, complete identity
+    a5 = t36_auth("bind")
+    prefB = t36_admit(a5, "bind-d")["permit_ref"]
+    r = a5.redeem(prefB, dispatch_id="bind-d", attempt_id="a",
+                  executor="editor2")
+    r2 = a5.redeem(prefB, dispatch_id="bind-d", attempt_id="a",
+                   executor="worker")
+    check("T36-12 redeem binds the current executor to the permit",
+          not r.get("ok") and r2.get("ok"), json.dumps([r, r2])[:200])
+    a5.mark_uncertain(prefB)
+    r = a5.reconcile(prefB, launched=False, dispatch_id="wrong",
+                     attempt_id="a", reconciler="worker")
+    r2 = a5.reconcile(prefB, launched=False, dispatch_id="bind-d",
+                      attempt_id="a", reconciler="editor2")
+    r3 = a5.reconcile(prefB, launched=False, dispatch_id="bind-d",
+                      attempt_id="a")
+    check("T36-12b reconcile identity complete + reconciler bound",
+          not r.get("ok") and not r2.get("ok") and r3.get("ok"))
+    # F35.3rr: token accounting boundary contract
+    cfg_tok = json.loads(json.dumps(v3))
+    cfg_tok["supply"]["budgets"]["b-consult-daily"]["hard_limits"] = {
+        "consults": 100, "tokens": 5}
+    for name, acct, expect in [
+            ("raise", lambda bid, plane: (_ for _ in ()).throw(
+                OSError("accounting down")), "CONTAIN"),
+            ("malformed", lambda bid, plane: {"available": False},
+             "CONTAIN"),
+            ("refused", lambda bid, plane: False, "HOLD"),
+            ("ok", lambda bid, plane: True, "ALLOW")]:
+        t36b = t36_auth(f"tok-{name}", cfg_tok, verifier=suite_verifier2)
+        t36b.token_accounting = acct
+        x = t36_admit(t36b, f"tok-{name}-d")
+        check(f"T36-13 token accounting {name} -> {expect}",
+              x["decision"] == expect, json.dumps(x)[:140])
+    # F35.4rr: the real ledger path carries a delegated demand edit
+    sdF = temp_state()
+    seedF = json.loads(json.dumps(v3))
+    seedF["roles"]["agent"] = {"kind": "execution"}
+    seedF["supply"]["pressure"]["control"]["agent_role_refs"] = ["agent"]
+    seedF["supply"]["pressure"]["control"]["agent_level_names"] = [
+        "normal", "high", "saturate"]
+    seedF["identity"] = dict(v3["identity"], parent_hash="0" * 64,
+                             change_id="99999999-2222-4333-8444-567890123456")
+    rsF = sc.accept(sc.canonical_json(seedF), proposed_by="owner",
+                    state_dir=sdF)
+    wsF = sdF / "workspace.yaml"
+    wsF.write_bytes(sc.canonical_json(seedF))
+    sl.init_state(sdF, workspace=wsF, host="t36-ledger")
+    editF = json.loads(json.dumps(seedF))
+    editF["supply"]["pressure"]["demand"]["level"] = "saturate"
+    wsF.write_bytes(sc.canonical_json(editF))
+    capF = sl.capture(sdF, workspace=wsF)
+    vF = sl.adjudicate(sdF)
+    decF = {x["change_id"]: x["decision"] for x in vF}
+    check("T36-14 ledger carries the delegated demand edit end to end",
+          rsF["decision"] == "accepted"
+          and decF.get(capF.get("change_id")) == "accepted",
+          json.dumps([rsF["decision"], decF])[:200])
+    # F35.6rr: configured cooldown fallback, malformed/stale health
+    cfg_hc = json.loads(json.dumps(v3))
+    cfg_hc["planes"]["intelligence-consult"]["health_contract"] = {
+        "source_ref": "probe-health", "ttl_seconds": 900}
+    hc36 = t36_auth("health-cfg", cfg_hc)
+    seen2 = [0]
+
+    def refusing2(b):
+        seen2[0] += 1
+        base = {"source_ref": "probe-health", "observed_at": clock[0]}
+        if seen2[0] == 1:
+            return dict(base, state="refused", pool_ref="codex-sol",
+                        retry_at=clock[0] + 60)
+        return dict(base, state="ok")
+
+    hc36.health_evidence = refusing2
+    x = t36_admit(hc36, "cd2-first")
+    y = t36_admit(hc36, "cd2-peer", profile="sol-medium")
+    check("T36-15 refusal without retry_at uses the configured cooldown",
+          x["decision"] == "HOLD" and y["decision"] == "HOLD"
+          and any("cooldown" in rc for rc in y["reason_codes"]),
+          json.dumps(y.get("reason_codes"))[:160])
+    for name, ev in [
+            ("str-expiry", lambda b: {"state": "ok",
+                                      "expires_at": "soon"}),
+            ("nan-obs", lambda b: {"state": "ok",
+                                   "observed_at": float("nan")}),
+            ("stale-obs", lambda b: {"state": "ok",
+                                     "observed_at": clock[0] - 10000})]:
+        h36b = t36_auth(f"health2-{name}", cfg_hc, health=ev)
+        x = t36_admit(h36b, f"health2-{name}-d")
+        check(f"T36-15b health {name} HOLDs",
+              x["decision"] == "HOLD", json.dumps(x)[:120])
+    # F35.7rr: alias override bounded by the CANONICAL ceiling; alias
+    # lease delegation canonical
+    bad = json.loads(json.dumps(v3))
+    bad["supply"]["pressure"]["demand"]["profile_slot_overrides"][
+        "sol-editor/default"] = 40
+    check("T36-16 alias override bounded by canonical ceiling",
+          any(x["code"] == "PRESSURE_BOUNDS" for x in sc.validate(bad)))
+    vlow = sc.pressure_view(v3)
+    vlow["baseline"]["sol-high"] = 1
+    lal = t36_auth("alias-lease", view=vlow, config_hash="t36-alias-low")
+    lr = lal.lease(request_id="alias-lease-1",
+                   expected_config_hash=lal.config_hash,
+                   verified_principal="worker",
+                   issuer_role_ref="intelligence",
+                   profile_slots={"sol-editor/default": 5},
+                   ttl_seconds=60, expected_lease_revision=0)
+    check("T36-16b alias lease resolves delegation and applies canonically",
+          lr.get("ok") and lr["profile_slots"] == {"sol-high": 5}
+          and lal.status()["desired"].get("sol-high") == 5,
+          json.dumps([lr, lal.status()["desired"].get("sol-high")])[:200])
+    # F35.9rr: restart invalidates ALL unredeemed grants; shared recovery
+    # obligation; peer latch clears from authoritative resolution
+    r36 = t36_auth("restart2")
+    prefR = t36_admit(r36, "rs2-live")["permit_ref"]
+    rs = r36.restart()
+    r = r36.redeem(prefR, dispatch_id="rs2-live", attempt_id="a",
+                   executor="worker")
+    check("T36-17 restart invalidates unexpired unredeemed grants",
+          rs.get("ok") and not r.get("ok")
+          and r36._db.execute(
+              "SELECT state FROM permits WHERE permit_ref=?",
+              (prefR,)).fetchone()[0] == "expired")
+    r36b = t36_auth("restart3")
+    peer = pr.PressureAuthority(
+        r36b.view, r36b.config_hash, state_dir=r36b.db_path.parents[2],
+        health_evidence=r36b.health_evidence,
+        principal_verifier=r36b.principal_verifier, budgets=r36b.budgets,
+        plane_budgets=r36b.plane_budgets)
+    prefR2 = t36_launch(r36b, "rs3-live")
+    act = r36b.restart()
+    x = t36_admit(peer, "rs3-peer")
+    check("T36-17b restart recovery obligation binds already-open peers",
+          act.get("ok") and x["decision"] == "HOLD")
+    r36b.release(prefR2)
+    x = t36_admit(peer, "rs3-peer2")
+    check("T36-17c peer proceeds once obligations are authoritatively "
+          "resolved", x["decision"] == "ALLOW", json.dumps(x)[:140])
+    # F35.10rr: structural faults, no raise, no input mutation
+    for name, mut in [
+            ("string-ceiling", lambda c: c["supply"]["pressure"]["ceilings"]
+             ["binding_concurrent_slots"].update({"sol-editor": "many"})),
+            ("unhashable-pool-member", lambda c: c["supply"]["pressure"]
+             ["ceilings"]["pools"]["codex-sol"]["binding_refs"].append({})),
+            ("unhashable-delegate", lambda c: c["supply"]["pressure"]
+             ["control"]["agent_profile_refs"].append({})),
+            ("unhashable-routing", lambda c: c["roles"]["editor"]["routing"]
+             ["fallback_profile_refs"].append([]))]:
+        bad = json.loads(json.dumps(v3))
+        mut(bad)
+        try:
+            faults = sc.validate(bad)
+        except Exception as e:
+            faults = [{"code": f"RAISED {e}"}]
+        check(f"T36-18 {name} -> structural fault, no raise",
+              bool(faults) and not any(str(x["code"]).startswith("RAISED")
+                                       for x in faults),
+              json.dumps(faults)[:140])
+    bad = json.loads(json.dumps(v3))
+    bad["supply"]["pressure"]["control"]["agent_level_names"] = "high"
+    snapshot_before = json.dumps(bad, sort_keys=True)
+    sc.validate(bad)
+    check("T36-18b validate never rewrites the caller's object",
+          json.dumps(bad, sort_keys=True) == snapshot_before)
+    # F35.11rr: legacy mode preserves existing concurrency and families
+    leg2 = json.loads(json.dumps(v3))
+    leg2["supply"].pop("pressure")
+    leg2["supply"]["admission"] = {"global_max_concurrent": 6,
+                                   "per_family": {"intelligence": 6}}
+    la2 = t36_auth("legacy2", leg2)
+    la2.token_accounting = lambda bid, plane: True
+    x1 = la2.admit(dispatch_id="lg2-1", attempt_id="a",
+                   verified_principal="worker", role_ref="intelligence",
+                   profile_ref="sol-high", plane_ref="intelligence-consult")
+    x2 = la2.admit(dispatch_id="lg2-2", attempt_id="a",
+                   verified_principal="worker", role_ref="intelligence",
+                   profile_ref="sol-high", plane_ref="intelligence-consult")
+    check("T36-19 legacy global 6 + family 6 allows two processes",
+          x1["decision"] == "ALLOW" and x2["decision"] == "ALLOW"
+          and la2.view["baseline"]["sol-high"] is None,
+          json.dumps([x1["decision"], x2["decision"],
+                      x1.get("reason_codes")])[:160])
+    leg3 = json.loads(json.dumps(v3))
+    leg3["supply"].pop("pressure")
+    leg3["supply"]["admission"] = {"global_max_concurrent": 8,
+                                   "per_family": {"ux_parity": 0}}
+    leg3["roles"]["dreamers"] = {
+        "kind": "execution",
+        "profiles": {"ux_parity": {"binding_ref": "glm-workhorse"}}}
+    leg3.setdefault("planes", {})["workhorse"] = {
+        "owner_policy": "enabled", "binding_refs": ["glm-workhorse"],
+        "budget_refs": []}
+    la3 = t36_auth("legacy3", leg3)
+    la3.token_accounting = lambda bid, plane: True
+    x = la3.admit(dispatch_id="lg3-1", attempt_id="a",
+                  verified_principal="dreamer", role_ref="dreamers",
+                  profile_ref="glm-workhorse/default", plane_ref=None)
+    check("T36-19b legacy family limit (ux_parity:0) denies the launch",
+          x["decision"] == "HOLD"
+          and any("dreamers" in rc for rc in x["reason_codes"]),
+          json.dumps(x.get("reason_codes"))[:160])
+    pr._now = real_now
+
+    # =====================================================================
+    # T36c — pressure repair v5 (round-4 residuals F35.2rrr-F35.11rrr).
+    # The frozen clock resumes: the round-5/6/7 fixtures pin clock[0].
+    # =====================================================================
+    pr._now = lambda: clock[0]
+    # F35.2rrr: caller-assertion consistency + the evidence gate
+    # (a fresh uncertain permit per case — successful reconciliation
+    # consumes the uncertainty)
+    c5 = t36_auth("c5")
+
+    def c5_uncertain(tag):
+        p = t36_admit(c5, f"c5-{tag}")["permit_ref"]
+        c5.mark_uncertain(p)
+        return p
+
+    pg0 = c5_uncertain("g0")
+    r = c5.reconcile(pg0, launched=False)
+    # the refused resolution leaves g0 uncertain + the barrier set — clear
+    # it with the authenticated path so later cases admit
+    c5.reconcile(pg0, launched=False, evidence={"reconciler": "worker"})
+    r2 = c5.reconcile(c5_uncertain("g1"), launched=False,
+                      evidence={"reconciler": "worker"})
+    r3 = c5.reconcile(c5_uncertain("g2"), launched=False, reconciler="worker",
+                      evidence={"reconciler": "worker"})
+    r4 = c5.reconcile(c5_uncertain("g3"), launched=False, reconciler="reviewer",
+                      evidence={"reconciler": "worker"})
+    r5 = c5.reconcile(c5_uncertain("g4"), launched=False, dispatch_id="wrong",
+                      attempt_id="a", evidence={"reconciler": "worker"})
+    r6 = c5.reconcile(c5_uncertain("g5"), launched=False, dispatch_id="c5-g5",
+                      attempt_id="a", evidence={"reconciler": "reviewer"})
+    check("T36-20 evidence gate + caller-assertion agreement",
+          not r.get("ok") and r2.get("ok") and r3.get("ok")
+          and not r4.get("ok") and not r5.get("ok") and not r6.get("ok"),
+          json.dumps([r, r2, r4, r5, r6])[:400])
+    # F35.6rrr: future observation; NaN/past/infinite retry fall back to
+    # the configured cooldown; identified-pool cooldown lookup
+    cfg5 = json.loads(json.dumps(v3))
+    cfg5["supply"]["pressure"]["ceilings"]["pools"]["codex-sol"][
+        "cooldown_after_refusal_seconds"] = 60
+    cfg5["supply"]["pressure"]["ceilings"]["pools"]["slow-sol"] = {
+        "binding_refs": ["sol-editor"], "concurrent_slots": 96,
+        "cooldown_after_refusal_seconds": 180}
+    for name, refusal in [
+            ("nan-retry", {"state": "refused", "pool_ref": "slow-sol",
+                           "retry_at": float("nan")}),
+            ("past-retry", {"state": "refused", "pool_ref": "slow-sol",
+                            "retry_at": clock[0] - 5}),
+            ("inf-retry", {"state": "refused", "pool_ref": "slow-sol",
+                           "retry_at": float("inf")})]:
+        h5 = t36_auth(f"c5-{name}", cfg5)
+        seen4 = [0]
+
+        def once_refused(b, _refusal=refusal, _seen=seen4):
+            _seen[0] += 1
+            if _seen[0] == 1:
+                return _refusal
+            return {"state": "ok"}
+
+        h5.health_evidence = once_refused
+        x = t36_admit(h5, f"c5-{name}-d")
+        y = t36_admit(h5, f"c5-{name}-peer", profile="sol-medium")
+        check(f"T36-21 {name} falls back to the configured cooldown",
+              x["decision"] == "HOLD" and y["decision"] == "HOLD"
+              and any("cooldown" in rc for rc in y["reason_codes"]),
+              json.dumps([x.get("reason_codes"),
+                          y.get("reason_codes")])[:200])
+    h5 = t36_auth("c5-future-obs",
+                  health=lambda b: {"state": "ok",
+                                    "observed_at": clock[0] + 10000})
+    x = t36_admit(h5, "c5-future-obs-d")
+    check("T36-21 future observation fail-closed",
+          x["decision"] == "HOLD", json.dumps(x.get("reason_codes"))[:160])
+    # identified-pool cooldown: refusal names slow-sol (180s); the shared
+    # 5s... codex-sol 60s neighbor must not clear it early
+    h5 = t36_auth("c5-identified", cfg5)
+    seen3 = [0]
+
+    def refusing3(b):
+        seen3[0] += 1
+        if seen3[0] == 1:
+            return {"state": "refused", "pool_ref": "slow-sol"}
+        return {"state": "ok"}
+
+    h5.health_evidence = refusing3
+    x = t36_admit(h5, "c5-id-first")
+    clock[0] += 61  # past codex-sol's 60s, well inside slow-sol's 180s
+    y = t36_admit(h5, "c5-id-peer", profile="sol-medium")
+    check("T36-21b cooldown keyed by the IDENTIFIED pool",
+          x["decision"] == "HOLD" and y["decision"] == "HOLD"
+          and any("slow-sol" in rc for rc in y["reason_codes"]),
+          json.dumps(y.get("reason_codes"))[:160])
+    clock[0] = 1800000000.0
+    # F35.9rrr: a resolved peer latch never resurrects on new healthy work
+    ra = t36_auth("c5-latch")
+    pl = t36_launch(ra, "latch-old")
+    rb = pr.PressureAuthority(
+        ra.view, ra.config_hash, state_dir=ra.db_path.parents[2],
+        health_evidence=ra.health_evidence,
+        principal_verifier=ra.principal_verifier, budgets=ra.budgets,
+        plane_budgets=ra.plane_budgets)
+    check("T36-22 latch binds to open-time outstanding work",
+          rb.status()["reconcile_barrier"])
+    ra.release(pl)
+    x = t36_admit(rb, "latch-mid")
+    check("T36-22b peer resolution ends the latch", x["decision"] == "ALLOW")
+    pl2 = t36_launch(ra, "latch-new")
+    x = t36_admit(rb, "latch-after-new")
+    check("T36-22c new unrelated work never resurrects the latch",
+          x["decision"] == "ALLOW", json.dumps(x)[:140])
+    ra.release(pl2)
+    # F35.11rrr: multi-family legacy roles take the most restrictive limit
+    leg5 = json.loads(json.dumps(v3))
+    leg5["supply"].pop("pressure")
+    leg5["supply"]["admission"] = {"global_max_concurrent": 8,
+                                   "per_family": {"ux_parity": 0,
+                                                  "ux_second": 0}}
+    leg5["roles"]["dreamers"] = {
+        "kind": "execution",
+        "profiles": {"ux_parity": {"binding_ref": "glm-workhorse"},
+                     "ux_second": {"binding_ref": "glm-workhorse"}}}
+    leg5.setdefault("planes", {})["workhorse"] = {
+        "owner_policy": "enabled", "binding_refs": ["glm-workhorse"],
+        "budget_refs": []}
+    la5 = t36_auth("legacy5", leg5)
+    la5.token_accounting = lambda bid, plane: True
+    x = la5.admit(dispatch_id="lg5-1", attempt_id="a",
+                  verified_principal="dreamer", role_ref="dreamers",
+                  profile_ref="glm-workhorse/default", plane_ref=None)
+    check("T36-23 multi-family all-zero legacy roles deny",
+          x["decision"] == "HOLD"
+          and any("dreamers" in rc for rc in x["reason_codes"]),
+          json.dumps(x.get("reason_codes"))[:160])
+
+
+    # =====================================================================
+    # T36d — pressure repair v6 (round-5 residuals F35.2/6/7/10-rrrr).
+    # =====================================================================
+    # F35.2rrrr: partial identity without evidence refuses; redeem
+    # requires the current executor; verifier exceptions contained
+    d6 = t36_auth("d6")
+    pd6 = t36_admit(d6, "d6-partial")["permit_ref"]
+    d6.mark_uncertain(pd6)
+    r = d6.reconcile(pd6, launched=False, dispatch_id="d6-partial",
+                     attempt_id=None)
+    r2 = d6.reconcile(pd6, launched=False, dispatch_id=None,
+                      attempt_id="a")
+    r3 = d6.reconcile(pd6, launched=False, dispatch_id="d6-partial",
+                      attempt_id="a", reconciler="worker")
+    check("T36-24 partial identity without evidence refuses; complete ok",
+          not r.get("ok") and not r2.get("ok") and r3.get("ok"),
+          json.dumps([r, r2, r3])[:240])
+    pd7 = t36_admit(d6, "d6-noexec")["permit_ref"]
+    try:
+        rx = d6.redeem(pd7, dispatch_id="d6-noexec", attempt_id="a")
+        missing_executor = not rx.get("ok")
+    except TypeError:
+        missing_executor = True  # required keyword refused at the signature
+    rx2 = d6.redeem(pd7, dispatch_id="d6-noexec", attempt_id="a",
+                    executor="worker")
+    check("T36-24b redeem requires the current executor (ruling A)",
+          missing_executor and rx2.get("ok"))
+    def boom(who):
+        raise RuntimeError("verifier down")
+    d6b = t36_auth("d6-verifier", verifier=boom)
+    try:
+        x = t36_admit(d6b, "d6-verify-d")
+        exc = x["decision"]
+    except Exception as e:
+        exc = f"ESCAPED {type(e).__name__}"
+    pd8 = t36_admit(d6, "d6-verify")["permit_ref"]
+    d6.mark_uncertain(pd8)
+    d6.principal_verifier = boom
+    try:
+        rr = d6.reconcile(pd8, launched=False, dispatch_id="d6-verify",
+                          attempt_id="a")
+        rexc = "contained" if not rr.get("ok") else "AUTHORIZED"
+    except Exception as e:
+        rexc = f"ESCAPED {type(e).__name__}"
+    check("T36-24c verifier unavailability contained at the boundary",
+          exc == "CONTAIN" and rexc == "contained",
+          json.dumps([exc, rexc])[:160])
+    # F35.6rrrr: the contract binds every shape; refusal-side validation
+    # precedes shared-state writes
+    bad_shapes = [
+        ("bare", {"state": "ok"}),
+        ("wrong-source", {"state": "ok", "source_ref": "other",
+                          "observed_at": clock[0]}),
+        ("undated-matching-source", {"state": "ok",
+                                     "source_ref": "probe-health"}),
+        ("future-obs", {"state": "ok", "source_ref": "probe-health",
+                        "observed_at": clock[0] + 10})]
+    for name, evd in bad_shapes:
+        h6 = t36_auth(f"c6-{name}", cfg_hc, health=lambda b, _e=evd: _e)
+        x = t36_admit(h6, f"c6-{name}-d")
+        check(f"T36-25 contract binds {name}",
+              x["decision"] == "HOLD", json.dumps(x)[:120])
+    # a WRONG-source refusal must not install a shared cooldown
+    h6 = t36_auth("c6-badrefusal", cfg_hc)
+    seen5 = [0]
+
+    def bad_refusal(b):
+        seen5[0] += 1
+        if seen5[0] == 1:
+            return {"state": "refused", "pool_ref": "codex-sol",
+                    "source_ref": "other", "retry_at": clock[0] + 600}
+        return healthy(b)
+
+    h6.health_evidence = bad_refusal
+    x = t36_admit(h6, "c6-br-first")
+    y = t36_admit(h6, "c6-br-peer", profile="sol-medium")
+    check("T36-25b invalid refusal evidence installs no cooldown",
+          x["decision"] == "HOLD" and y["decision"] == "ALLOW",
+          json.dumps([x.get("reason_codes"), y["decision"]])[:160])
+    # F35.7rrrr: identical duplicate spellings dedupe; conflicting refuse
+    vlow6 = sc.pressure_view(v3)
+    vlow6["baseline"]["sol-high"] = 1
+    l6 = t36_auth("c6-lease", view=vlow6, config_hash="c6-lease")
+    lr = l6.lease(request_id="c6-dup-ok",
+                  expected_config_hash=l6.config_hash,
+                  verified_principal="worker",
+                  issuer_role_ref="intelligence",
+                  profile_slots={"sol-high": 5, "sol-editor/default": 5},
+                  ttl_seconds=60, expected_lease_revision=0)
+    eff = l6.status()["desired"].get("sol-high")
+    lr2 = l6.lease(request_id="c6-dup-bad",
+                   expected_config_hash=l6.config_hash,
+                   verified_principal="worker",
+                   issuer_role_ref="intelligence",
+                   profile_slots={"sol-high": 5, "sol-editor/default": 7},
+                   ttl_seconds=60, expected_lease_revision=lr["revision"])
+    check("T36-26 duplicate spellings dedupe; conflicts refuse",
+          lr.get("ok") and lr["profile_slots"] == {"sol-high": 5}
+          and eff == 5 and not lr2.get("ok"),
+          json.dumps([lr.get("profile_slots"), eff, lr2])[:220])
+    # F35.10rrrr: remaining structural escapes + invalid-shape acceptances
+    for name, mut in [
+            ("demand-level-list", lambda c: c["supply"]["pressure"]
+             ["demand"].update({"level": [1]})),
+            ("demand-level-null", lambda c: c["supply"]["pressure"]
+             ["demand"].update({"level": None})),
+            ("level-record-string", lambda c: c["supply"]["pressure"]
+             ["levels"].update({"high": "wrong"})),
+            ("pool-refs-int", lambda c: c["supply"]["pressure"]["ceilings"]
+             ["pools"]["codex-sol"].update({"binding_refs": 1})),
+            ("pool-refs-null", lambda c: c["supply"]["pressure"]["ceilings"]
+             ["pools"]["codex-sol"].update({"binding_refs": None})),
+            ("profile-record-list", lambda c: c["catalog"]
+             ["execution_profiles"].update({"sol-high": []})),
+            ("binding-ref-list", lambda c: c["catalog"]["execution_profiles"]
+             ["sol-high"].update({"binding_ref": []})),
+            ("agent-levels-null", lambda c: c["supply"]["pressure"]
+             ["control"].update({"agent_level_names": None}))]:
+        bad = json.loads(json.dumps(v3))
+        mut(bad)
+        before = json.dumps(bad, sort_keys=True)
+        try:
+            faults = sc.validate(bad)
+        except Exception as e:
+            faults = [{"code": f"RAISED {type(e).__name__}"}]
+        pure = json.dumps(bad, sort_keys=True) == before
+        check(f"T36-27 {name} -> structural fault, pure, no raise",
+              bool(faults) and pure
+              and not any(str(x["code"]).startswith("RAISED")
+                          for x in faults),
+              json.dumps(faults)[:140])
+
+
+    # =====================================================================
+    # T36e — pressure repair v7 (round-6 residuals F35.6t / F35.10t).
+    # =====================================================================
+    # F35.6t: huge finite integer timestamps must HOLD, never escape
+    for name, ev in [
+            ("huge-negative-obs-ok", lambda b: {
+                "state": "ok", "source_ref": "probe-health",
+                "observed_at": -(10 ** 400),
+                "expires_at": clock[0] + 3600}),
+            ("huge-negative-obs-refusal", lambda b: {
+                "state": "refused", "pool_ref": "codex-sol",
+                "source_ref": "probe-health",
+                "observed_at": -(10 ** 400),
+                "retry_at": clock[0] + 60}),
+            ("huge-positive-obs", lambda b: {
+                "state": "ok", "source_ref": "probe-health",
+                "observed_at": 10 ** 400})]:
+        h7 = t36_auth(f"c7-{name}", cfg_hc, health=ev)
+        x = t36_admit(h7, f"c7-{name}-d")
+        check(f"T36-28 {name} HOLDs without escaping",
+              x["decision"] == "HOLD", json.dumps(x)[:140])
+    # and the ttl side: an absurd contract ttl must not overflow either
+    cfg_ttl = json.loads(json.dumps(cfg_hc))
+    cfg_ttl["planes"]["intelligence-consult"]["health_contract"] = {
+        "source_ref": "probe-health", "ttl_seconds": 10 ** 400}
+    h7 = t36_auth("c7-huge-ttl", cfg_ttl,
+                  health=lambda b: {"state": "ok",
+                                    "source_ref": "probe-health",
+                                    "observed_at": clock[0]})
+    x = t36_admit(h7, "c7-huge-ttl-d")
+    check("T36-28b huge contract ttl does not overflow",
+          x["decision"] == "ALLOW", json.dumps(x)[:140])
+    # sol round-7 counterexample: huge ttl + STALE observation — exact
+    # arithmetic must HOLD (healthy) and install nothing (refusal)
+    ev_stale = lambda b: {"state": "ok", "source_ref": "probe-health",
+                          "observed_at": -2 * 10 ** 400,
+                          "expires_at": clock[0] + 60}
+    h7b = t36_auth("c7-huge-ttl-stale", cfg_ttl, health=ev_stale)
+    x = t36_admit(h7b, "c7-hts-d")
+    y = t36_admit(h7b, "c7-hts-peer", profile="sol-medium")
+    check("T36-28c huge-ttl stale observation HOLDs (exact arithmetic)",
+          x["decision"] == "HOLD"
+          and y["decision"] == "HOLD"
+          and any("stale" in rc for rc in x["reason_codes"]),
+          json.dumps([x.get("reason_codes"),
+                      y.get("reason_codes")])[:200])
+    h7c = t36_auth("c7-huge-ttl-refusal", cfg_ttl)
+    seen6 = [0]
+
+    def stale_refusal(b):
+        seen6[0] += 1
+        if seen6[0] == 1:
+            return {"state": "refused", "pool_ref": "codex-sol",
+                    "source_ref": "probe-health",
+                    "observed_at": -2 * 10 ** 400,
+                    "retry_at": clock[0] + 30}
+        return healthy(b)
+
+    h7c.health_evidence = stale_refusal
+    x = t36_admit(h7c, "c7-hts-refusal")
+    y = t36_admit(h7c, "c7-hts-refusal-peer", profile="sol-medium")
+    cd = json.loads(dict(h7c._db.execute(
+        "SELECT key, value FROM meta")).get("pool_cooldowns", "{}"))
+    check("T36-28d stale refusal HOLDs and installs no cooldown",
+          x["decision"] == "HOLD" and y["decision"] == "ALLOW"
+          and cd == {}, json.dumps([x["decision"], y["decision"],
+                                    cd])[:200])
+    # F35.10t: the six value-level normalization paths
+    for name, mut in [
+            ("level-slot-value-string", lambda c: c["supply"]["pressure"]
+             ["levels"]["high"]["profile_slots"].update({"sol-high": "20"})),
+            ("level-default-null", lambda c: c["supply"]["pressure"]
+             ["levels"]["high"].update({"default_profile_slots": None})),
+            ("profiles-nonmapping", lambda c: c["catalog"]
+             .update({"execution_profiles": 7})),
+            ("adapter-ref-dict", lambda c: c["catalog"]["harnesses"]
+             ["codex"].update({"adapter_ref": {"x": 1}})),
+            ("role-refs-int", lambda c: c["roles"]["intelligence"]
+             .update({"binding_refs": 3})),
+            ("role-refs-dict-element", lambda c: c["roles"]["intelligence"]
+             ["binding_refs"].append({})),
+            ("plane-refs-dict-element", lambda c: c["planes"]
+             ["intelligence-consult"]["binding_refs"].append([])),
+            ("plane-health-contract-list", lambda c: c["planes"]
+             ["intelligence-consult"].update({"health_contract": [1]}))]:
+        bad = json.loads(json.dumps(v3))
+        mut(bad)
+        before = json.dumps(bad, sort_keys=True)
+        try:
+            faults = sc.validate(bad)
+        except Exception as e:
+            faults = [{"code": f"RAISED {type(e).__name__}"}]
+        pure = json.dumps(bad, sort_keys=True) == before
+        check(f"T36-29 {name} -> structural fault, pure, no raise",
+              bool(faults) and pure
+              and not any(str(x["code"]).startswith("RAISED")
+                          for x in faults),
+              json.dumps(faults)[:140])
+
+    pr._now = real_now
 
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
     if FAIL:
