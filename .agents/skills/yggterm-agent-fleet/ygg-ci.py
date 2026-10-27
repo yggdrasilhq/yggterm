@@ -703,9 +703,28 @@ def cmd_subscribe(a):
         print("subscribe: need --lane lane/<topic>", file=sys.stderr)
         return 2
     repo_path, pcfg = _repo_for(project, a.repo)
-    # CI_HOST enforcement: warn if not on dev
-    if this_host() != CI_HOST and this_host() != pcfg.get("host", CI_HOST):
-        log(f"⚠ subscribe on {this_host()} but ci host is {pcfg.get('host', CI_HOST)} — subscription stored locally, watcher may not see it. Prefer: ssh {pcfg.get('host', CI_HOST)} ygg-ci.py subscribe --lane {lane} --project {project}")
+    # CI_HOST forwarding (2026-10-27, graveyard fix): subscribing from a
+    # non-CI host used to store the sub LOCALLY with only a stderr warning —
+    # and the local store is a graveyard the watcher never reads (16
+    # stranded subs found on one host, some back to September; every seat's
+    # tail -1 ate the warning). FORWARD to the CI host; local storage is
+    # the fallback only when ssh fails.
+    ci_host = pcfg.get("host", CI_HOST)
+    if this_host() != CI_HOST and this_host() != ci_host:
+        remote_cli = "~/.yggterm/bin/ygg/ygg-ci.py"
+        fwd = ["ssh", ci_host, sys.executable, remote_cli,
+               "subscribe", "--lane", lane, "--project", project]
+        if a.want:
+            fwd += ["--want", a.want]
+        fr = _run(fwd, timeout=60)
+        if fr.returncode == 0 and "subscribed" in (fr.stdout or ""):
+            log(f"subscribe forwarded to {ci_host}: {lane}")
+            print((fr.stdout or "").strip().splitlines()[-1])
+            return 0
+        log(f"⚠ forward to ci host {ci_host} FAILED (rc={fr.returncode}) "
+            f"— storing LOCALLY; the watcher will NOT see it. "
+            f"Forward manually: ssh {ci_host} ygg-ci.py subscribe "
+            f"--lane {lane} --project {project}")
     SUBS.mkdir(parents=True, exist_ok=True)
     # resolve tip if branch exists remotely (best effort)
     tip = None
