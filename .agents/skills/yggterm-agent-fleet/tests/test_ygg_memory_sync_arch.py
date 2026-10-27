@@ -350,11 +350,16 @@ def main():
         body = (
             "from pathlib import Path\n"
             "root=Path(sys.argv[3])\n"
+            "import json as _json\n"
             "for i in range(15):\n"
             "    m.append_journal_entry(root,'h','f.md','note','upsert','zcode',"
             "'hammer-'+sys.argv[2]+str(i))\n"
             "    if i%5==0:\n"
-            "        m._merge_journals(root/'journal.jsonl','')\n"
+            "        peer=[{'seq':1000+i,'ns':'peer-'+sys.argv[2],'file':'p.md','digest':None,"
+            "'version_id':'pv-'+sys.argv[2]+str(i),'event_id':'pe-'+sys.argv[2]+str(i),"
+            "'target_harness':'all'}]\n"
+            "        m._merge_journals(root/'journal.jsonl',"
+            "_json.dumps(peer[0]))\n"
         )
         runner = (
             "import importlib.util,sys;"
