@@ -225,6 +225,7 @@ def version_for_digest(root: Path, namespace: str, filename: str, digest: str | 
             row = conn.execute(
                 "SELECT payload FROM entries INDEXED BY ix_entries_nfd"
                 " WHERE gen = ? AND ns = ? AND file = ? AND digest = ?"
+                " AND seq > 0"
                 " ORDER BY off DESC LIMIT 1",
                 (gen, namespace, filename, digest),
             ).fetchone()
@@ -1820,11 +1821,34 @@ def _ji_repair_partial_tail(jpath: Path) -> None:
         f.seek(-1, 2)
         if f.read(1) == b"\n":
             return
-        back = min(size, 65536)
-        f.seek(size - back)
-        blob = f.read()
-    cut = blob.rfind(b"\n")
-    good = (size - back + cut + 1) if cut >= 0 else 0
+        cut_abs = -1
+        back = 65536
+        while cut_abs < 0:
+            if back >= size:
+                f.seek(0)
+                head_blob = f.read(size)
+                cut_abs = head_blob.rfind(b"\n")
+                good = cut_abs + 1
+                tail = head_blob[good:]
+                break
+            f.seek(size - back)
+            blob = f.read(back)
+            cut_abs = blob.rfind(b"\n")
+            if cut_abs >= 0:
+                good = size - back + cut_abs + 1
+                tail = blob[cut_abs + 1 :]
+                break
+            back *= 4
+    # a tail that is itself valid JSON is a record whose newline was lost —
+    # complete it rather than destroy it; anything else is crash debris
+    try:
+        json.loads(tail.decode("utf-8"))
+        with open(jpath, "r+b") as f:
+            f.seek(good + len(tail))
+            f.write(b"\n")
+        return
+    except Exception:
+        pass
     os.truncate(jpath, good)
 
 
@@ -1843,6 +1867,8 @@ def _ji_refresh(root: Path, conn) -> None:
     last_len = int(meta.get("last_len", "0") or 0)
     last_hash = meta.get("last_hash", "")
     head_hash = meta.get("head", "")
+    mid_off = int(meta.get("mid_off", "0") or 0)
+    mid_hash = meta.get("mid_hash", "")
     with open(jpath, "rb") as f:
         f.seek(0, 2)
         size = f.tell()
@@ -1868,15 +1894,27 @@ def _ji_refresh(root: Path, conn) -> None:
                 and hashlib.sha256(probe).hexdigest() == last_hash
                 and (not head_hash or hashlib.sha256(head).hexdigest() == head_hash)
             )
+        if append_ok and mid_off:
+            f.seek(mid_off)
+            mid = f.read(4096)
+            append_ok = (
+                len(mid) == 4096
+                and hashlib.sha256(mid).hexdigest() == mid_hash
+            )
         if append_ok:
             f.seek(covered)
             blob = f.read(size - covered)
             base = covered
+            mid_off_new = max(0, covered // 2 - 2048)
+            f.seek(mid_off_new)
+            mid_new = f.read(4096)
         else:
             gen += 1
             f.seek(0)
             blob = f.read()
             base = 0
+            mid_off_new = max(0, len(blob) // 2 - 2048)
+            mid_new = blob[mid_off_new : mid_off_new + 4096]
     rows = []
     last_complete_end = base
     last_line = b""
@@ -1884,17 +1922,28 @@ def _ji_refresh(root: Path, conn) -> None:
     n = len(blob)
     while True:
         nl = blob.find(b"\n", i)
-        if nl < 0:
-            break
-        line = blob[i:nl]
-        i = nl + 1
-        last_complete_end = base + i
-        if line.strip():
+        if nl >= 0:
+            line = blob[i:nl]
+            i = nl + 1
+            last_complete_end = base + i
+            trailing = False
+        else:
+            # a valid unterminated final record is still a record (the naive
+            # scan parses it); cover it, and remember it is newline-less
+            line = blob[i:]
+            if not line.strip():
+                break
+            trailing = True
+            i = n
+        if True:
             try:
                 rec = json.loads(line.decode("utf-8"))
             except Exception:
                 rec = None
             if rec is not None:
+                if trailing:
+                    last_complete_end = base + n
+                    last_line = line  # newline-less: anchors match its bytes
                 rows.append(
                     (
                         gen,
@@ -1906,7 +1955,8 @@ def _ji_refresh(root: Path, conn) -> None:
                         line.decode("utf-8", errors="replace"),
                     )
                 )
-                last_line = blob[i - len(line) - 1 : i]  # line + its newline
+                if not trailing:
+                    last_line = blob[i - len(line) - 1 : i]  # line + its newline
     conn.execute("BEGIN IMMEDIATE")
     conn.execute("DELETE FROM entries WHERE gen != ?", (gen,))
     if rows:
@@ -1915,7 +1965,11 @@ def _ji_refresh(root: Path, conn) -> None:
             " VALUES (?, ?, ?, ?, ?, ?, ?)",
             rows,
         )
-    if "max_seq" in meta:
+    if gen != old_gen:
+        # rebuild parses everything: the maximum comes from these rows alone
+        # (a stale carried maximum survives truncation otherwise)
+        max_seq = 0
+    elif "max_seq" in meta:
         max_seq = int(meta["max_seq"] or 0)
     else:
         row = conn.execute(
@@ -1925,12 +1979,24 @@ def _ji_refresh(root: Path, conn) -> None:
     for row in rows:
         if row[2] > max_seq:
             max_seq = row[2]
-    for k, v in {
+    meta_update = {
         "gen": str(gen),
         "covered": str(last_complete_end),
         "max_seq": str(max_seq),
+        "mid_off": str(mid_off_new),
+        "mid_hash": hashlib.sha256(mid_new).hexdigest() if len(mid_new) == 4096 else "",
         **_ji_anchors(head, last_line),
-    }.items():
+    }
+    if not last_line and covered:
+        # nothing new parsed (an unchanged or malformed-only tail): PRESERVE
+        # the anchors — zeroing them would force a pointless rebuild next read
+        meta_update["last_len"] = meta.get("last_len", "0")
+        meta_update["last_hash"] = meta.get("last_hash", "")
+        meta_update["head"] = hashlib.sha256(head).hexdigest()
+        if mid_hash:
+            meta_update["mid_off"] = meta.get("mid_off", "0")
+            meta_update["mid_hash"] = mid_hash
+    for k, v in meta_update.items():
         conn.execute("INSERT OR REPLACE INTO meta (k, v) VALUES (?, ?)", (k, v))
     conn.commit()
 
@@ -1939,6 +2005,7 @@ def _ji_read(root: Path, after_seq: int, namespace, target_harness) -> list:
     conn = _ji_connect(root)
     try:
         _ji_refresh(root, conn)
+        conn.execute("BEGIN")  # one WAL snapshot for gen + rows (R4)
         gen = int(_ji_meta_get(conn).get("gen", "0") or 0)
         sql = "SELECT payload FROM entries WHERE gen = ? AND seq > ?"
         args: list = [gen, after_seq]
@@ -1956,6 +2023,7 @@ def _ji_read(root: Path, after_seq: int, namespace, target_harness) -> list:
             ):
                 continue
             out.append(rec)
+        conn.commit()
         return out
     finally:
         conn.close()
@@ -3062,6 +3130,13 @@ def cmd_sync(args):
 
 
 def _merge_journals(local_path: Path, peer_content: str):
+    # the writer lock covers the WHOLE merge: snapshot after acquiring it, or
+    # an append landing between snapshot and rewrite is silently erased
+    with journal_writer_lock(local_path.parent):
+        return _merge_journals_locked(local_path, peer_content)
+
+
+def _merge_journals_locked(local_path: Path, peer_content: str):
     records_by_key = {}
     if local_path.exists():
         for line in local_path.read_text(encoding="utf-8").splitlines():
@@ -3096,7 +3171,7 @@ def _merge_journals(local_path: Path, peer_content: str):
         # derived index every tick
         return
     local_path.parent.mkdir(parents=True, exist_ok=True)
-    with journal_writer_lock(local_path.parent):
+    if True:
         tmp = local_path.with_name(local_path.name + ".merge-tmp")
         offsets = []
         pos = 0
