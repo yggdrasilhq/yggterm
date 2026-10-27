@@ -2274,6 +2274,409 @@ def main():
           r6 == ["rejected", "rejected", "rejected", "tick rejected"],
           json.dumps(r6))
 
+    # =====================================================================
+    # T35 — pressure v3 (sol-certified design 2026-10-26; claims C13-C29).
+    # Build a full v3 doc from the worked example fragment merged onto the
+    # conformance genesis.
+    # =====================================================================
+    import pressure as pr
+
+    def healthy(binding):
+        return {"state": "ok", "source": "test", "concurrent_limit": None}
+
+    PRINCIPALS = {"orch-intel": "intelligence", "orch-intel-2": "intelligence",
+                  "orch-editor": "editor"}
+
+    def make_auth(tag, cfg=None, config_hash="cfg35", **kw):
+        cfg = cfg if cfg is not None else v3
+        kw.setdefault("health_evidence", healthy)
+        kw.setdefault("budgets", (cfg.get("supply") or {}).get("budgets"))
+        kw.setdefault("principal_verifier",
+                      lambda p, _cfg=None: PRINCIPALS.get(p))
+        return pr.authority_from_config(cfg, config_hash,
+                                        state_dir=temp_state() / f"pressure-{tag}",
+                                        **kw)
+
+    ex, ex_pf = sc.parse_yaml_bytes(
+        (HERE / "config" / "design" / "pressure-v3-example.yaml").read_bytes())
+    check("T35-0 worked example parses", ex_pf is None and
+          ex.get("schema_version") == 3, str(ex_pf))
+    v3 = sc.parse_yaml_bytes(GENESIS)[0]
+    hard30 = ex.pop("hard_limits", None)
+    wh30 = ex.pop("window_hours", 24)
+    # the example's fleet bindings must exist for refs to resolve: add the
+    # three admitted bindings the profiles ride (conformance genesis has
+    # only its own b1/b2 seed bindings)
+    v3["catalog"]["harnesses"].update({
+        "codex": {"kind": "consult-cli"}, "agy": {"kind": "consult-cli"}, "zcode-tui": {"kind": "dispatch-queue"}})
+    v3["catalog"]["providers"].update({p: {"id": p} for p in ("openai", "google", "zai")})
+    v3["catalog"]["accounts"].update({"openai-sol": {"provider": "openai"}, "google-bundled": {"provider": "google"}, "zai-primary": {"provider": "zai"}})
+    v3["catalog"]["plans"].update({"openai-paid": {"provider": "openai", "kind": "subscription"}, "gemini-bundled": {"provider": "google", "kind": "subscription"}, "zai-coding-plan": {"provider": "zai", "kind": "subscription"}})
+    v3["catalog"]["bindings"].update({
+        "sol-editor": {"harness": "codex", "provider": "openai",
+                       "account": "openai-sol", "plan": "openai-paid",
+                       "model": "gpt-6.1-sol", "reasoning": "high",
+                       "status": "admitted", "capabilities": ["editorial"]},
+        "gemini-reviewer": {"harness": "agy", "provider": "google",
+                            "account": "google-bundled",
+                            "plan": "gemini-bundled",
+                            "model": "gemini-3.8-flash", "status": "admitted",
+                            "capabilities": ["review"]},
+        "glm-workhorse": {"harness": "zcode-tui", "provider": "zai",
+                          "account": "zai-primary", "plan": "zai-coding-plan",
+                          "model": "GLM-5.3-Flash", "status": "admitted",
+                          "capabilities": ["execution", "dreamer"]}})
+    v3["catalog"]["providers"].update(
+        {p: {"id": p} for p in ("openai", "google", "zai")})
+    v3["catalog"]["bindings"].update({
+        "glm-offpeak": {"harness": "zcode-tui", "provider": "zai",
+                        "account": "zai-primary", "plan": "zai-offpeak",
+                        "model": "GLM-5.3-Flash", "status": "admitted",
+                        "capabilities": ["execution"],
+                        "task_restrictions": ["offpeak-only"]}})
+    v3["catalog"]["plans"]["zai-offpeak"] = {
+        "provider": "zai", "kind": "privilege"}
+    v3["catalog"]["bindings"].update({
+        "kimi-editor": {"status": "declared", "capabilities": ["editorial"],
+                        "note": "logical editor profile only (sol turn-5)"}})
+    v3["roles"]["intelligence"] = {
+        "kind": "proposal-and-review",
+        "binding_refs": ["sol-editor", "gemini-reviewer"]}
+    # the adoption aligns retained legacy projections with routing (C24)
+    v3["roles"]["editor"]["default_binding_ref"] = "sol-editor"
+    v3["roles"]["editor"]["fallback_binding_refs"] = ["kimi-editor"]
+    v3["roles"]["dreamers"] = {"kind": "execution"}
+    v3["roles"]["core-keeper"] = {
+        "kind": "model-assisted-maintenance", "reserve_ref": "bud1"}
+    for k, sec in ex.items():
+        if k in ("catalog", "roles", "supply") and \
+                isinstance(sec, dict) and isinstance(v3.get(k), dict):
+            for k2, v2_ in sec.items():
+                if isinstance(v2_, dict) and isinstance(v3[k].get(k2), dict):
+                    v3[k][k2].update(v2_)
+                else:
+                    v3[k][k2] = v2_
+        else:
+            v3[k] = sec
+    # the SAME owner-class adoption raises the consult budget; the example
+    # fragment carries hard_limits + window_hours for b-consult-daily
+    v3["supply"]["budgets"]["b-consult-daily"] = {
+        "scope": "plane/intelligence-consult",
+        "hard_limits": hard30 or {"consults": 4096},
+        "window_hours": wh30}
+    v3.setdefault("planes", {})["intelligence-consult"] = {
+        "owner_policy": "enabled",
+        "binding_refs": ["sol-editor", "gemini-reviewer"],
+        "budget_refs": ["b-consult-daily"],
+        "allowed_task_classes": ["editorial", "review"]}
+    v3["supply"].pop("admission", None)
+
+    # C13 closed schema: unknown field, bad ref, double default, bounds
+    bad = json.loads(json.dumps(v3))
+    bad["supply"]["pressure"]["ceilings"]["whoops"] = 1
+    codes = {x["code"] for x in sc.validate(bad)}
+    check("T35-1a unknown ceiling key -> PRESSURE_SCHEMA",
+          "PRESSURE_SCHEMA" in codes, json.dumps(sorted(codes)))
+    bad = json.loads(json.dumps(v3))
+    bad["supply"]["pressure"]["demand"]["level"] = "turbo"
+    codes = {x["code"] for x in sc.validate(bad)}
+    check("T35-1b unknown demand level -> PRESSURE_REF",
+          "PRESSURE_REF" in codes, json.dumps(sorted(codes)))
+    bad = json.loads(json.dumps(v3))
+    bad["catalog"]["execution_profiles"]["sol-med2"] = {
+        "binding_ref": "sol-editor", "default_for_binding": True}
+    codes = {x["code"] for x in sc.validate(bad)}
+    check("T35-1c two default profiles on one binding -> PRESSURE_PROFILE",
+          "PRESSURE_PROFILE" in codes, json.dumps(sorted(codes)))
+    bad = json.loads(json.dumps(v3))
+    bad["supply"]["pressure"]["demand"]["profile_slot_overrides"] = {
+        "sol-high": 999}
+    codes = {x["code"] for x in sc.validate(bad)}
+    check("T35-1d override past ceilings -> PRESSURE_BOUNDS",
+          "PRESSURE_BOUNDS" in codes, json.dumps(sorted(codes)))
+
+    # C15 one pressure source
+    bad = json.loads(json.dumps(v3))
+    bad["supply"]["admission"] = {"global_max_concurrent": 6}
+    codes = {x["code"] for x in sc.validate(bad)}
+    check("T35-2 admission+pressure coexist -> PRESSURE_SOURCE_CONFLICT",
+          "PRESSURE_SOURCE_CONFLICT" in codes, json.dumps(sorted(codes)))
+
+    # C14 v2 preservation: genesis still validates; legacy view
+    check("T35-3 v2 genesis validates unchanged and views legacy",
+          sc.validate(sc.parse_yaml_bytes(GENESIS)[0]) == []
+          and sc.pressure_view(sc.parse_yaml_bytes(GENESIS)[0])["version"] == 2)
+
+    # C16/C17 shared identity + the opening numbers
+    check("T35-4 v3 worked example validates",
+          sc.validate(v3) == [], json.dumps(sc.validate(v3))[:200])
+    pv = sc.pressure_view(v3)
+    check("T35-5 shared sol identity: both profiles on one binding",
+          pv["profiles"].get("sol-high", pv["profiles"].get(
+              "sol-editor/default"))["binding_ref"] == "sol-editor"
+          and pv["profiles"]["sol-medium"]["binding_ref"] == "sol-editor"
+          and pv["profile_aliases"].get("sol-editor/default") == "sol-high"
+          and pv["profiles"]["sol-medium"]["reasoning_override"] == "medium")
+    check("T35-6 opening resolves 16 high + 32 medium at level high",
+          pv["baseline"].get("sol-high") == 16
+          and pv["baseline"].get("sol-editor/default") == 16
+          and pv["baseline"].get("sol-medium") == 32
+          and pv["baseline"].get("gemini-high") == 2
+          and pv["baseline"].get("glm-max") == 6
+          and pv["baseline"].get("b1/default") == 1
+          and pv["baseline"].get("kimi-editor/default") == 1
+          and pv["level"] == "high"
+          and pv["global_ceiling"] == 128,
+          json.dumps(pv["baseline"]))
+    v3s = json.loads(json.dumps(v3))
+    v3s["supply"]["pressure"]["demand"]["level"] = "saturate"
+    pvs = sc.pressure_view(v3s)
+    check("T35-6b saturate resolves 32 + 64",
+          pvs["baseline"].get("sol-high") == 32
+          and pvs["baseline"].get("sol-medium") == 64)
+
+    # C18 aggregate ceilings under racing admits; leases combine by max
+    sd35 = temp_state() / "pressure-t35"
+    auth = make_auth("main", cfg=v3, config_hash="cfg35")
+    got = [auth.admit(dispatch_id=f"d{i}", attempt_id=f"a{i}",
+                      verified_principal="orch-intel",
+                      role_ref="intelligence", profile_ref="sol-high",
+                      plane_ref="intelligence-consult")
+           for i in range(20)]
+    allows = [g for g in got if g["decision"] == "ALLOW"]
+    check("T35-7 admits cap at the profile desired (16), rest HOLD",
+          len(allows) == 16
+          and all(g["decision"] == "HOLD" for g in got[16:]),
+          json.dumps([g["decision"] for g in got] +
+                     [g.get("reason_codes") for g in got if g["decision"] != "ALLOW"][:2]))
+    lr = auth.lease(request_id="rq-1", expected_config_hash="cfg35",
+                    verified_principal="orch-intel",
+                    issuer_role_ref="intelligence",
+                    profile_slots={"sol-high": 24}, ttl_seconds=300,
+                    expected_lease_revision=0)
+    check("T35-7b delegated lease granted and raises desired by max",
+          lr.get("ok") and auth.status()["desired"].get("sol-high", 0) == 24,
+          json.dumps(lr)[:160])
+    lr2 = auth.lease(request_id="rq-2", expected_config_hash="cfg35",
+                     verified_principal="orch-intel-2",
+                     issuer_role_ref="intelligence",
+                     profile_slots={"sol-high": 10}, ttl_seconds=300,
+                     expected_lease_revision=0)
+    over = auth.lease(request_id="rq-3", expected_config_hash="cfg35",
+                      verified_principal="orch-intel-2",
+                      issuer_role_ref="intelligence",
+                      profile_slots={"sol-high": 40}, ttl_seconds=300,
+                      expected_lease_revision=0)
+    check("T35-7c second issuer: combined by MAX (24), never sum; "
+          "above-ceiling lease refused",
+          lr2.get("ok") and auth.status()["desired"].get("sol-high", 0) == 24
+          and not over.get("ok"),
+          json.dumps([auth.status()["desired"].get("sol-high", 0),
+                      lr2.get("faults"), over.get("faults")]))
+
+    # C19 budget binding: exhausted consults HOLD despite free slots
+    cfg_b = json.loads(json.dumps(v3))
+    cfg_b["supply"]["budgets"]["b-consult-daily"]["hard_limits"] = {
+        "consults": 2}
+    auth_b = pr.authority_from_config(
+        cfg_b, "cfg35b", state_dir=temp_state() / "p35-budget",
+        health_evidence=healthy,
+        principal_verifier=lambda p: PRINCIPALS.get(p))
+    res = [auth_b.admit(dispatch_id=f"b{i}", attempt_id=f"a{i}",
+                        verified_principal="orch-intel",
+                        role_ref="intelligence", profile_ref="sol-high",
+                        plane_ref="intelligence-consult")
+           for i in range(4)]
+    check("T35-8 exhausted consult budget HOLDs despite free slots",
+          [r["decision"] for r in res] ==
+          ["ALLOW", "ALLOW", "HOLD", "HOLD"]
+          and any("consults" in rc for r in res[2:]
+                  for rc in r["reason_codes"]),
+          json.dumps([r["decision"] for r in res]))
+
+    # C20 agent boundaries via the ledger accept() path
+    sd9 = temp_state() / "p35-auth"
+    seed = json.loads(json.dumps(v3))
+    seed["identity"] = dict(v3["identity"], parent_hash="0" * 64,
+                            change_id="11111111-2222-4333-8444-567890123456")
+    rs = sc.accept(json.dumps(seed), proposed_by="owner",
+                   authority_class="owner", state_dir=sd9)
+    check("T35-9 owner seeds the v3 ledger",
+          rs["decision"] == "accepted", json.dumps(rs["faults"])[:200])
+    head9 = sc.active_head(sd9)["content_hash"]
+
+    def agent_variant(mutate, change):
+        d = json.loads(json.dumps(v3))
+        d["supply"]["pressure"]["control"]["agent_profile_refs"] = [
+            "sol-high", "sol-medium", "gemini-high", "glm-max"]
+        mutate(d)
+        d["identity"] = dict(v3["identity"], revision=2,
+                             parent_hash=head9, change_id=change)
+        return json.dumps(d)
+
+    ra = sc.accept(agent_variant(
+        lambda d: d["supply"]["pressure"]["demand"].update(level="saturate"),
+        "22222222-2222-4333-8444-555555555551"),
+        proposed_by="orchestrator-agent", authority_class="agent",
+        state_dir=sd9, issuer_role_ref="intelligence")
+    check("T35-9 delegated demand change accepted from an agent",
+          ra["decision"] == "accepted", json.dumps(ra["faults"])[:200])
+    head9 = sc.active_head(sd9)["content_hash"]
+    rc_ = sc.accept(agent_variant(
+        lambda d: d["supply"]["pressure"]["ceilings"].update(
+            global_concurrent_slots=256),
+        "22222222-2222-4333-8444-555555555552"),
+        proposed_by="orchestrator-agent", authority_class="agent",
+        state_dir=sd9)
+    check("T35-9b agent raising a ceiling -> rejected_unauthorized",
+          rc_["decision"] == "rejected_unauthorized", rc_["decision"])
+    head9 = sc.active_head(sd9)["content_hash"]
+    rr = sc.accept(agent_variant(
+        lambda d: d["supply"]["pressure"].update(
+            control=dict(d["supply"]["pressure"]["control"],
+                         agent_level_names=["normal"])),
+        "22222222-2222-4333-8444-555555555553"),
+        proposed_by="agent-x", authority_class="agent", state_dir=sd9)
+    check("T35-9c undelegated level -> rejected_unauthorized",
+          rr["decision"] == "rejected_unauthorized", rr["decision"])
+
+    # C21 lease lifecycle: CAS, single per issuer, expiry restores baseline
+    auth2 = pr.authority_from_config(v3, "cfg35c",
+                                     state_dir=temp_state() / "p35-lease",
+                                     health_evidence=healthy,
+                                     principal_verifier=lambda p:
+                                         PRINCIPALS.get(p))
+    l1 = auth2.lease(request_id="s", expected_config_hash="cfg35c",
+                     verified_principal="orch-intel",
+                     issuer_role_ref="intelligence",
+                     profile_slots={"sol-high": 20}, ttl_seconds=1,
+                     expected_lease_revision=0)
+    again = auth2.lease(request_id="s2", expected_config_hash="cfg35c",
+                        verified_principal="orch-intel",
+                        issuer_role_ref="intelligence",
+                        profile_slots={"sol-high": 21}, ttl_seconds=1,
+                        expected_lease_revision=0)
+    check("T35-10 second lease without revision CAS refused",
+          not again.get("ok") and
+          any("CAS" in f for f in again.get("faults", [])),
+          json.dumps(again)[:160])
+    l1b = auth2.lease(request_id="s3", expected_config_hash="cfg35c",
+                      verified_principal="orch-intel",
+                      issuer_role_ref="intelligence",
+                      profile_slots={"sol-high": 20}, ttl_seconds=1,
+                      expected_lease_revision=l1["revision"])
+    check("T35-10b replacement via revision CAS ok",
+          l1b.get("ok") and l1b["revision"] == l1["revision"] + 1)
+    time.sleep(1.1)
+    check("T35-10c expired lease drops out of desired",
+          auth2.status()["desired"].get("sol-high", 0) == 16)
+
+    # C22 owner fencing: activation invalidates leases/permits; ceiling
+    # below occupancy refused
+    l2 = auth2.lease(request_id="rq-l2", expected_config_hash="cfg35c",
+                     verified_principal="orch-intel",
+                     issuer_role_ref="intelligence",
+                     profile_slots={"sol-medium": 60}, ttl_seconds=300,
+                     expected_lease_revision=0)
+    act = auth2.activate(sc.pressure_view(v3s), "cfg35-next")
+    nowX = __import__("time").time()
+    leases_left = auth2._leases_for(auth2._db, "sol-medium", nowX)
+    check("T35-11 activation invalidates old-config leases",
+          act.get("ok") and leases_left == 0,
+          json.dumps(act)[:160])
+    auth3 = pr.authority_from_config(v3, "cfg35d", state_dir=sd35,
+                                     health_evidence=healthy,
+                                     principal_verifier=lambda p:
+                                         PRINCIPALS.get(p))
+    for i in range(6):
+        auth3.admit(dispatch_id=f"dX{i}", attempt_id=f"aX{i}",
+                    verified_principal="orch-intel", role_ref="intelligence",
+                    profile_ref="sol-high", plane_ref="intelligence-consult")
+    tiny = json.loads(json.dumps(v3))
+    tiny["supply"]["pressure"]["ceilings"]["profile_concurrent_slots"] = {
+        "sol-high": 5}
+    refused = auth3.activate(sc.pressure_view(tiny), "cfg35-tiny")
+    check("T35-11b ceiling below occupancy refuses activation",
+          not refused.get("ok")
+          and any("BELOW_INFLIGHT" in f for f in refused.get("faults", [])),
+          json.dumps(refused)[:200])
+
+    # C23 health stale HOLDs
+    auth4 = pr.authority_from_config(v3, "cfg35e",
+                                     state_dir=temp_state() / "p35-health",
+                                     health_evidence=lambda b: None,
+                                     principal_verifier=lambda p:
+                                         PRINCIPALS.get(p))
+    r_h = auth4.admit(dispatch_id="dH", attempt_id="aH",
+                      verified_principal="orch-intel",
+                      role_ref="intelligence", profile_ref="sol-high",
+                      plane_ref="intelligence-consult")
+    check("T35-12 stale health HOLDs dispatch",
+          r_h["decision"] == "HOLD")
+
+    # C24 routing: conflict with legacy projections; duplicate lanes
+    bad = json.loads(json.dumps(v3))
+    bad["roles"]["editor"]["routing"]["fallback_profile_refs"] = [
+        "gemini-high"]
+    codes = {x["code"] for x in sc.validate(bad)}
+    check("T35-13 routing/legacy disagreement -> PRESSURE_ROUTE_CONFLICT",
+          "PRESSURE_ROUTE_CONFLICT" in codes, json.dumps(sorted(codes)))
+    bad = json.loads(json.dumps(v3))
+    bad["roles"]["intelligence"]["routing"]["parallel"]["lanes"].append(
+        {"profile_ref": "sol-high", "weight": 1})
+    codes = {x["code"] for x in sc.validate(bad)}
+    check("T35-13b duplicate lane -> PRESSURE_REF",
+          "PRESSURE_REF" in codes, json.dumps(sorted(codes)))
+
+    # C25 uncertain submission: reserved until reconciled
+    auth5 = pr.authority_from_config(v3, "cfg35f2",
+                                     state_dir=temp_state() / "p35-f2",
+                                     health_evidence=healthy,
+                                     principal_verifier=lambda p:
+                                         PRINCIPALS.get(p))
+    pm = auth5.admit(dispatch_id="dU", attempt_id="aU",
+                     verified_principal="orch-intel",
+                     role_ref="intelligence", profile_ref="sol-medium",
+                     plane_ref="intelligence-consult")
+    auth5.mark_uncertain(pm["permit_ref"], "ack lost")
+    rd = auth5.redeem(pm["permit_ref"], dispatch_id="dU",
+                      attempt_id="aU")
+    auth5.reconcile(pm["permit_ref"], launched=True)
+    occU = auth5.status()["occupancy"]
+    auth5.release(pm["permit_ref"])
+    occR = auth5.status()["occupancy"]
+    check("T35-14 uncertain reserved; reconcile keeps slot; release frees",
+          not rd.get("ok")
+          and occU["profiles"].get("sol-medium") == 1
+          and occR["profiles"].get("sol-medium") is None,
+          json.dumps([rd, occU["profiles"], occR["profiles"]]))
+
+    # C26 recovery: corrupt store -> CONTAIN, never fresh capacity
+    sdC = temp_state() / "pressure-t35-corrupt"
+    (sdC / "runtime" / "pressure").mkdir(parents=True, exist_ok=True)
+    (sdC / "runtime" / "pressure" / "state.sqlite").write_bytes(b"not a db")
+    authC = pr.authority_from_config(v3, "cfg35g", state_dir=sdC,
+                                     health_evidence=healthy,
+                                     principal_verifier=lambda p:
+                                         PRINCIPALS.get(p))
+    outC = authC.admit(dispatch_id="dC", attempt_id="aC",
+                       verified_principal="orch-intel",
+                       role_ref="intelligence", profile_ref="sol-high",
+                       plane_ref="intelligence-consult")
+    check("T35-15 corrupt authority CONTAINs (never fabricates capacity)",
+          outC["decision"] == "CONTAIN"
+          and any("unavailable" in rc for rc in outC["reason_codes"]),
+          json.dumps(outC)[:160])
+
+    # C28 golden binding preserved: glm-workhorse identity untouched
+    check("T35-16 golden zcode-tui binding identity unchanged",
+          v3["catalog"]["bindings"]["glm-workhorse"]["harness"] ==
+          "zcode-tui"
+          and v3["catalog"]["bindings"]["glm-workhorse"]["model"] ==
+          "GLM-5.3-Flash"
+          and pv["profiles"]["glm-max"]["binding_ref"] == "glm-workhorse")
+
+
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
     if FAIL:
         print("FAILED:", *FAIL, sep="\n  - ")

@@ -1,0 +1,151 @@
+schema_version: 3
+
+catalog:
+  execution_profiles:
+    sol-high:
+      binding_ref: sol-editor
+      default_for_binding: true
+      reasoning_override: high
+
+    sol-medium:
+      binding_ref: sol-editor
+      default_for_binding: false
+      reasoning_override: medium
+
+    gemini-high:
+      binding_ref: gemini-reviewer
+      default_for_binding: true
+      reasoning_override: high
+
+    glm-max:
+      binding_ref: glm-workhorse
+      default_for_binding: true
+      reasoning_override: max
+
+roles:
+  editor:
+    default_binding_ref: sol-editor
+    fallback_binding_refs:
+      - kimi-editor
+    routing:
+      preferred_profile_ref: sol-high
+      fallback_profile_refs:
+        - kimi-editor/default
+      max_concurrent_slots: 16
+      parallel:
+        strategy: single
+        lanes: []
+
+  intelligence:
+    default_binding_ref: sol-editor
+    fallback_binding_refs:
+      - gemini-reviewer
+    binding_refs:
+      - sol-editor
+      - gemini-reviewer
+    routing:
+      preferred_profile_ref: sol-high
+      fallback_profile_refs:
+        - gemini-high
+      max_concurrent_slots: 96
+      parallel:
+        strategy: weighted_fair
+        lanes:
+          - profile_ref: sol-high
+            weight: 1
+          - profile_ref: sol-medium
+            weight: 2
+
+supply:
+  pressure:
+    ceilings:
+      global_concurrent_slots: 128
+
+      default_binding_concurrent_slots: 1
+      binding_concurrent_slots:
+        sol-editor: 96
+        gemini-reviewer: 4
+        glm-workhorse: 8
+
+      default_profile_concurrent_slots: 1
+      profile_concurrent_slots:
+        sol-high: 32
+        sol-medium: 64
+        gemini-high: 4
+        glm-max: 8
+
+      pools:
+        codex-sol:
+          binding_refs:
+            - sol-editor
+          concurrent_slots: 96
+          cooldown_after_refusal_seconds: 60
+
+        gemini-consult:
+          binding_refs:
+            - gemini-reviewer
+          concurrent_slots: 4
+          cooldown_after_refusal_seconds: 60
+
+        zai-shared:
+          binding_refs:
+            - glm-workhorse
+            - glm-offpeak
+          concurrent_slots: 8
+          cooldown_after_refusal_seconds: 60
+
+    levels:
+      normal:
+        default_profile_slots: 1
+        profile_slots:
+          sol-high: 2
+          sol-medium: 4
+          gemini-high: 1
+          glm-max: 2
+
+      high:
+        default_profile_slots: 1
+        profile_slots:
+          sol-high: 16
+          sol-medium: 32
+          gemini-high: 2
+          glm-max: 6
+
+      saturate:
+        default_profile_slots: 1
+        profile_slots:
+          sol-high: 32
+          sol-medium: 64
+          gemini-high: 4
+          glm-max: 8
+
+    demand:
+      level: high
+      profile_slot_overrides: {}
+
+    control:
+      persistent_agent_edits: true
+      agent_role_refs:
+        - editor
+        - intelligence
+        - dreamers
+        - core-keeper
+      agent_profile_refs:
+        - sol-high
+        - sol-medium
+        - gemini-high
+        - glm-max
+      agent_level_names:
+        - normal
+        - high
+        - saturate
+      lease_max_ttl_seconds: 900
+      lease_max_active_per_issuer: 1
+
+
+# the SAME owner-class adoption changes the existing b-consult-daily budget:
+hard_limits:
+  consults: 4096
+window_hours: 24
+
+# and REMOVES supply.admission (never coexists with supply.pressure)
