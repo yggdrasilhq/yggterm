@@ -16,6 +16,7 @@ etc.) to:
 """
 
 import argparse
+import contextlib
 import datetime
 import fcntl
 import hashlib
@@ -24,6 +25,7 @@ import os
 import re
 import shutil
 import socket
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -213,8 +215,28 @@ def text_sha256(content: str) -> str:
 def version_for_digest(root: Path, namespace: str, filename: str, digest: str | None) -> str | None:
     if not digest:
         return None
+    try:
+        conn = _ji_connect(root)
+        try:
+            _ji_refresh(root, conn)
+            gen = int(_ji_meta_get(conn).get("gen", "0") or 0)
+            # last physical occurrence wins (same rule as the naive scan);
+            # indexed columns only — payloads are never parsed on this path
+            row = conn.execute(
+                "SELECT payload FROM entries INDEXED BY ix_entries_nfd"
+                " WHERE gen = ? AND ns = ? AND file = ? AND digest = ?"
+                " ORDER BY off DESC LIMIT 1",
+                (gen, namespace, filename, digest),
+            ).fetchone()
+            if row and row[0]:
+                return json.loads(row[0]).get("version_id")
+            return None
+        finally:
+            conn.close()
+    except Exception:
+        pass
     found = None
-    for record in read_journal_entries(root, namespace=namespace):
+    for record in _read_journal_entries_naive(root, namespace=namespace):
         if record.get("file") == filename and record.get("digest") == digest:
             found = record.get("version_id")
     return found
@@ -1727,7 +1749,314 @@ def matches_target_harness(entry_target: str, query_harness: str) -> bool:
     return ent == qh
 
 
+
+# ----------------------------------------------------------- journal index
+# Derived SQLite cache over journal.jsonl (sync-arch phase 1, 2026-10-27,
+# sol-corrected design). Rows are keyed by (generation, byte offset): seq is
+# NOT unique across origins, so it is a filtered column, never the key.
+# Appends extend coverage only after anchor validation (file head bytes plus
+# the previously covered last line), so a legacy writer that mutates the
+# journal without registering is still detected and triggers a rebuild.
+# _merge_journals (an in-place rewrite) bumps the generation explicitly.
+# The naive full scans above are kept verbatim as the fallback: any index
+# error degrades to today's behavior, never to wrong answers.
+
+_JOURNAL_INDEX_NAME = "journal-index.db"
+_JOURNAL_WRITER_LOCK_NAME = ".journal-writer.lock"
+
+
+@contextlib.contextmanager
+def journal_writer_lock(root: Path, timeout_seconds: float = 30.0):
+    """Short exclusive lock over journal mutations (seq allocation, append,
+    rewrite, tail repair). Scans, network and object hashing stay outside."""
+    f = _flock_open(root / _JOURNAL_WRITER_LOCK_NAME, timeout_seconds=timeout_seconds)
+    try:
+        yield f
+    finally:
+        _flock_close(f)
+
+
+def _journal_index_path(root: Path) -> Path:
+    return root / _JOURNAL_INDEX_NAME
+
+
+def _ji_connect(root: Path):
+    conn = sqlite3.connect(str(_journal_index_path(root)), timeout=5.0)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=5000")
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS entries ("
+        "gen INTEGER NOT NULL, off INTEGER NOT NULL, seq INTEGER NOT NULL,"
+        "ns TEXT, file TEXT, digest TEXT, payload TEXT NOT NULL,"
+        "PRIMARY KEY (gen, off))"
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS ix_entries_nfd ON entries(ns, file, digest)")
+    conn.execute("CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)")
+    return conn
+
+
+def _ji_meta_get(conn) -> dict:
+    return {k: v for k, v in conn.execute("SELECT k, v FROM meta")}
+
+
+def _ji_anchors(head: bytes, last_line: bytes) -> dict:
+    return {
+        "head": hashlib.sha256(head).hexdigest(),
+        "last_len": str(len(last_line)),
+        "last_hash": hashlib.sha256(last_line).hexdigest() if last_line else "",
+    }
+
+
+def _ji_repair_partial_tail(jpath: Path) -> None:
+    """A crash between write() and completion can leave a line without its
+    newline. Repair to the last complete line before any append (writer lock
+    held); the index coverage never crosses an incomplete line anyway."""
+    if not jpath.exists():
+        return
+    size = jpath.stat().st_size
+    if size == 0:
+        return
+    with open(jpath, "rb") as f:
+        f.seek(-1, 2)
+        if f.read(1) == b"\n":
+            return
+        back = min(size, 65536)
+        f.seek(size - back)
+        blob = f.read()
+    cut = blob.rfind(b"\n")
+    good = (size - back + cut + 1) if cut >= 0 else 0
+    os.truncate(jpath, good)
+
+
+def _ji_refresh(root: Path, conn) -> None:
+    """Level the index with journal.jsonl. Append case: parse only new bytes
+    after validating anchors. Any other shape (rewrite, truncation, legacy
+    mutation) rebuilds under a bumped generation. Rows and the coverage
+    cursor commit together in one transaction."""
+    jpath = get_journal_path(root)
+    if not jpath.exists():
+        return
+    meta = _ji_meta_get(conn)
+    old_gen = int(meta.get("gen", "0") or 0)
+    gen = old_gen
+    covered = int(meta.get("covered", "0") or 0)
+    last_len = int(meta.get("last_len", "0") or 0)
+    last_hash = meta.get("last_hash", "")
+    head_hash = meta.get("head", "")
+    with open(jpath, "rb") as f:
+        f.seek(0, 2)
+        size = f.tell()
+        if size == 0:
+            if covered:
+                conn.execute("BEGIN IMMEDIATE")
+                conn.execute("DELETE FROM entries")
+                conn.execute(
+                    "INSERT OR REPLACE INTO meta (k, v) VALUES ('gen', ?)",
+                    (str(gen + 1),),
+                )
+                conn.execute("DELETE FROM meta WHERE k != 'gen'")
+                conn.commit()
+            return
+        f.seek(0)
+        head = f.read(4096)
+        append_ok = covered > 0 and size >= covered and last_len > 0
+        if append_ok:
+            f.seek(covered - last_len)
+            probe = f.read(last_len)
+            append_ok = (
+                len(probe) == last_len
+                and hashlib.sha256(probe).hexdigest() == last_hash
+                and (not head_hash or hashlib.sha256(head).hexdigest() == head_hash)
+            )
+        if append_ok:
+            f.seek(covered)
+            blob = f.read(size - covered)
+            base = covered
+        else:
+            gen += 1
+            f.seek(0)
+            blob = f.read()
+            base = 0
+    rows = []
+    last_complete_end = base
+    last_line = b""
+    i = 0
+    n = len(blob)
+    while True:
+        nl = blob.find(b"\n", i)
+        if nl < 0:
+            break
+        line = blob[i:nl]
+        i = nl + 1
+        last_complete_end = base + i
+        if line.strip():
+            try:
+                rec = json.loads(line.decode("utf-8"))
+            except Exception:
+                rec = None
+            if rec is not None:
+                rows.append(
+                    (
+                        gen,
+                        base + (i - len(line) - 1),
+                        int(rec.get("seq", 0) or 0),
+                        rec.get("ns"),
+                        rec.get("file"),
+                        rec.get("digest"),
+                        line.decode("utf-8", errors="replace"),
+                    )
+                )
+                last_line = blob[i - len(line) - 1 : i]  # line + its newline
+    conn.execute("BEGIN IMMEDIATE")
+    conn.execute("DELETE FROM entries WHERE gen != ?", (gen,))
+    if rows:
+        conn.executemany(
+            "INSERT OR REPLACE INTO entries (gen, off, seq, ns, file, digest, payload)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?)",
+            rows,
+        )
+    if "max_seq" in meta:
+        max_seq = int(meta["max_seq"] or 0)
+    else:
+        row = conn.execute(
+            "SELECT MAX(seq) FROM entries WHERE gen = ?", (old_gen,)
+        ).fetchone()
+        max_seq = int(row[0]) if row and row[0] is not None else 0
+    for row in rows:
+        if row[2] > max_seq:
+            max_seq = row[2]
+    for k, v in {
+        "gen": str(gen),
+        "covered": str(last_complete_end),
+        "max_seq": str(max_seq),
+        **_ji_anchors(head, last_line),
+    }.items():
+        conn.execute("INSERT OR REPLACE INTO meta (k, v) VALUES (?, ?)", (k, v))
+    conn.commit()
+
+
+def _ji_read(root: Path, after_seq: int, namespace, target_harness) -> list:
+    conn = _ji_connect(root)
+    try:
+        _ji_refresh(root, conn)
+        gen = int(_ji_meta_get(conn).get("gen", "0") or 0)
+        sql = "SELECT payload FROM entries WHERE gen = ? AND seq > ?"
+        args: list = [gen, after_seq]
+        if namespace is not None:
+            sql += " AND ns = ?"
+            args.append(namespace)
+        sql += " ORDER BY off"
+        out = []
+        for (text,) in conn.execute(sql, args):
+            if not text:
+                continue
+            rec = json.loads(text)
+            if target_harness is not None and not matches_target_harness(
+                rec.get("target_harness", "all"), target_harness
+            ):
+                continue
+            out.append(rec)
+        return out
+    finally:
+        conn.close()
+
+
+def _ji_invalidate(root: Path) -> None:
+    """Force a rebuild on next read (call after in-place journal rewrites)."""
+    try:
+        conn = _ji_connect(root)
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            gen = int(_ji_meta_get(conn).get("gen", "0") or 0)
+            conn.execute("DELETE FROM entries")
+            conn.execute(
+                "INSERT OR REPLACE INTO meta (k, v) VALUES ('gen', ?)",
+                (str(gen + 1),),
+            )
+            conn.execute("DELETE FROM meta WHERE k != 'gen'")
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception:
+        pass
+
+
+def _ji_install(root: Path, records, offsets, covered: int) -> None:
+    """A merge just rewrote the journal and holds every record in memory —
+    install its rows directly (gen+1) so readers never pay a full rebuild."""
+    try:
+        conn = _ji_connect(root)
+        try:
+            gen = int(_ji_meta_get(conn).get("gen", "0") or 0) + 1
+            rows = []
+            max_seq = 0
+            for r, off in zip(records, offsets):
+                seq = int(r.get("seq", 0) or 0)
+                if seq > max_seq:
+                    max_seq = seq
+                rows.append(
+                    (gen, off, seq, r.get("ns"), r.get("file"), r.get("digest"),
+                     json.dumps(r))
+                )
+            jpath = get_journal_path(root)
+            with open(jpath, "rb") as f:
+                head = f.read(4096)
+                size = jpath.stat().st_size
+                tail_len = min(size, 262144)
+                f.seek(size - tail_len)
+                tail = f.read()
+            nl = tail.rfind(b"\n")
+            prev_nl = tail.rfind(b"\n", 0, nl)
+            last_line = tail[prev_nl + 1 : nl + 1] if nl >= 0 else b""
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute("DELETE FROM entries")
+            if rows:
+                conn.executemany(
+                    "INSERT OR REPLACE INTO entries (gen, off, seq, ns, file, digest, payload)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    rows,
+                )
+            for k, v in {
+                "gen": str(gen),
+                "covered": str(covered),
+                "max_seq": str(max_seq),
+                **_ji_anchors(head, last_line),
+            }.items():
+                conn.execute("INSERT OR REPLACE INTO meta (k, v) VALUES (?, ?)", (k, v))
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception:
+        pass
+
+
 def read_journal_entries(root: Path, after_seq: int = 0, namespace: str = None, target_harness: str = None) -> list:
+    try:
+        return _ji_read(root, after_seq, namespace, target_harness)
+    except Exception:
+        return _read_journal_entries_naive(root, after_seq, namespace, target_harness)
+
+
+def get_latest_seq(root: Path) -> int:
+    try:
+        conn = _ji_connect(root)
+        try:
+            _ji_refresh(root, conn)
+            meta = _ji_meta_get(conn)
+            if "max_seq" in meta:
+                return int(meta["max_seq"])
+            row = conn.execute(
+                "SELECT MAX(seq) FROM entries WHERE gen = ?",
+                (int(meta.get("gen", "0") or 0),),
+            ).fetchone()
+            return int(row[0]) if row and row[0] is not None else 0
+        finally:
+            conn.close()
+    except Exception:
+        return _get_latest_seq_naive(root)
+
+
+def _read_journal_entries_naive(root: Path, after_seq: int = 0, namespace: str = None, target_harness: str = None) -> list:
     jpath = get_journal_path(root)
     if not jpath.exists():
         return []
@@ -1752,7 +2081,7 @@ def read_journal_entries(root: Path, after_seq: int = 0, namespace: str = None, 
     return entries
 
 
-def get_latest_seq(root: Path) -> int:
+def _get_latest_seq_naive(root: Path) -> int:
     jpath = get_journal_path(root)
     if not jpath.exists():
         return 0
@@ -1823,8 +2152,6 @@ def append_journal_entry(
     base_versions: list[str] | None = None,
 ) -> dict:
     jpath = get_journal_path(root)
-    latest = get_latest_seq(root)
-    next_seq = latest + 1
     now_ts = int(time.time())
     iso_ts = datetime.datetime.now(datetime.timezone.utc).isoformat()
     event_id = str(uuid.uuid4())
@@ -1848,7 +2175,7 @@ def append_journal_entry(
     # A -> B -> A reuses an object digest but is a new causal revision.
     version_id = f"event:{event_id}"
     record = {
-        "seq": next_seq,
+        "seq": 0,  # allocated under the journal writer lock, just before append
         "event_id": event_id,
         "origin": origin,
         "ts": now_ts,
@@ -1865,8 +2192,22 @@ def append_journal_entry(
         "base_version": previous,
         "base_versions": base_versions or [],
     }
-    with open(jpath, "a", encoding="utf-8") as f:
-        f.write(json.dumps(record) + "\n")
+    with journal_writer_lock(root):
+        _ji_repair_partial_tail(jpath)
+        record["seq"] = get_latest_seq(root) + 1
+        line = (json.dumps(record) + "\n").encode("utf-8")
+        pre_size = jpath.stat().st_size if jpath.exists() else 0
+        fd = os.open(jpath, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+        try:
+            written = os.write(fd, line)
+        finally:
+            os.close(fd)
+        if written != len(line):
+            os.truncate(jpath, pre_size)
+            raise RuntimeError(
+                f"journal append short-write ({written}/{len(line)} bytes); "
+                "truncated back and aborted"
+            )
     return record
 
 
@@ -2732,6 +3073,7 @@ def _merge_journals(local_path: Path, peer_content: str):
                     records_by_key[k] = d
                 except Exception:
                     pass
+    local_count = len(records_by_key)
     for line in peer_content.splitlines():
         line = line.strip()
         if line:
@@ -2746,10 +3088,28 @@ def _merge_journals(local_path: Path, peer_content: str):
         records_by_key.values(),
         key=lambda r: (r.get("ts", 0), r.get("origin", ""), r.get("seq", 0), record_event_id(r)),
     )
+    if len(records_by_key) == local_count and not peer_content.strip():
+        return
+    if len(records_by_key) == local_count:
+        # peer brought nothing new: the rewrite below would be byte-identical,
+        # so skip it — an idle-hub merge must not churn the journal or the
+        # derived index every tick
+        return
     local_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(local_path, "w", encoding="utf-8") as f:
-        for r in sorted_records:
-            f.write(json.dumps(r) + "\n")
+    with journal_writer_lock(local_path.parent):
+        tmp = local_path.with_name(local_path.name + ".merge-tmp")
+        offsets = []
+        pos = 0
+        with open(tmp, "w", encoding="utf-8") as f:
+            for r in sorted_records:
+                line = json.dumps(r) + "\n"
+                f.write(line)
+                offsets.append(pos)
+                pos += len(line.encode("utf-8"))
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, local_path)
+        _ji_install(local_path.parent, sorted_records, offsets, pos)
 
 
 def migrate_legacy_store(root: Path) -> int:
