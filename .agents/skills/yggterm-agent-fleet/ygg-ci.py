@@ -751,6 +751,31 @@ def cmd_subscribe(a):
     if not p.exists():
         log("⛔ subscribe did not persist")
         return 1
+    # fail-loud readback (2026-10-27): the first-wake race has been observed
+    # to consume a fresh sub WITHOUT integrating or logging a disposition
+    # (lane/composer 2026-10-26 23:10, lane/audit-sticky-unknown 23:57 —
+    # both fixed only by re-subscribing). Verify the sub survives until the
+    # woken watcher's first pass; if it vanished with no disposition line,
+    # say so loudly instead of leaving the seat assuming integration.
+    first_tick_deadline = time.time() + 15
+    while time.time() < first_tick_deadline:
+        if not p.exists():
+            break  # consumed — disposition expected in the log
+        time.sleep(3)
+    if p.exists():
+        return 0  # still enlisted; the next interval tick owns it
+    try:
+        recent = CI_LOG.read_text(errors="ignore").splitlines()[-40:]
+        disposition = [l for l in recent if lane in l]
+    except Exception:
+        disposition = []
+    if disposition:
+        log(f"subscribe readback: {lane} consumed by first wake "
+            f"({disposition[-1][:120]})")
+    else:
+        log(f"⛔ subscribe readback: {lane} sub vanished from {SUBS} with NO "
+            f"disposition in the log — the first-wake race ate it. "
+            f"RE-SUBSCRIBE now (observed to always work on the second try).")
     return 0
 
 def cmd_unsubscribe(a):
