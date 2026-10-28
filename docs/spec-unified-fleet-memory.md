@@ -200,3 +200,13 @@ it never degrades to a silent no-op that reports success.
 1. **Privacy Guard (`scripts/check-privacy.sh`):** Unit tests and documentation must only use synthetic test fixtures (invented UUIDs, invented project paths like `/home/user/proj`). Zero real filings, personal paths, or credentials in fixtures.
 2. **Locking & Concurrency:** File locks (`flock`) prevent interleaving when multiple agents read/write concurrently.
 3. **Idempotence:** Every operation (`ack`, `publish`, `sync`, `sync-harness`) is strictly idempotent.
+4. **Native checkpoint I/O:** Within the global sync lock, a native Markdown
+   tree pass loads its harness watermark once and shares that snapshot only
+   for the duration of the pass. Unchanged document state never rewrites the
+   watermark. Each changed document is checkpointed before the next document
+   starts, so a later failure retains completed progress. A subsequent pass
+   reloads the watermark rather than overwriting another writer's updates.
+   This removes repeated whole-checkpoint JSON work from routine no-op syncs;
+   it does not make the global lock fair or bound arbitrary changed-file I/O.
+   Falsifier: `tests/test_native_watermark_io.py` in the fleet skill counts
+   reads/writes and checks edit durability and recovery after a later failure.
