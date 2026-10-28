@@ -131,6 +131,144 @@ publish_aux_link() {
   mv -f "${staged}" "${launcher_path}"
 }
 
+# ------------------------------------------------------------- ygg4 seed path
+# The GUI-free seed install is selected EXPLICITLY (`install.sh seed` or
+# YGGTERM_SEED=1). The default flow below stays the 3.x direct/GUI installer
+# so every older release keeps its documented behavior. The seed path never
+# touches the direct/GUI install root, never starts a daemon, and delegates
+# the entire staging/publication/rollback transaction to `ynpm
+# seed-activate`; this script only fetches verified bytes and publishes the
+# command links afterwards.
+seed_requested() {
+  [ "${YGGTERM_SEED:-0}" = "1" ] || [ "${1:-}" = "seed" ]
+}
+
+seed_link_is_ours() {
+  # true when an existing bin link points into the seed tree
+  link_target="$(readlink "$1" 2>/dev/null || true)"
+  case "${link_target}" in
+    */.yggterm/seed/*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+seed_publish_link() {
+  name="$1"
+  link_path="${HOME}/.local/bin/${name}"
+  if [ -e "${link_path}" ] || [ -L "${link_path}" ]; then
+    if ! seed_link_is_ours "${link_path}"; then
+      if [ "${YGG_MIGRATE_NATIVE:-0}" = "1" ]; then
+        log "migrating existing ${name} command to the ygg4 seed (YGG_MIGRATE_NATIVE=1)"
+      else
+        log "existing non-seed ${name} at ${link_path} left in place; set YGG_MIGRATE_NATIVE=1 to take it over"
+        return 0
+      fi
+    fi
+  fi
+  publish_aux_link "${name}" "${seed_root}/current/bin/${name}"
+}
+
+seed_install() {
+  seed_root="${YGGTERM_SEED_ROOT:-${HOME}/.yggterm/seed}"
+  seed_dist="${YGGTERM_SEED_DIST:-}"   # local dist override: tests and air-gapped hosts
+  scratch="${YGGTERM_INSTALL_SCRATCH:-${HOME}/.yggterm/scratchpad/ygg4-install}"
+  mkdir -p "${scratch}" "${HOME}/.local/bin"
+  seed_tmp="$(mktemp -d "${scratch}/seed-XXXXXX")"
+
+  requested_version="${YGGTERM_VERSION:-}"
+  if [ -z "${requested_version}" ]; then
+    latest_effective_url="$(curl -fsSL -o /dev/null -w '%{url_effective}' "${LATEST_URL}")"
+    requested_version="$(printf '%s\n' "${latest_effective_url}" | sed -n 's#.*/tag/\(v[^/?#]*\).*#\1#p' | tail -n1 | sed 's/^v//')"
+  fi
+  requested_version="$(printf '%s' "${requested_version}" | sed 's/^v//')"
+  [ -n "${requested_version}" ] || fail "could not resolve the seed version to install"
+  release_tag="v${requested_version}"
+
+  archive_name="ygg-seed-${target_label}.tar.gz"
+  manifest_name="release-manifest.json"
+  if [ -n "${seed_dist}" ]; then
+    archive_path="${seed_dist}/${archive_name}"
+    manifest_path="${seed_dist}/${manifest_name}"
+    [ -f "${archive_path}" ] || fail "local seed dist has no ${archive_name}"
+  else
+    base_url="https://github.com/${REPO}/releases/download/${release_tag}"
+    archive_path="${seed_tmp}/${archive_name}"
+    manifest_path="${seed_tmp}/${manifest_name}"
+    log "downloading ygg4 seed ${requested_version} for ${target_label}"
+    curl -fL "${base_url}/${archive_name}" -o "${archive_path}" || {
+      fail "seed archive ${archive_name} is not published for ${release_tag}"
+    }
+  fi
+
+  # Checksum verification is mandatory: an unverifiable archive fails the
+  # install, it is never installed unverified.
+  checksum_path="${seed_tmp}/${archive_name}.sha256"
+  if [ -n "${seed_dist}" ]; then
+    cp "${seed_dist}/${archive_name}.sha256" "${checksum_path}" || {
+      fail "local seed dist has no ${archive_name}.sha256"
+    }
+  else
+    curl -fsSL "${base_url}/${archive_name}.sha256" -o "${checksum_path}" || {
+      fail "no checksum published for ${archive_name}; refusing an unverifiable download"
+    }
+  fi
+  expected="$(awk '{print $1}' "${checksum_path}")"
+  case "${expected}" in
+    [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]*) ;;
+    *) fail "published checksum for ${archive_name} is not a sha256 digest" ;;
+  esac
+  if command -v sha256sum >/dev/null 2>&1; then
+    actual="$(sha256sum "${archive_path}" | awk '{print $1}')"
+  else
+    actual="$(shasum -a 256 "${archive_path}" | awk '{print $1}')"
+  fi
+  [ "${expected}" = "${actual}" ] || fail "seed checksum verification failed for ${archive_name}"
+
+  # The archive name above is constructed locally, but the manifest is
+  # release-published content: keep it untrusted until ynpm validates it.
+  if [ -n "${seed_dist}" ]; then
+    cp "${manifest_path}" "${seed_tmp}/${manifest_name}" 2>/dev/null || true
+    manifest_path="${seed_tmp}/${manifest_name}"
+    [ -f "${manifest_path}" ] || fail "local seed dist has no ${manifest_name}"
+  else
+    curl -fsSL "${base_url}/${manifest_name}" -o "${manifest_path}" || {
+      fail "release manifest not published for ${release_tag}"
+    }
+  fi
+
+  # Extract the bootstrap only (the transaction owner we are about to run);
+  # seed-activate re-extracts and verifies the archive itself, staged.
+  tar -xzf "${archive_path}" -C "${seed_tmp}" ynpm || {
+    fail "seed archive did not carry an executable ynpm bootstrap"
+  }
+  [ -x "${seed_tmp}/ynpm" ] || fail "extracted ynpm bootstrap is not executable"
+
+  log "activating seed generation (staged by ynpm seed-activate)"
+  "${seed_tmp}/ynpm" seed-activate \
+    --archive "${archive_path}" \
+    --manifest "${manifest_path}" \
+    --package ygg-seed \
+    --expect-version "${requested_version}" \
+    --json || fail "seed-activate refused the transaction"
+
+  # Only now are commands published, symlinking through current/ so later
+  # activations are picked up without touching these links again.
+  seed_publish_link ygg
+  seed_publish_link ynpm
+  seed_publish_link ynpx
+
+  active_generation="$(readlink "${seed_root}/current" 2>/dev/null || echo '?')"
+  log "installed ygg4 seed ${requested_version} (${active_generation})"
+  log "commands: ${HOME}/.local/bin/{ygg,ynpm,ynpx}"
+  case ":${PATH:-}:" in
+    *":${HOME}/.local/bin:"*) ;;
+    *) log "add ${HOME}/.local/bin to PATH to use the ygg command" ;;
+  esac
+  log "this host can now be operated over ssh as a ygg system; that is a remote-operator capability, not local worker readiness"
+  log "previous generations are preserved under ${seed_root}/generations"
+}
+
+
 os="$(uname -s)"
 arch="$(uname -m)"
 
@@ -163,6 +301,13 @@ case "${os}:${arch}" in
     fail "unsupported architecture: ${arch} on ${os}"
     ;;
 esac
+
+if seed_requested "$1"; then
+  seed_status=0
+  seed_install || seed_status=$?
+  [ -n "${seed_tmp:-}" ] && rm -rf "${seed_tmp}" 2>/dev/null
+  exit "${seed_status}"
+fi
 
 log "checking latest release for ${target_label}"
 latest_effective_url="$(curl -fsSL -o /dev/null -w '%{url_effective}' "${LATEST_URL}")"

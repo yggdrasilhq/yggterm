@@ -111,6 +111,142 @@ jobs:
           path: |
             dist/yggterm-${{ matrix.label }}*
 
+  # ---------------------------------------------------------- ygg4 seed
+  # The GUI-free seed plane is separate from the GUI/deb planes above: it
+  # builds only the native frontend products, runs their version gates on
+  # the native runner, and finishes with a REAL fresh-install smoke (the
+  # packaged ynpm drives seed-activate into a sandboxed HOME). Advertised
+  # seed targets are exactly the matrix legs below — a target is advertised
+  # only when it can run its own product natively here. Cross-compiled
+  # arm64/macos seeds are NOT advertised: a cross binary cannot pass its
+  # own version gate or a fresh-install smoke, and a GUI or deb leg is
+  # never accepted as its proxy.
+  seed:
+    name: Seed package ${{ matrix.label }}
+    runs-on: ${{ matrix.runs_on }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: linux-x86_64
+            runs_on: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - label: windows-x86_64
+            runs_on: windows-2022
+            target: x86_64-pc-windows-msvc
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install system packages
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config protobuf-compiler
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.94.0
+          targets: ${{ matrix.target }}
+
+      - name: Build native seed products
+        shell: bash
+        run: cargo build --release -p ygg-cli -p ynpm --target ${{ matrix.target }}
+
+      - name: Package seed (native version gates run here)
+        shell: bash
+        run: |
+          python3 scripts/package-ygg-seed.py \
+            --binary-dir "target/${{ matrix.target }}/release" \
+            --target "${{ matrix.target }}" \
+            --output dist
+
+      - name: Fresh-install smoke (real seed-activate transaction)
+        shell: bash
+        env:
+          YGGTERM_TEST_HOME: ${{ runner.temp }}/seed-smoke-home
+        run: |
+          mkdir -p "${YGGTERM_TEST_HOME}"
+          SEED_VERSION="$(python3 -c 'import tomllib;print(tomllib.load(open("Cargo.toml","rb"))["workspace"]["package"]["version"])')"
+          export YGGTERM_SEED_DIST="$PWD/dist"
+          export YGGTERM_VERSION="$SEED_VERSION"
+          export YGGTERM_INSTALL_SCRATCH="${YGGTERM_TEST_HOME}/.yggterm/scratchpad/ygg4-install"
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            powershell -NoProfile -ExecutionPolicy Bypass -File scripts/install.ps1 -Seed
+            "$LOCALAPPDATA/ygg/bin/ygg.exe" --version
+            [ -x "$LOCALAPPDATA/ygg/bin/ynpm.exe" ] && [ -x "$LOCALAPPDATA/ygg/bin/ynpx.exe" ]
+          else
+            env HOME="$YGGTERM_TEST_HOME" sh scripts/install.sh seed
+            test "$(readlink "$YGGTERM_TEST_HOME/.local/bin/ygg")" = "$YGGTERM_TEST_HOME/.yggterm/seed/current/bin/ygg"
+            "$YGGTERM_TEST_HOME/.local/bin/ygg" --version
+          fi
+          echo "fresh-install smoke passed for ${{ matrix.label }}"
+
+      - name: Upload seed artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ygg-seed-${{ matrix.label }}
+          path: |
+            dist/ygg-seed-${{ matrix.label }}*
+
+  # The seed publish predicate: EVERY advertised seed target must have
+  # passed native packaging and the fresh-install smoke above. This job
+  # needs `seed` plainly (no always() bypass) and never waits on the GUI
+  # or deb jobs; a GUI failure never blocks the seed, and the seed never
+  # rides a Linux GUI/deb proxy.
+  seed-publish:
+    name: Publish ygg4 seed assets
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs:
+      - seed
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Download seed artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+          pattern: ygg-seed-*
+          merge-multiple: true
+
+      - name: Generate release-manifest.json (real digests only)
+        run: |
+          python3 scripts/generate-release-manifest.py \
+            --dist release-artifacts \
+            --output release-artifacts/release-manifest.json
+          # Publish predicate, restated where it can fail loudly: every
+          # advertised target present, no placeholder digests, seed role
+          # separate from desktop.
+          python3 - <<'EOF'
+          import json, pathlib
+          doc = json.loads(pathlib.Path("release-artifacts/release-manifest.json").read_text())
+          seed = [p for p in doc["packages"] if p["role"] == "seed"]
+          assert len(seed) == 1, "exactly one seed package must be published"
+          platforms = {a["platform"] for a in seed[0]["artifacts"]}
+          expected = {"linux-x64", "windows-x64"}
+          assert platforms == expected, f"advertised seed targets must all publish: {platforms} != {expected}"
+          for package in doc["packages"]:
+              for artifact in package.get("artifacts", []):
+                  digest = artifact["sha256"].lower()
+                  assert len(digest) == 64 and digest.strip("0") , f"placeholder digest on {artifact['filename']}"
+          print("publish predicate satisfied:", sorted(platforms))
+          EOF
+
+      - name: Attach seed assets to the release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release-artifacts/ygg-seed-*
+            release-artifacts/release-manifest.json
+
   package-linux-deb:
     name: Package Linux deb
     runs-on: ubuntu-24.04
@@ -168,6 +304,12 @@ jobs:
     # as long as the Linux deb leg succeeded (a proxy for "the Linux build is good");
     # the download step below only collects artifacts that exist, so missing
     # Windows/macOS artifacts simply aren't attached.
+    #
+    # `seed-publish` is in `needs:` for ATTACH ORDERING only (seed assets land
+    # before the legacy desktop assets; both call the release upsert). The
+    # seed plane never gates the legacy plane: with always() plus the deb
+    # condition below, a seed or GUI failure never suppresses this job, and
+    # this job's assets are never a proxy for the seed's publish predicate.
     if: >-
       always()
       && startsWith(github.ref, 'refs/tags/v')
@@ -176,6 +318,7 @@ jobs:
       - proof-bundles
       - package
       - package-linux-deb
+      - seed-publish
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout
