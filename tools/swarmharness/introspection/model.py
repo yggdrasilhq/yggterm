@@ -10,6 +10,13 @@ import re
 SCHEMA = 1
 QUALITIES = {"verified", "stale", "unavailable", "conflicting", "unknown"}
 SEVERITY = {"debug": 0, "info": 1, "warning": 2, "error": 3, "critical": 4}
+# THE one bounded clock-skew allowance, shared by capture (_coverage),
+# collectors (plane_fresh) and query (assess). A source whose observation
+# time is ahead of the reader by more than this is never certifiable as
+# current; a gate looser elsewhere and stricter here would pass collection
+# and then fail the same frame at query time. The bound is the strict one:
+# a source more than two seconds in the future is conflicting everywhere.
+CLOCK_SKEW_SECONDS = 2
 _SECRET = re.compile(r"(?i)(?:bearer\s+\S+|(?:api[_-]?key|password|access[_-]?token|secret)\s*[:=]\s*[^\s,;]+|\bsk-[A-Za-z0-9_-]{12,})")
 _CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
 
@@ -79,7 +86,7 @@ def assess(row, now):
         ttl = row.get("ttl_seconds")
         if observed is None or not isinstance(ttl, (int, float)) or ttl <= 0:
             row.update(quality="unknown", reason="missing_observation_time_or_ttl")
-        elif observed > now + 2:
+        elif observed > now + CLOCK_SKEW_SECONDS:
             row.update(quality="conflicting", reason="source_clock_ahead")
         elif now - observed > ttl:
             row.update(quality="stale", reason="observation_expired")
@@ -300,9 +307,15 @@ def query(snapshot, path, args, now):
     if host and host != "all":
         rows = [r for r in rows if r.get("host") == host]
     if since is not None or until is not None:
-        # A history filter was evaluated on matching attempts, not on the
-        # work row's later update time (which could be an unrelated edit).
-        if not (family == "dream" and args.get("all") and args.get("state")):
+        if family == "dream" and args.get("all"):
+            # A history filter over --all must judge the work row by its
+            # attempts too: a parent row last touched days ago stays in scope
+            # when a historical attempt inside the window matches. Rows with
+            # no in-window activity at all still drop.
+            rows = [r for r in rows if in_window(r)
+                    or any(in_window(a) for a in data.get("attempts", [])
+                           if a.get("work_id") == r["id"])]
+        else:
             rows = [r for r in rows if in_window(r)]
     sources = [assess(c, now) for c in snapshot["coverage"]
                if (needed is None or c.get("kind") in needed)
