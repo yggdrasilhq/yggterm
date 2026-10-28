@@ -176,3 +176,74 @@ class GenerationIdentity(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class GenerationSurfaces(unittest.TestCase):
+    """Surfaces the native frontend resolves: directory-joining env
+    strategies, the machine version document and the remote-operator door.
+    The native tests in crates/ygg-cli pin the behavior; these pin the
+    contract declarations both front ends share."""
+
+    EXACT_FORMS = ("payload", "internal")
+    PREFIX_FORMS = ("env:", "env_dir:", "home_bin:", "path:", "exe_sibling:", "payload:")
+
+    @classmethod
+    def _is_known_strategy(cls, strategy):
+        if strategy in cls.EXACT_FORMS:
+            return True
+        return any(strategy.startswith(form) for form in cls.PREFIX_FORMS)
+
+    def test_every_resolution_strategy_is_a_known_native_form(self):
+        for name, declared in commands.COMPONENTS.items():
+            for strategy in declared.get("resolution", []):
+                self.assertTrue(
+                    self._is_known_strategy(strategy),
+                    f"component {name} declares unknown strategy {strategy}",
+                )
+                if strategy.startswith("env_dir:"):
+                    # env_dir always names a DIRECTORY var the runner is
+                    # joined into, never an exact-file pointer.
+                    self.assertIn("DIR", strategy, f"{name} env_dir var should name a directory: {strategy}")
+
+    def test_exact_file_overrides_are_distinct_from_env_dir(self):
+        # YGG_MEMORY_BIN stays an exact-file override; the generic payload
+        # components moved to directory joining (parent review item 3).
+        memory = commands.COMPONENTS["memory"]["resolution"]
+        self.assertIn("env:YGG_MEMORY_BIN", memory)
+        self.assertNotIn("env:YGG_BIN_DIR", memory)
+        for name, declared in commands.COMPONENTS.items():
+            self.assertNotIn(
+                "env:YGG_BIN_DIR", declared.get("resolution", []),
+                f"component {name} still treats the payload DIRECTORY as an exact file",
+            )
+
+    def test_version_record_emits_a_json_document_option(self):
+        version = commands.TREE[("version",)]
+        self.assertEqual(version.handler, "version")
+        flags = {f for o in version.options for f in o.flags}
+        self.assertIn("--json", flags)
+
+    def test_remote_record_is_a_passthrough_operator_door(self):
+        remote = commands.TREE[("remote",)]
+        self.assertEqual(remote.handler, "remote")
+        self.assertTrue(remote.passthrough)
+        path, args, rest = commands.parse(["remote", "build-host", "--", "dream", "ls", "--json"])
+        self.assertEqual(path, ("remote",))
+        # argparse REMAINDER keeps the literal delimiter; the native
+        # entrypoint strips it when building the ssh argv. The passthrough
+        # capture itself is the contract: host first, remote words after.
+        self.assertEqual(args.harness_args[0], "build-host")
+        self.assertEqual(args.harness_args[-1], "--json")
+        self.assertIn("dream", args.harness_args)
+        # Pre-delimiter typos: the native frontend rejects them in its
+        # strict option loop (pinned in crates/ygg-cli tests); argparse
+        # REMAINDER captures them verbatim. Here we pin the capture.
+        _, args2, _ = commands.parse(["remote", "build-host", "--json"])
+        self.assertEqual(args2.harness_args, ["build-host", "--json"])
+
+    def test_version_parses_with_and_without_json(self):
+        # The bare `--version` spelling is intercepted by the native
+        # entrypoint before parsing; the IR surface is the version command.
+        for argv in (["version"], ["version", "--json"]):
+            path, args, _ = commands.parse(argv)
+            self.assertEqual(path, ("version",))

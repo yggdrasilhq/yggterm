@@ -753,9 +753,36 @@
       "path": [
         "version"
       ],
-      "summary": "Print the command contract version.",
+      "summary": "Print frontend and command-contract versions.",
       "handler": "version",
-      "options": []
+      "options": [
+        {
+          "$ref": "json"
+        }
+      ],
+      "examples": [
+        {
+          "title": "Emit the machine-readable version document",
+          "command": "ygg version --json",
+          "tags": ""
+        }
+      ]
+    },
+    {
+      "path": [
+        "remote"
+      ],
+      "summary": "Run this generation's ygg on a remote node over SSH (remote-operator door; executes the remote node's installed ygg, no local Python required).",
+      "handler": "remote",
+      "options": [],
+      "passthrough": true,
+      "examples": [
+        {
+          "title": "List dreams on a remote node",
+          "command": "ygg remote build-host -- dream ls",
+          "tags": ""
+        }
+      ]
     },
     {
       "path": [
@@ -1815,7 +1842,7 @@
         "ygg-board.py"
       ],
       "resolution": [
-        "env:YGG_BIN_DIR",
+        "env_dir:YGG_BIN_DIR",
         "payload:ygg-board.py"
       ],
       "interpreter": "python3",
@@ -1829,7 +1856,7 @@
         "ygg-dream-orchestrator.py"
       ],
       "resolution": [
-        "env:YGG_BIN_DIR",
+        "env_dir:YGG_BIN_DIR",
         "payload:ygg-dream-orchestrator.py"
       ],
       "interpreter": "python3",
@@ -1843,7 +1870,7 @@
         "ygg-fleet.py"
       ],
       "resolution": [
-        "env:YGG_BIN_DIR",
+        "env_dir:YGG_BIN_DIR",
         "payload:ygg-fleet.py"
       ],
       "interpreter": "python3",
@@ -1861,7 +1888,7 @@
         "ygg-auth.py"
       ],
       "resolution": [
-        "env:YGG_BIN_DIR",
+        "env_dir:YGG_BIN_DIR",
         "payload:ygg-auth.py"
       ],
       "interpreter": "python3",
@@ -1875,7 +1902,7 @@
         "ygg-ci.py"
       ],
       "resolution": [
-        "env:YGG_BIN_DIR",
+        "env_dir:YGG_BIN_DIR",
         "payload:ygg-ci.py"
       ],
       "interpreter": "python3",
@@ -1889,7 +1916,7 @@
         "ygg-init.sh"
       ],
       "resolution": [
-        "env:YGG_BIN_DIR",
+        "env_dir:YGG_BIN_DIR",
         "payload:ygg-init.sh"
       ],
       "interpreter": "bash",
@@ -1903,7 +1930,7 @@
         "ygg_row.py"
       ],
       "resolution": [
-        "env:YGG_BIN_DIR",
+        "env_dir:YGG_BIN_DIR",
         "payload:ygg_row.py"
       ],
       "interpreter": "python3",
@@ -1917,7 +1944,7 @@
         "ygg_bridge.py"
       ],
       "resolution": [
-        "env:YGG_BIN_DIR",
+        "env_dir:YGG_BIN_DIR",
         "payload:ygg_bridge.py"
       ],
       "interpreter": "python3",
@@ -1939,7 +1966,7 @@
         "ygg-babysit.py"
       ],
       "resolution": [
-        "env:YGG_BIN_DIR",
+        "env_dir:YGG_BIN_DIR",
         "payload"
       ],
       "interpreter": "python3",

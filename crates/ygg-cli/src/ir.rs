@@ -234,16 +234,29 @@ pub fn parse_and_validate(raw: &str) -> Result<Document, LoadError> {
         .iter()
         .filter_map(|r| r.path.first().map(|s| s.as_str()))
         .collect();
-    for name in document.wired_adapters.keys() {
+    for (name, spec) in &document.wired_adapters {
         if !families.contains(name.as_str()) {
             return Err(LoadError::Refused(format!(
                 "wired adapter names an unknown family: {name}"
             )));
         }
+        let adapter = spec.get("adapter").and_then(|v| v.as_str()).unwrap_or("");
+        if adapter.is_empty()
+            || adapter.contains('/')
+            || adapter.contains('\\')
+            || adapter.contains("..")
+        {
+            return Err(LoadError::Refused(format!(
+                "wired adapter for {name} must name a bare adapter filename"
+            )));
+        }
     }
     let mut definitions: std::collections::BTreeSet<Vec<String>> = Default::default();
     for record in &document.commands {
-        if record.path.is_empty() || record.path.iter().any(|p| p.is_empty()) {
+        // The root record is the empty path; only empty SEGMENTS are
+        // invalid. (The Python loader accepts the root the same way; the
+        // previous `path.is_empty()` arm here refused the whole contract.)
+        if record.path.iter().any(|p| p.is_empty()) {
             return Err(LoadError::Refused("invalid/duplicate command path".into()));
         }
         if !definitions.insert(record.path.clone()) {
@@ -454,7 +467,7 @@ pub fn load() -> Result<Loaded, LoadError> {
     finish(EMBEDDED_IR.to_string(), ContractSource::Embedded)
 }
 
-fn finish(raw: String, source: ContractSource) -> Result<Loaded, LoadError> {
+pub(crate) fn finish(raw: String, source: ContractSource) -> Result<Loaded, LoadError> {
     let contract_hash = sha256_hex(raw.as_bytes());
     let document = parse_and_validate(&raw)?;
     let mut definitions: BTreeMap<Vec<String>, &Record> = BTreeMap::new();
@@ -499,6 +512,16 @@ pub fn payload_dir() -> Option<PathBuf> {
         .ok()
         .filter(|h| !h.trim().is_empty())
         .map(|h| Path::new(&h).join(".yggterm/bin/ygg"))
+}
+
+/// The installed generation's declared layout under the payload root:
+/// `commands.json` at the root, components under `components/`, the kernel
+/// under `kernel/`. Declared in docs/ygg4-cli-contract.md; the packager
+/// owns creating these, the resolver only reads them.
+pub fn kernel_dir() -> PathBuf {
+    payload_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("kernel")
 }
 
 #[cfg(test)]
@@ -560,10 +583,16 @@ mod tests {
 
     #[test]
     fn unowned_target_is_refused() {
-        let broken = EMBEDDED_IR.replace(
-            "\"legacy\": [\"ygg-ci.py\"]",
-            "\"legacy\": [\"ygg-panic.py\"]",
-        );
+        // Parse-mutate-reserialize: string replaces are hostage to the
+        // file's formatting (the previous one-line anchors matched nothing,
+        // so the corruption silently never applied).
+        let mut document: serde_json::Value = serde_json::from_str(EMBEDDED_IR).expect("json");
+        for record in document["commands"].as_array_mut().expect("commands").iter_mut() {
+            if record["path"] == serde_json::json!(["ci"]) {
+                record["legacy"] = serde_json::json!(["ygg-panic.py"]);
+            }
+        }
+        let broken = serde_json::to_string(&document).expect("serialize");
         assert!(matches!(
             parse_and_validate(&broken),
             Err(LoadError::Refused(message)) if message.contains("not owned by its component")
@@ -572,10 +601,13 @@ mod tests {
 
     #[test]
     fn unknown_role_is_refused() {
-        let broken = EMBEDDED_IR.replace(
-            "\"path\": [\"daemon\"],",
-            "\"path\": [\"daemon\"],\n    \"role\": \"spooky\",",
-        );
+        let mut document: serde_json::Value = serde_json::from_str(EMBEDDED_IR).expect("json");
+        for record in document["commands"].as_array_mut().expect("commands").iter_mut() {
+            if record["path"] == serde_json::json!(["daemon"]) {
+                record["role"] = serde_json::json!("spooky");
+            }
+        }
+        let broken = serde_json::to_string(&document).expect("serialize");
         assert!(matches!(
             parse_and_validate(&broken),
             Err(LoadError::Refused(message)) if message.contains("unsupported command role")

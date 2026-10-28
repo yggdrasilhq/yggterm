@@ -105,18 +105,39 @@ fn run(mut argv: Vec<String>) -> Result<u32, String> {
 
     match node.record.handler.as_str() {
         "version" => {
-            out("ygg command contract 1 (swarm introspection)");
-            out(&format!(
-                "ygg frontend {} ({}) contract {} sha256 {} source {}",
-                env!("CARGO_PKG_VERSION"),
-                std::env::consts::OS,
-                loaded.document.contract,
-                &loaded.contract_hash[..12.min(loaded.contract_hash.len())],
-                match &loaded.source {
-                    ir::ContractSource::Embedded => "embedded".to_string(),
-                    ir::ContractSource::File(p) => p.display().to_string(),
-                }
-            ));
+            let wants_json = matches!(args.get("json"), Some(ArgValue::Bool(true)));
+            if wants_json {
+                out(&serde_json::to_string_pretty(&serde_json::json!({
+                    "schema_version": 1,
+                    "frontend": {
+                        "name": "ygg",
+                        "version": env!("CARGO_PKG_VERSION"),
+                        "os": std::env::consts::OS,
+                    },
+                    "command_contract": {
+                        "name": loaded.document.contract,
+                        "schema_version": ir::SUPPORTED_SCHEMA,
+                        "sha256": loaded.contract_hash,
+                        "source": contract_source_label(&loaded.source),
+                    },
+                }))
+                .unwrap_or_default());
+            } else {
+                // Frontend version and command-contract identity are separate
+                // facts; neither may masquerade as the other in the human
+                // form either.
+                out(&format!(
+                    "ygg frontend {} ({})",
+                    env!("CARGO_PKG_VERSION"),
+                    std::env::consts::OS
+                ));
+                out(&format!(
+                    "command contract {} sha256 {} source {}",
+                    loaded.document.contract,
+                    &loaded.contract_hash[..12.min(loaded.contract_hash.len())],
+                    contract_source_label(&loaded.source),
+                ));
+            }
             Ok(0)
         }
         "examples" => {
@@ -162,15 +183,35 @@ fn run(mut argv: Vec<String>) -> Result<u32, String> {
                 interpreter,
                 argv,
                 ..
-            } => dispatch::exec(&program, interpreter.as_deref(), &argv),
+            } => dispatch::exec(&program, interpreter.as_deref(), &argv, &[]),
             dispatch::Dispatch::Refused(message) => {
                 eprintln!("{message}");
                 Ok(3)
             }
             _ => unreachable!("legacy dispatch never stages"),
         },
+        "remote" => match dispatch::plan_remote(&rest_of(&argv, &path)) {
+            Ok(dispatch::Dispatch::Exec {
+                program,
+                interpreter,
+                argv,
+                ..
+            }) => dispatch::exec(&program, interpreter.as_deref(), &argv, &[]),
+            Ok(_) => unreachable!("remote dispatch never stages"),
+            Err(message) => {
+                eprintln!("ygg: {message}");
+                Ok(2)
+            }
+        },
         handler if handler == "query" || handler == "open" => {
-            match dispatch::plan_query(&loaded, &path, &args) {
+            match dispatch::plan_query(&loaded, &path, &args, &rest_of(&argv, &path)) {
+                dispatch::Dispatch::Exec {
+                    program,
+                    interpreter,
+                    argv,
+                    env,
+                    ..
+                } => dispatch::exec(&program, interpreter.as_deref(), &argv, &env),
                 dispatch::Dispatch::StagedUnavailable { path, request_json } => {
                     let snapshot = dispatch::staged_snapshot_json(&path, &request_json);
                     let wants_json = matches!(args.get("json"), Some(ArgValue::Bool(true)));
@@ -189,7 +230,6 @@ fn run(mut argv: Vec<String>) -> Result<u32, String> {
                     eprintln!("{message}");
                     Ok(3)
                 }
-                _ => unreachable!("query dispatch never execs"),
             }
         }
         other => {
@@ -204,6 +244,13 @@ fn run(mut argv: Vec<String>) -> Result<u32, String> {
 
 fn rest_of(argv: &[String], path: &[String]) -> Vec<String> {
     argv[path.len()..].to_vec()
+}
+
+fn contract_source_label(source: &ir::ContractSource) -> String {
+    match source {
+        ir::ContractSource::Embedded => "embedded".into(),
+        ir::ContractSource::File(p) => p.display().to_string(),
+    }
 }
 
 fn run_native(loaded: &ir::Loaded, path: &[String], args: &grammar::Args) -> Result<u32, String> {
