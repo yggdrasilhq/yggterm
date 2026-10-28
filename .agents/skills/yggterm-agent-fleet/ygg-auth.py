@@ -112,6 +112,7 @@ import hashlib
 import json
 import os
 import re
+import signal
 import socket
 import stat
 import subprocess
@@ -175,7 +176,9 @@ HARNESSES = {
     "codex": {
         "auth_file": harness_auth_file,
         "login": "device-code (auth.openai.com; the owner completes the browser step)",
-        "live_note": "running codex sessions keep the tokens they loaded at start",
+        "live_note": "switch/rotate/login tear down the codex app-server daemon — it caches auth "
+                     "at startup and every TUI delegates auth to it; a TUI that read auth itself "
+                     "keeps its loaded tokens until restarted",
     },
     "claude": {
         "auth_file": harness_auth_file,
@@ -560,6 +563,95 @@ def _live_fingerprint(path):
     return (st.st_mtime_ns, st.st_size)
 
 
+def _proc_env(pid):
+    try:
+        with open(f"/proc/{pid}/environ", "rb") as fh:
+            raw = fh.read().split(b"\0")
+    except (OSError, ValueError):
+        return None
+    env = {}
+    for chunk in raw:
+        key, sep, value = chunk.partition(b"=")
+        if sep:
+            env[key.decode("utf-8", "replace")] = value.decode("utf-8", "replace")
+    return env
+
+
+def _pid_gone(pid):
+    try:
+        with open(f"/proc/{pid}/stat", "r") as fh:
+            return fh.read().rsplit(")", 1)[1].split()[0] == "Z"
+    except (OSError, IndexError):
+        return True
+
+
+def codex_daemon_pids(home):
+    """PIDs of the codex app-server family bound to `home`.
+
+    codex runs a managed `codex app-server` daemon per CODEX_HOME and every
+    TUI delegates auth to it; the daemon reads auth.json ONCE at startup, so
+    a swapped file never reaches a running daemon (measured on dev,
+    2026-10-28: switch reported success while the TUI kept the old account).
+    Matching is by the process's OWN environment, never by name alone: a
+    process counts when the home codex would resolve FOR IT equals `home` —
+    CODEX_HOME when set, else $HOME/.codex from that process's HOME (never
+    this process's expanduser: a sandboxed switch has a different HOME, and
+    equating the two once matched — and killed — an unrelated live daemon,
+    caught by the teardown screens) — AND its cmdline is the daemon family
+    (`app-server` or `codex-code-mode-host`). TUI processes (`codex resume
+    …`) never match, so a switch cannot kill the owner's live sessions.
+    """
+    pids = []
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        pid = int(entry)
+        if pid == os.getpid():
+            continue
+        env = _proc_env(pid)
+        if env is None:
+            continue
+        if _pid_gone(pid):
+            continue  # a zombie still exposes cmdline/environ but can serve no auth
+        env_home = env.get("CODEX_HOME") or os.path.join(env.get("HOME") or os.path.expanduser("~"), ".codex")
+        if env_home != home:
+            continue
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as fh:
+                argv = fh.read().decode("utf-8", "replace")
+        except OSError:
+            continue
+        if "codex" not in argv:
+            continue
+        if "app-server" in argv or "code-mode-host" in argv:
+            pids.append(pid)
+    return sorted(pids)
+
+
+def stop_codex_daemons(home, grace_seconds=3.0):
+    """Pull the codex app-server family for `home` down: SIGTERM, wait for
+    exit, SIGKILL stragglers. Returns the pids that were running at call
+    time (empty when the home had no daemon)."""
+    pids = codex_daemon_pids(home)
+    if not pids:
+        return []
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            pass
+    deadline = time.time() + grace_seconds
+    while time.time() < deadline and not all(_pid_gone(pid) for pid in pids):
+        time.sleep(0.1)
+    for pid in pids:
+        if not _pid_gone(pid):
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+    return pids
+
+
 def switch(harness, slug, lock_held=False):
     """capture-on-leave, then byte-faithful atomic swap to the named profile.
 
@@ -577,6 +669,20 @@ def switch(harness, slug, lock_held=False):
     live_path = HARNESSES[harness]["auth_file"](harness)
     target_record = read_json(target)
     # (identity calls below are harness-scoped)
+
+    # The app-server daemon caches auth at startup and every TUI delegates
+    # auth to it — swapping under a live daemon leaves every session on the
+    # OLD account while status already reports the new one (dev 2026-10-28,
+    # dream ACK-59bf86a578). Pull it down FIRST so nothing writes or serves
+    # the old tokens across the swap; sweep again after, for a daemon a
+    # client respawned mid-window (it may have read the previous file).
+    daemon_home = os.path.dirname(live_path)
+    daemons_stopped = []
+    if harness == "codex":
+        daemons_stopped = stop_codex_daemons(daemon_home)
+        if daemons_stopped:
+            print(f"⬇  stopped codex app-server daemon(s) {daemons_stopped} — they cache auth "
+                  f"at startup and would keep serving the previous account", file=sys.stderr)
 
     captured = None
     if os.path.exists(live_path):
@@ -602,7 +708,14 @@ def switch(harness, slug, lock_held=False):
     swapped = identity_of(live_record(harness, required=True), harness)
     if swapped["slug"] and swapped["slug"] != slug:
         raise AuthError(5, f"post-switch verification failed: live file reports {swapped['slug']!r}")
-    return {"switched_to": slug, "identity": swapped, "captured_before_leaving": captured}
+    if harness == "codex":
+        respawned = stop_codex_daemons(daemon_home)
+        if respawned:
+            print(f"⬇  stopped respawned codex app-server daemon(s) {respawned} — spawned during "
+                  f"the swap window, may have read the previous auth", file=sys.stderr)
+            daemons_stopped += respawned
+    return {"switched_to": slug, "identity": swapped, "captured_before_leaving": captured,
+            "daemons_stopped": daemons_stopped}
 
 
 def rotate_score(p, measure=True):
@@ -750,7 +863,8 @@ def cmd_switch(args):
                 ident = identity_of(live_rec)
                 writer = get_writer(harness, ident.get("slug") or "")
                 if writer not in (None, "unknown", HOSTNAME):
-                    print(f"⚠️  pre-switch refresh skipped: {ident.get('slug')}'s writer is {writer}",
+                    print(f"⚠️  pre-switch refresh skipped: {ident.get('slug')}'s lineage is owned by "
+                          f"{writer!r} — switching proceeds with the stored copy as-is",
                           file=sys.stderr)
                 else:
                     fresh = refresh_grant(live_rec)
@@ -910,6 +1024,10 @@ def device_login(harness, name=None, notify=True):
 
     with fleet_lock():
         live_path = HARNESSES[harness]["auth_file"](harness)
+        if harness == "codex":
+            # same daemon trap as switch(): the freshly logged-in record must
+            # be what a running app-server daemon serves, not its startup cache
+            stop_codex_daemons(os.path.dirname(live_path))
         captured = None
         if os.path.exists(live_path):
             current = live_record(harness, required=True)
