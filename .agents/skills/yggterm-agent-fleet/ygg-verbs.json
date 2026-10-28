@@ -23,7 +23,8 @@
     "ygg",
     "ygg-dream-orchestrator.py",
     "ygg-fleet.py",
-    "ygg-init.sh"
+    "ygg-init.sh",
+    "ygg-inspect.py"
   ],
   "owner_managed": [
     "ygg-memory",
@@ -88,6 +89,10 @@
     "ygg",
     "ygg-dream-orchestrator.py",
     "ygg-fleet.py",
-    "ygg-init.sh"
+    "ygg-init.sh",
+    "ygg-inspect.py"
+  ],
+  "tier_data": [
+    "ygg_command_tree.py"
   ]
 }

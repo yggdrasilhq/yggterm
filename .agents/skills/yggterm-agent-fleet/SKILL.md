@@ -48,6 +48,17 @@ agents are testing (see §3c).
 
 ---
 
+### Local swarm CLI discovery
+
+`ygg`, `ygg dream`, `ygg service`, `ygg schedule` and `ygg swarm` show local
+next-word help and task examples. `ygg help examples --search "unused quota"`
+finds a complete command without a model or fleet query. `ygg completion bash`
+prints local completion setup. Help never invokes an operational backend.
+Inspection commands without a wired adapter report unknown coverage and
+exit 3; they do not certify an empty or healthy fleet. Existing mutation and
+compatibility tools retain their authority gates. Full contract and current
+availability: `docs/swarm-introspection.md` in the yggterm repository.
+
 ### Optional semantic memory search
 
 `ygg-memory search 'orchard irrigation' --semantic` reranks the same regex

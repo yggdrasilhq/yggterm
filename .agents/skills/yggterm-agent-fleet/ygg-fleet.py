@@ -129,23 +129,39 @@ def cmd_pressure(as_json):
 
 
 def cmd_board_scan(as_json):
-    rc, out, err = run([str(YGGBIN / "ygg-board.py"), "read", "dreams/features", "--json"], 30)
+    rc, out, err = run(["msgboard", "read", "dreams/features"], 30)
     if rc != 0:
         msg = f"board read failed: {(err or out).strip()[:100]}"
-        print(json.dumps({"error": msg}) if as_json else msg)
-        return
-    try:
-        posts = json.loads(out)
-    except Exception:
-        posts = []
-    open_dreams = [p for p in (posts if isinstance(posts, list) else [])
-                   if not any((a.get("kind") == "answer") for a in (p.get("answers") or []))] if isinstance(posts, list) else []
+        print(json.dumps({"error": msg, "quality": "unavailable"}) if as_json else msg)
+        return 3
+    posts, skipped = [], 0
+    for line in out.splitlines():
+        if not line.strip():
+            continue
+        try:
+            p = json.loads(line)
+            if (not isinstance(p, dict) or not isinstance(p.get("ack_token"), str)
+                    or not p.get("ack_token") or not isinstance(p.get("kind"), str)
+                    or not isinstance(p.get("refs", []), list)
+                    or not all(isinstance(ref, str) for ref in p.get("refs", []))):
+                raise ValueError("invalid board record")
+            posts.append(p)
+        except (ValueError, TypeError):
+            skipped += 1
+    answered = {ref for p in posts if p.get("kind") == "answer"
+                for ref in p.get("refs", []) if isinstance(ref, str)}
+    open_dreams = [p for p in posts if p.get("kind") != "answer"
+                   and not p.get("graduated_to") and p.get("ack_token") not in answered]
+    # The source verb warns about skipped malformed records on stderr.
+    # Successfully reading the surviving rows does not make coverage whole.
+    quality = "unknown" if skipped or err.strip() else "verified"
     if as_json:
-        print(json.dumps({"open_dreams": open_dreams, "total": len(posts) if isinstance(posts, list) else 0}, indent=1))
-        return
-    print(f"board scan dreams/features — {len(open_dreams)} open of {len(posts) if isinstance(posts, list) else 0}")
+        print(json.dumps({"open_dreams": open_dreams, "total": len(posts), "quality": quality, "skipped": skipped}, indent=1))
+        return 0 if quality == "verified" else 3
+    print(f"board scan dreams/features — {len(open_dreams)} open of {len(posts)}; coverage {quality}")
     for p in open_dreams[:15]:
-        print(f"  {str(p.get('ack') or p.get('id') or '?')[:16]} {str(p.get('title') or p.get('text') or '')[:90]}")
+        print(f"  {str(p.get('ack_token') or '?')[:18]} {str(p.get('body') or '')[:90]}")
+    return 0 if quality == "verified" else 3
 
 
 def main():
@@ -157,7 +173,7 @@ def main():
     elif verb in ("fleet", "pressure"):
         cmd_pressure(as_json)
     elif verb == "board":
-        cmd_board_scan(as_json)
+        sys.exit(cmd_board_scan(as_json))
     else:
         print("usage: ygg-fleet.py <agents|fleet|board> [--json]")
         sys.exit(2)
