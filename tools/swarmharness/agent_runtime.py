@@ -28,6 +28,7 @@ subprocess, no network, no writes outside the caller's cwd.
 from __future__ import annotations
 
 import json
+import shlex
 import re
 import sys
 
@@ -333,7 +334,7 @@ def selftest() -> int:
     check("spawn carries command", spawn[-2:] == ["--command", "echo hi"], str(spawn))
     check(
         "shell quoting parity",
-        shell_quote_command("it's") == "'" + chr(92) + "'" + "''" + "s'",
+        shlex.split(shell_quote_command("it's")) == ["it's"],
         shell_quote_command("it's"),
     )
     attach = build_attach_argv("wave-1")

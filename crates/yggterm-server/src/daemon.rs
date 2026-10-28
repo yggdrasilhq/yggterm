@@ -4108,6 +4108,9 @@ pub struct TerminalStreamChunk {
 pub enum ServerRequest {
     Ping,
     Status,
+    /// Negotiate worker launch before an older daemon can ignore the
+    /// optional worker field on EnsureShellSession and create a bare row.
+    WorkerCapabilities,
     /// The identity cure verb ([11.75] addendum): move ONE live row's session
     /// id onto the id the owner names. Daemon-side so the in-memory table,
     /// the persistence and the trace move together.
@@ -12591,6 +12594,9 @@ impl DaemonRuntime {
         let response = match request {
             ServerRequest::Ping => ServerResponse::Pong,
             ServerRequest::Status => ServerResponse::Status(self.status()),
+            ServerRequest::WorkerCapabilities => ServerResponse::Ack {
+                message: Some(serde_json::json!({"launch_spec_schema": 1}).to_string()),
+            },
             // ⛔ ANSWERED FROM THE CACHE, AND THAT IS WHAT MAKES THE FAN-OUT
             // SAFE TO WIDEN. This request is served by the very path that
             // proxies it, so a daemon that asks a sibling here would be asking
@@ -20175,6 +20181,7 @@ fn server_request_name(request: &ServerRequest) -> &'static str {
     match request {
         ServerRequest::Ping => "ping",
         ServerRequest::Status => "status",
+        ServerRequest::WorkerCapabilities => "worker_capabilities",
         ServerRequest::WorkingFlags => "working_flags",
         ServerRequest::Snapshot => "snapshot",
         ServerRequest::PrepareUpdateRestart => "prepare_update_restart",

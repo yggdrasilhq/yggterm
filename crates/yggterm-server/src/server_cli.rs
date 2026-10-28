@@ -1148,12 +1148,8 @@ mod screen_verb_tests {
 // ---------------------------------------------------------------------------
 // `server workers` — the ygg4 worker identity plane (lane DAEMON).
 //
-// A pure home-directory verb: it reads and writes
-// `<home>/runtime/workers/*.json` and talks to NOTHING — the same "host fact"
-// shape `relay-boundary` and the census arms have, so it could be served by
-// either binary. Today only the headless binary dispatches it, because the
-// headless door IS the GUI-independent one; adding the GUI binary's dispatch
-// is a one-line follow-up for whoever owns `apps/yggterm/src/main.rs`.
+// Record operations use `<home>/runtime/workers/*.json`. Spawn and attach
+// use the owning daemon's PTY protocol; both clients dispatch these verbs.
 // See `crate::worker_identity` for the contract this verb serves.
 
 /// `--flag value` or `--flag=value`, the ONE argv rule for this verb.
@@ -1208,6 +1204,14 @@ fn workers_spawn_via_daemon(
 ) -> anyhow::Result<()> {
     ensure_local_server_ready_for_cli(store)?;
     let endpoint = cli_server_endpoint(store.home_dir());
+    let capability = crate::expect_ack(crate::send_request(
+        &endpoint, &crate::ServerRequest::WorkerCapabilities,
+    )?)?.context("daemon did not provide worker launch capabilities")?;
+    let capability: serde_json::Value = serde_json::from_str(&capability)
+        .context("daemon worker capabilities are not a valid object")?;
+    if capability.get("launch_spec_schema").and_then(|v| v.as_u64()) != Some(1) {
+        anyhow::bail!("daemon has no compatible worker launch capability; no worker was launched");
+    }
     let session_id = crate::worker_identity::worker_session_id(token)?;
     let response = crate::send_request(
         &endpoint,
@@ -1257,10 +1261,8 @@ fn workers_spawn_via_daemon(
     }
 }
 
-/// Resolve a launch token to its daemon row and re-ensure the SAME session:
-/// the idempotent key means a GUI-absent, SSH-dropped caller reconnects the
-/// original PTY — never a second launch. The record must be daemon-attested:
-/// attaching to a row nobody's daemon owns is not a reattach.
+/// Resolve the recorded token to a currently owned PTY. Reattachment cannot
+/// create a replacement session when its former daemon or PTY is gone.
 fn workers_attach_via_daemon(store: &SessionStore, token: &str, json: bool) -> anyhow::Result<()> {
     let home = store.home_dir().to_path_buf();
     let record = crate::worker_identity::load_record(&home, token)?.ok_or_else(|| {
@@ -1284,37 +1286,21 @@ fn workers_attach_via_daemon(store: &SessionStore, token: &str, json: bool) -> a
         .session_marker
         .clone()
         .ok_or_else(|| anyhow::anyhow!("worker {token:?} has no daemon session marker recorded"))?;
-    ensure_local_server_ready_for_cli(store)?;
-    let endpoint = cli_server_endpoint(store.home_dir());
-    // Re-ensure by the daemon-derived id: same token, same id, same PTY.
-    let session_id = crate::worker_identity::worker_session_id(token)?;
-    let response = crate::send_request(
-        &endpoint,
-        &crate::ServerRequest::EnsureShellSession {
-            session_id,
-            cwd: None,
-            initial_cols: None,
-            initial_rows: None,
-            worker: None,
-        },
-    )?;
-    let key = crate::expect_ack(response)?
-        .with_context(|| format!("daemon acknowledged attach for {token:?} without a key"))?;
+    let endpoint = crate::owning_daemon_endpoint_for_runtime_key(store.home_dir(), &marker)
+        .with_context(|| format!("no live daemon owns the recorded PTY for {token:?}; refusing replacement launch"))?;
     if json {
         println!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
                 "launch_token": record.launch_token,
                 "record_marker": marker,
-                "session_key": key,
+                "session_key": marker,
+                "status": "resolved",
+                "pty_attached": false,
             }))?
         );
     } else {
-        println!(
-            "worker {:?} reattached to row {key} (record marker {marker}); run `server attach {key}` \
-             for the interactive PTY door",
-            record.launch_token
-        );
+        return crate::bridge_remote_runtime_session_stdio(&endpoint, &marker);
     }
     Ok(())
 }
