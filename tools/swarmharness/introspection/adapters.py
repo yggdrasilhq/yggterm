@@ -223,7 +223,8 @@ def _runmeta(audit_rows, now):
 
 _EMPTY_DATASETS = {"dreams": [], "attempts": [], "services": [], "schedules": [],
                    "plans": [], "events": [], "heartbeat": [], "findings": [],
-                   "repairs": [], "workers": [], "summary": []}
+                   "repairs": [], "workers": [], "composer": [], "reviews": [],
+                   "summary": []}
 
 
 def _failclosed_frame(spec, now, root):
@@ -396,6 +397,22 @@ def _capture_standing(spec, now, root, host):
     workers, wst, wdetail = collectors.collect_workers(now)
     datasets["workers"] = workers
 
+    comp, compst, compdetail = collectors.collect_composer(now, limits)
+    datasets["composer"] = comp
+    revs, revst, revdetail = collectors.collect_reviews(now, limits)
+    datasets["reviews"] = revs
+    meml, memst, memdetail = collectors.collect_memory_lock(now, limits)
+    # Failed work keeps its failure explicit: attempts carry the composer
+    # linkage state verbatim (no inferred correlation), and every failed work
+    # row without a linked repair is a named unreviewed-failure finding.
+    failed = [w for w in work if str(w.get("state", "")).startswith("failed")
+              or str(w.get("state")) == "interrupted"]
+    for a in attempts:
+        if any(a["work_id"] == w["id"] for w in failed):
+            a["composer_link"] = ("none-correlated; composer observations are "
+                                  "inventoried separately, correlation is not "
+                                  "inferred from failure text alone")
+
     pressure, pst, pdetail = collectors.collect_pressure(now, DEFAULT_TTLS["heartbeat"])
     datasets["plans"] = [{"id": "plan:" + r["kind"] + ":" + str(r.get("plane", ""))[:60], **r}
                          for r in pressure]
@@ -446,8 +463,34 @@ def _capture_standing(spec, now, root, host):
             events.append(r)
             seen.add(r["id"])
     datasets["events"] = events
+    datasets["events"].extend({
+        "id": "event:memlock:" + r["id"].replace("memlock:", ""),
+        "subsystem": "memory-lock", "severity": "info",
+        "at": r.get("source_observed_at") or now,
+        "summary": "sealed module %s bytes=%s sha16=%s" % (
+            r.get("module"), r.get("bytes"), r.get("sha256_16"))}
+        for r in meml)
 
     findings = _checks(datasets, q, hb, services, dstate, now)
+    for w in failed:
+        linked = [r for r in datasets["repairs"] if r.get("work_id") == w["id"]]
+        reviewed = [r for r in linked if r.get("verification") == "editor-verified"]
+        findings.append({
+            "id": "finding:failure:" + str(w.get("id"))[:70],
+            "scope": "failures",
+            "verdict": "falsified",
+            "detail": ("work %s state=%s: repair rows=%d (editor-verified=%d); "
+                       "review=%s; composer_link=%s"
+                       % (str(w.get("queue_id") or w.get("id"))[:40],
+                          w.get("state"), len(linked), len(reviewed),
+                          w.get("review", "unreviewed"),
+                          (attempts[0].get("composer_link", "unknown")
+                           if attempts else "unknown")))[:220]})
+    if memst not in ("ok",):
+        findings.append({"id": "finding:memory-lock:" + memst, "scope": "memory",
+                         "verdict": "unknown",
+                         "detail": ("composer sealed-kernel lock %s: %s"
+                                    % (memst, str(memdetail)[:140]))})
     datasets["findings"] = findings
     datasets["summary"] = [{"id": "summary:1", "collection_mode": mode,
                             "dreams": len(work),
@@ -456,7 +499,18 @@ def _capture_standing(spec, now, root, host):
                             "workers": len(workers) if workers else 0,
                             "workers_state": wst,
                             "queue_is_not_whole_compute": True,
-                            "services": len(services), "schedules": len(sched),
+                            "services": len(services),
+                            "services_dynamic_instances": len(
+                                [s for s in services
+                                 if re.search(r"@[^.]+\.service$", str(s.get("unit", "")))]),
+                            "composer_observations": len(
+                                [c for c in comp if c.get("row_type") == "observation"]),
+                            "composer_state": compst,
+                            "reviews": len(revs),
+                            "reviews_state": revst,
+                            "memory_lock_modules": len(meml),
+                            "memory_lock_state": memst,
+                            "schedules": len(sched),
                             "events": len(events), "heartbeat_planes": len(hb["planes"]),
                             "active_findings": len([f for f in hb["findings"] if f.get("active")])}]
 
@@ -506,6 +560,28 @@ def _capture_standing(spec, now, root, host):
                   source_observed_at=now,
                   reason=str(cmtdetail)[:120] if cmtst != "ok" else None, host=host,
                   collection_mode=mode),
+        _coverage("composer:" + host, "composer", compst, now,
+                  DEFAULT_TTLS.get("composer", 120),
+                  source_observed_at=max(((c.get("last_at") or 0)
+                                          for c in comp
+                                          if c.get("row_type") == "observation"),
+                                         default=0) or None,
+                  reason=(str(compst) + ": " + str(compdetail)[:110])
+                         if compst != "ok" else None,
+                  host=host, collection_mode=mode),
+        _coverage("reviews:" + host, "reviews", revst, now,
+                  DEFAULT_TTLS.get("reviews", 120),
+                  source_observed_at=max(((r.get("resolution_at") or 0)
+                                          for r in revs), default=0) or None,
+                  reason=str(revdetail)[:120] if revst != "ok" else None,
+                  host=host, collection_mode=mode),
+        _coverage("memory-lock:" + host, "memory_lock", memst, now,
+                  DEFAULT_TTLS.get("memory_lock", 120),
+                  source_observed_at=max(((r.get("source_observed_at") or 0)
+                                          for r in meml), default=0) or None,
+                  reason=(str(memst) + ": " + str(memdetail)[:110])
+                         if memst != "ok" else None,
+                  host=host, collection_mode=mode),
     ]
     frame = model.frame(model.digest({"sources": sorted(c["source"] + ":" + c["kind"] for c in cov),
                                       "limits": limits, "retention": spec["retention"],
@@ -543,6 +619,7 @@ def _capture_configured(spec, now, root, host):
     have_queue = False
     hb = {"planes": [], "findings": [], "as_of": None}
     services = []
+    compst = revst = "unobserved"
     for s in spec["sources"]:
         sid, kind = str(s.get("id", "")), s.get("kind")
         ttl = s.get("ttl_seconds") if isinstance(s.get("ttl_seconds"), int) else DEFAULT_TTLS.get(kind, 120)
@@ -624,6 +701,41 @@ def _capture_configured(spec, now, root, host):
                                           collection_mode=mode))
             else:
                 coverage.append(_coverage(src, kind, "absent", now, ttl, collection_mode=mode))
+        elif kind == "composer":
+            rows_c, cst, cdet = collectors.collect_composer(now, limits, s.get("path"))
+            datasets["composer"].extend(rows_c)
+            coverage.append(_coverage(src, kind, cst, now, ttl,
+                                      source_observed_at=max(
+                                          ((r.get("last_at") or 0) for r in rows_c
+                                           if r.get("row_type") == "observation"),
+                                          default=0) or None,
+                                      reason=str(cdet)[:140] if cst != "ok" else None,
+                                      collection_mode=mode))
+        elif kind == "reviews":
+            rows_r, rst, rdt = collectors.collect_reviews(now, limits, s.get("path"))
+            datasets["reviews"].extend(rows_r)
+            coverage.append(_coverage(src, kind, rst, now, ttl,
+                                      source_observed_at=max(
+                                          ((r.get("resolution_at") or 0) for r in rows_r),
+                                          default=0) or None,
+                                      reason=(str(rst) + ": " + str(rdt)[:120])
+                                             if rst != "ok" else None,
+                                      collection_mode=mode))
+        elif kind == "memory_lock":
+            rows_m, mst, mdt = collectors.collect_memory_lock(now, limits, s.get("path"))
+            datasets["events"].extend({
+                "id": "event:memlock:" + r["id"].replace("memlock:", ""),
+                "subsystem": "memory-lock", "severity": "info",
+                "at": r.get("source_observed_at") or now,
+                "summary": "sealed module %s bytes=%s sha16=%s" % (
+                    r.get("module"), r.get("bytes"), r.get("sha256_16"))}
+                for r in rows_m)
+            coverage.append(_coverage(src, kind, mst, now, ttl,
+                                      source_observed_at=max(
+                                          ((r.get("source_observed_at") or 0) for r in rows_m),
+                                          default=0) or None,
+                                      reason=str(mdt)[:140] if mst != "ok" else None,
+                                      collection_mode=mode))
         else:
             coverage.append(_coverage(src, kind, "unobserved", now, ttl,
                                       reason="collector not implemented for kind %s "
@@ -643,7 +755,17 @@ def _capture_configured(spec, now, root, host):
                             "workers_state": wst,
                             "services": len(datasets["services"]),
                             "schedules": len(datasets["schedules"]),
-                            "events": 0, "heartbeat_planes": len(hb["planes"]),
+                            "events": len(datasets["events"]),
+                            "composer_observations": len(
+                                [c for c in datasets["composer"]
+                                 if c.get("row_type") == "observation"]),
+                            "composer_state": compst,
+                            "reviews": len(datasets["reviews"]),
+                            "reviews_state": revst,
+                            "memory_lock_modules": len(
+                                [r for r in datasets["events"]
+                                 if r.get("subsystem") == "memory-lock"]),
+                            "heartbeat_planes": len(hb["planes"]),
                             "sources_enrolled": len(spec["sources"]),
                             "queue_is_not_whole_compute": True}]
     cov = coverage + [
@@ -806,6 +928,29 @@ def _row_briefs(items, family):
         for r in items:
             print("  %-18.18s %-10.10s %s" % (r.get("scope"), r.get("verdict"),
                                               str(r.get("detail", ""))[:90]))
+    elif family in ("worker", "workers"):
+        for r in items:
+            print("  %-30.30s %-9.9s %-10.10s %-12.12s %s" % (
+                r.get("id"), r.get("row_type") or "worker",
+                r.get("status") or r.get("state") or "?",
+                r.get("origin", ""), str(r.get("note", ""))[:50]))
+    elif family == "composer":
+        for r in items:
+            if r.get("row_type") == "observation":
+                print("  %-52.52s %-9.9s %-18.18s det=%s/%s rep=%s last=%s" % (
+                    r.get("id"), r.get("severity"), r.get("status"),
+                    r.get("detector_id"), r.get("detector_version"),
+                    r.get("repeat_count"), r.get("last_at")))
+            else:
+                print("  %s %s" % (r.get("id"), json.dumps(
+                    {k: v for k, v in r.items()
+                     if k not in ("id", "row_type")}, sort_keys=True)[:150]))
+    elif family == "reviews":
+        for r in items:
+            print("  %-40.40s %-12.12s %-9.9s editor=%-24.24s chain=%s" % (
+                r.get("review_id"), r.get("resolution") or "open",
+                r.get("review_state"), r.get("editor_bound") or "-",
+                r.get("chain_state")))
     elif family == "summary":
         for r in items:
             print("  " + json.dumps({k: v for k, v in r.items() if k != "id"}, sort_keys=True))

@@ -327,7 +327,8 @@ def collect_dreamer_ledgers(now):
             continue
         keep = {k: r.get(k) for k in ("id", "route", "status", "terminal",
                                       "repair_ref", "verdict", "audited_at",
-                                      "model_expected", "model_found")}
+                                      "model_expected", "model_found",
+                                      "review_id")}
         checks = r.get("checks")
         if isinstance(checks, dict):
             keep["checks"] = {k: checks.get(k) for k in sorted(checks) if isinstance(checks.get(k), (bool, type(None)))}
@@ -414,6 +415,7 @@ def collect_services(units, now, limits=None):
         return [], "absent", "no enrolled or standing units"
     out, state = _systemctl(["list-units", "--all", "--no-legend", "--plain", *names], timeout)
     found = []
+    dynamic = []
     if state == "ok" and out is not None:
         for line in out.splitlines():
             cols = line.split()
@@ -421,14 +423,31 @@ def collect_services(units, now, limits=None):
             # fixed offset from the end is safe.
             if cols and re.fullmatch(r"[A-Za-z0-9@_.:-]+\.(?:service|timer|target|socket)", cols[0]):
                 found.append(cols[0])
-    roster = {"expected": names, "observed": found,
-              "expected_not_found": [u for u in names if u not in found]}
-    if not found:
+    # Dynamic instance roster: template units (name@.service) carry a live
+    # population of instantiated units (name@N.service) that a literal
+    # expected-name list can never name. Discover them; never invent an
+    # instance systemd did not report.
+    templates = [u for u in names if u.endswith("@.service")]
+    if templates and state == "ok":
+        pats = [t.replace("@.service", "@*") for t in templates]
+        outi, istate = _systemctl(["list-units", "--all", "--no-legend", "--plain", *pats], timeout)
+        if istate == "ok" and outi is not None:
+            for line in outi.splitlines():
+                cols = line.split()
+                if cols and re.fullmatch(r"[A-Za-z0-9@_.:-]+@[^.]+\.service", cols[0]) \
+                        and cols[0] not in found and cols[0] not in templates:
+                    dynamic.append(cols[0])
+    roster = {"expected": names, "observed": found + dynamic,
+              "expected_not_found": [u for u in names if u not in found and u not in dynamic],
+              "dynamic_instances": dynamic,
+              "dynamic_discovery": "systemd list-units template glob" if templates and state == "ok" else None}
+    if not found and not dynamic:
         detail = dict(roster, note="no matching user units observed for the expected roster")
         return [], ("absent" if state == "ok" else state), detail
     detail = dict(roster)
     props = ["Id,ActiveState,SubState,MainPID,ExecMainStartTimestamp,NRestarts,Description,LoadState"]
-    out2, state2 = _systemctl(["show", *found, "--no-pager", "--property", props[0]], timeout)
+    show_names = found + dynamic
+    out2, state2 = _systemctl(["show", *show_names, "--no-pager", "--property", props[0]], timeout)
     if state2 != "ok":
         return [], state2, "systemctl show unavailable"
     rows = []
@@ -619,8 +638,15 @@ def _ledger_path_dirs():
 def collect_commitments(state_dir=None, now=None):
     """The config commitment ledger (journal + verdicts), via swarm_ledger.
     Predicates (endorsement verification) and revision/authority ride each
-    row; this is the human-readable accountability view."""
+    row; this is the human-readable accountability view. Composer-notes and
+    conditional-plan areas are inventoried the same way when the ledger
+    carries them: a conditional row is PRESENTED with its predicate,
+    deadline, priority, source and authority/timing — the read adapter never
+    executes a conditional plan and never grants it spawn or repair
+    authority. A hardcoded schedule is only claimed where the row itself is
+    programmatic; prose intent stays prose."""
     rows = []
+    extras = {"areas_inventoried": [], "absent_areas": []}
     state = str(state_dir or SWARM_STATE)
     import sys as _sys
     for cand in _ledger_path_dirs():
@@ -643,12 +669,47 @@ def collect_commitments(state_dir=None, now=None):
                      "change_id": rec.get("change_id"),
                      "event_hash": rec.get("event_hash"),
                      "parent_hash": rec.get("parent_hash")})
+    # Composer-notes and conditional-plan areas: inventory whatever journal
+    # areas the local ledger actually holds; an area that does not exist is
+    # absent, never folded into the config area.
+    for area in ("composer-notes", "conditional", "conditional-ledger"):
+        try:
+            recs = sl.journal_records(state, area)
+        except Exception:
+            recs = None
+        if not recs:
+            extras["absent_areas"].append(area)
+            continue
+        extras["areas_inventoried"].append(area)
+        for rec in recs:
+            if not isinstance(rec, dict):
+                continue
+            programmatic = isinstance(rec.get("cron"), str) or \
+                isinstance(rec.get("schedule"), str)
+            rows.append({
+                "id": ("commit:%s:%s" % (area, str(rec.get("change_id")
+                       or rec.get("plan_id") or rec.get("id") or "")[:40])),
+                "area": area, "kind": "conditional-plan" if area.startswith("conditional")
+                                     else "composer-note",
+                "revision": rec.get("revision"),
+                "principal": model.text(rec.get("principal"), 60),
+                "source": model.text(rec.get("source"), 80) or None,
+                "plan_text": model.text(rec.get("plan") or rec.get("note"), 160) or None,
+                "predicate": model.text(rec.get("predicate"), 120) or None,
+                "deadline": model.epoch(rec.get("deadline")),
+                "priority": model.text(rec.get("priority"), 20) or None,
+                "authority": model.text(rec.get("authority_ref")
+                                        or rec.get("authority"), 24) or "none",
+                "timing": model.text(rec.get("timing"), 40) or None,
+                "programmatic": programmatic,
+                "execution": "presentation-only (never executed by the read adapter)"})
     ok, bad = (True, None)
     try:
         ok, bad = sl.verify_ancestry(state)
     except Exception:
         ok = False
-    return rows, ("ok" if ok else "conflicting"), ("" if ok else f"chain broken at {bad}")
+    return rows, ("ok" if ok else "conflicting"), extras if ok else \
+        ("chain broken at %s" % bad)
 
 
 def parse_tasks_ledger(path=None):
@@ -668,6 +729,176 @@ def parse_tasks_ledger(path=None):
 _ROW_KEYS = ("id", "kind", "number", "claim", "harness", "host", "status",
              "state", "pid", "campaign", "role", "updated_at", "claimed_at",
              "released_at", "note")
+
+
+COMPOSER_STATE = _HOME / ".yggterm/swarm/composer"
+REVIEWS_DIR = _HOME / ".yggterm/swarm/reviews"
+MEMORY_LOCK_DIR = _HOME / ".yggterm/swarm/composer/kernel"
+
+# Closed observation fields of a composer OBS row. Anything else in the
+# source row (bodies, notes, provider text) never enters a frame.
+_COMPOSER_OBS_FIELDS = ("at", "dedupe_key", "detector_id", "detector_version",
+                        "fingerprint", "generation", "lineage_id", "severity",
+                        "source_kind", "span", "status")
+
+
+def collect_composer(now, limits=None, state_dir=None):
+    """Composer scan state: sealed OBS observations, read cursors, scanned
+    lineages, outbox presence. Repeated observations of the same dedupe_key
+    collapse into ONE row with a repeat count — a replayed detection is the
+    same vote, never a second confirmation. Cursor sources are fingerprinted
+    (label + digest), never stored as raw filesystem paths."""
+    limits = limits or {}
+    base = Path(state_dir or COMPOSER_STATE).expanduser()
+    obs, ostate, oskip, otrunc = read_jsonl(
+        base / "observations.jsonl", tail=limits.get("max_records"),
+        max_bytes=limits.get("max_bytes"))
+    merged = {}
+    for r in obs:
+        if not isinstance(r, dict):
+            continue
+        key = r.get("dedupe_key") or _fingerprint(r)
+        at = model.epoch(r.get("at"))
+        cur = merged.get(key)
+        if cur is None:
+            row = {"id": "composer-obs:" + str(key)[:40], "row_type": "observation"}
+            row.update({f: r.get(f) for f in _COMPOSER_OBS_FIELDS})
+            row.update(first_at=at, last_at=at, repeat_count=1,
+                       source_observed_at=at)
+            merged[key] = row
+        else:
+            cur["repeat_count"] += 1
+            if at and (cur["last_at"] is None or at > cur["last_at"]):
+                cur.update(last_at=at, source_observed_at=at)
+            if at and (cur["first_at"] is None or at < cur["first_at"]):
+                cur["first_at"] = at
+    rows = sorted(merged.values(), key=lambda r: r.get("last_at") or 0,
+                  reverse=True)
+    cursors, cstate, _ = _state(base / "cursors.json", max_bytes=262144)
+    cursor_rows = []
+    if cstate == "ok" and isinstance(cursors, dict):
+        for k, v in sorted(cursors.items())[:100]:
+            if not isinstance(v, dict):
+                continue
+            cursor_rows.append({
+                "id": "composer-cursor:" + _fingerprint({"source": k})[:24],
+                "row_type": "cursor",
+                "source_ref": _fingerprint({"source": k}),
+                "source_label": model.text(k.rsplit("/", 1)[-1], 60),
+                "cursor": v.get("cursor") if isinstance(v.get("cursor"), int) and v.get("cursor") >= 0 else None,
+                "generation": model.text(v.get("generation"), 60) or None,
+                "lineage_id": model.text(v.get("lineage_id"), 40) or None,
+                "pending_fps": len(v.get("pending_fps") or [])})
+    scanned, sstate, _ = _state(base / "scanned.json", max_bytes=262144)
+    scanned_n = len(scanned) if sstate == "ok" and isinstance(scanned, list) else None
+    outbox = base / "outbox"
+    try:
+        outbox_entries = len([p for p in outbox.iterdir()][:200]) if outbox.is_dir() else None
+        outbox_state = "ok" if outbox_entries is not None else "absent"
+    except OSError:
+        outbox_entries, outbox_state = None, "unreadable"
+    detail = {"state_dir": str(base), "observations_state": ostate,
+              "observations_skipped": oskip, "observations_truncated": otrunc,
+              "cursors_state": cstate, "scanned_state": sstate,
+              "scanned_lineages": scanned_n, "outbox_state": outbox_state,
+              "outbox_entries": outbox_entries}
+    sub = {"observations": ostate, "cursors": cstate, "scanned": sstate,
+           "outbox": outbox_state}
+    if all(v == "absent" for v in sub.values()):
+        # a fully absent composer state is a material unknown about the
+        # composer, never a verified-empty healthy scan
+        overall = "absent"
+    elif any(v in ("invalid", "unreadable") for v in sub.values()):
+        overall = "stale"
+    else:
+        overall = ostate if ostate != "ok" else "ok"
+    rows.extend(cursor_rows)
+    rows.append({"id": "composer-state:1", "row_type": "state", **detail})
+    return rows, overall, detail
+
+
+def collect_reviews(now, limits=None, reviews_dir=None):
+    """One row per sessionReview chain — chain-level truth, never a tally of
+    repeated verdict rows (a cached repeat vote is not evidence). The
+    resolution outcome and editor binding are recorded as claims; HMAC
+    editor-verification is a query-time receipt check (_receipt_state), not
+    something a chain row can assert about itself."""
+    base = Path(reviews_dir or os.environ.get("YGG_INSPECT_REVIEWS",
+                                              str(REVIEWS_DIR))).expanduser()
+    try:
+        entries = sorted(base.glob("*.jsonl"))
+    except OSError:
+        return [], "unreadable", {"reviews_dir": str(base)}
+    if not entries:
+        return [], "absent", {"reviews_dir": str(base)}
+    rows, skipped = [], 0
+    for p in entries[:100]:
+        chain, cstate, _, _ = read_jsonl(p, tail=300, max_bytes=262144)
+        if cstate != "ok":
+            skipped += 1
+            continue
+        kinds = {}
+        for r in chain:
+            k = r.get("kind", "?")
+            kinds[k] = kinds.get(k, 0) + 1
+        res = [r for r in chain if r.get("kind") == "resolution"]
+        verdicts = [r for r in chain if r.get("kind") == "editor_verdict"]
+        snaps = [r for r in chain if r.get("kind") == "snapshot_staged"]
+        opened = chain[0] if chain and isinstance(chain[0], dict) else {}
+        rid = model.text(opened.get("review_id") or p.stem, 80)
+        editor = verdicts[-1].get("editor") if verdicts else None
+        rows.append({"id": "review:" + rid, "review_id": rid,
+                     "reviewer_scope": "inspection-ledger",
+                     "review_state": "unreviewed" if not verdicts else
+                                     "verdict-claimed",
+                     "row_count": len(chain),
+                     "kinds": {k: v for k, v in sorted(kinds.items())},
+                     "resolution": model.text(res[-1].get("outcome"), 24)
+                                   if res else None,
+                     "resolution_at": model.epoch(res[-1].get("at"))
+                                      if res else None,
+                     "editor_bound": model.text(
+                         editor.get("name") if isinstance(editor, dict)
+                         else editor, 60) or None,
+                     "subject_digest": model.text(snaps[-1].get("subject_digest"), 80)
+                                       if snaps else None,
+                     "tier": model.text(opened.get("tier"), 20) or None,
+                     "chain_state": cstate})
+    return rows, ("ok" if rows or not skipped else "invalid"), {
+        "reviews_dir": str(base), "entries": len(entries), "skipped": skipped}
+
+
+def collect_memory_lock(now, limits=None, kernel_dir=None):
+    """The sealed composer kernel the memory scans lock against: per-module
+    presence, size and digest. An absent or empty lock dir is a material
+    unknown, not a healthy zero; byte reads are bounded."""
+    base = Path(kernel_dir or os.environ.get("YGG_MEMORY_LOCK_DIR",
+                                             str(MEMORY_LOCK_DIR))).expanduser()
+    limit = int((limits or {}).get("max_bytes") or DEFAULT_LIMITS["max_bytes"])
+    try:
+        entries = sorted(p for p in base.iterdir()
+                         if p.is_file() and p.suffix in (".py", ".json")
+                         and p.stat().st_size <= limit)
+    except FileNotFoundError:
+        return [], "absent", {"memory_lock_dir": str(base)}
+    except OSError:
+        return [], "unreadable", {"memory_lock_dir": str(base)}
+    rows = []
+    for p in entries[:50]:
+        try:
+            st = p.stat()
+            fp = hashlib.sha256(p.read_bytes()).hexdigest()[:16]
+        except OSError:
+            continue
+        rows.append({"id": "memlock:" + _fingerprint({"module": p.name})[:24],
+                     "row_type": "sealed-module", "module": p.name,
+                     "bytes": st.st_size, "sha256_16": fp,
+                     "mtime": st.st_mtime, "source_observed_at": st.st_mtime})
+    oversized = len([q for q in base.iterdir()
+                     if q.is_file() and q.stat().st_size > limit])
+    return rows, ("ok" if rows else "invalid"), {
+        "memory_lock_dir": str(base), "entries": len(entries),
+        "oversized_skipped": oversized}
 
 
 def collect_workers(now, registry_dir=None):

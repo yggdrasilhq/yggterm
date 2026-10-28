@@ -207,3 +207,61 @@ complete inspection release.
   without a control key; editor-verified repairs therefore cannot occur on
   a keyless reader by design. Receipt-production tooling is the review
   lane's scope.
+
+## Composer lane (round 3) — collectors, workers route, roster, conditional ledger
+
+Implemented this unit (lane/ygg4/composer-inspection, base 479ed06b):
+
+- **Collectors implemented** for the three enrolled-but-unimplemented kinds:
+  `composer` (`~/.yggterm/swarm/composer/`: observations.jsonl, cursors.json,
+  scanned.json, outbox — repeated `dedupe_key` rows collapse to one
+  observation with a repeat count; a replayed detection is never a second
+  vote; cursor sources are fingerprinted, raw paths never enter frames),
+  `reviews` (one row per sessionReview chain; resolution/editor recorded as
+  claims; `editor-verified` remains a query-time HMAC receipt check, never a
+  chain-row assertion), `memory_lock` (sealed composer kernel modules with
+  size+digest; an absent lock dir is an explicit unknown finding, not a
+  healthy zero).
+- **New snapshot datasets** `composer` and `reviews` (model.validate_frame
+  allowed set extended; metadata-only scan applies to them).
+- **Workers query route**: `model.query` now serves family `worker`/
+  `workers` → dataset `workers`. **Native IR contract for the parent:**
+  family `worker`, verbs `ls`/`ps` (ps = all rows today), args `id`,
+  `since`/`until`, `host`, `limit`/`cursor`; datasets `workers` (rows keyed
+  `worker:<row-id>`, origin `manual-owner-worker`, separate from
+  queue-admitted dreams). Inspection refresh contract: re-run capture → new
+  sealed frame; queries are always bound to the exact `snapshot_id` (cursor
+  tamper across snapshots is rejected). Requested host scope: enrolled
+  `host` values other than the serving host record unobserved (not silently
+  widened); standing mode is local-only.
+- **Dynamic executor roster**: template units (`name@.service`) trigger a
+  `systemctl list-units 'name@*'` discovery pass; instantiated units appear
+  as real service rows plus `dynamic_instances` in the roster detail; the
+  template itself stays in `expected_not_found`. No instance is invented
+  that systemd did not report.
+- **Conditional / composer-notes ledger**: `collect_commitments` inventories
+  the ledger's composer-notes and conditional areas. A conditional row is
+  presented with plan text, predicate, deadline, priority, source, authority
+  and timing, plus `programmatic` (true only when the row itself carries a
+  schedule/cron field — prose intent is never misread as a hardcoded
+  schedule) and `execution: presentation-only`. The read adapter never
+  executes a conditional plan and never grants spawn or repair authority.
+- **Retention vs review evidence**: `store.prune` never deletes a snapshot
+  whose ID is cited as `subject_digest` by any sessionReview chain
+  (`protected_by_review` counter reports deferrals); month partitions and
+  raw-day bounds otherwise unchanged. No new auto-repair daemon.
+- **Negative falsifiers added** (ComposerInspectors): repeat-dedupe not a
+  vote; outbox/cursor-source absent = material unknown; stale composer
+  observation demotes coverage; missing sources are unavailable, never
+  healthy-empty; a verdict claim never reads editor-verified without the
+  HMAC receipt; worker route + cursor/query tamper across snapshots; private
+  fields refused in the new datasets; the same sealed frame answers composer
+  and operator alike; dynamic instances discovered-not-invented; conditional
+  ledger presented-never-executed; review-cited snapshots survive pruning.
+  review_id now survives the dreamer audit projection, so the verified-
+  repair HMAC rule is actually reachable from live ledgers.
+
+Out of checkout: collectors/config read only explicit env roots
+(`YGG_INSPECT_STORE`, `YGG_INSPECT_REVIEWS`, `YGG_MEMORY_LOCK_DIR`,
+`YGGTERM_HOME`) — no `~/gh` fallback in this module; `_ledger_path_dirs`
+tolerates repo and `share/ygg/kernel` staged layouts.
