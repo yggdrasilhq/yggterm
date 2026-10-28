@@ -146,3 +146,15 @@ build or a version edit is not a downstream-install proof.
 Existing GUI/plan/pressure defects keep their own acceptance criteria. They
 cannot be closed by this architecture or labelled green when required proof
 or owner acceptance is missing.
+
+## GitHub releases as the optional porcelain distribution source
+
+The CLI seed is the first install. The owner-facing desktop install sentence
+is `ygg ynpm https://github.com/yggdrasilhq/yggterm`. The URL resolves to an
+explicit versioned release package manifest, not an arbitrary repository
+install script. Every artifact declares its platform, architecture, checksum,
+package identity and delivery capability. Desktop publication, rollback and
+removal preserve the seed and daemon-owned sessions. Web and mobile clients
+can share the schema while declaring different delivery mechanisms; support
+is qualified per mechanism and target. Schema support is not artifact or
+installer proof.

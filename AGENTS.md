@@ -22,7 +22,7 @@ When the user clicks an agent session in the cwd tree, yggterm performs the equi
 ```bash
 ssh <machine> "cd <cwd> && codex resume <UUID>"      # or: claude -r <UUID>
 ```
-…and hands off the terminal. The user just types. **This handoff IS the product.**
+…and hands off the terminal. The user just types. This is the GUI handoff path over daemon-owned execution; the system remains operable through `ygg` when the GUI is absent.
 > **Wrapper-vs-manual parity rule:** If `app open <agent-session>` renders differently from `ssh -t <machine> codex resume <UUID>` typed into a clean shell, that is a yggterm bug, NOT a CLI bug. Diagnose in a clean shell first; fix yggterm's wrapper, PTY setup, or preservation path without adding CLI flags that change CLI behavior.
 
 ### First-class vs second-class sessions
@@ -60,12 +60,18 @@ ssh <machine> "cd <cwd> && codex resume <UUID>"      # or: claude -r <UUID>
 
 ## Decentralized Host-Resident Daemon Architecture
 
-Yggterm is a terminal multiplexer that matches tmux's persistence while exceeding it in modern affordances.
+Yggterm owns durable worker execution and coordination independently of its clients. The GUI terminal multiplexer is one client; `ygg` is the primary operator entry point. Existing PTY persistence and attach contracts remain required.
 
-**Nomenclature:**
-- **yggterm** — the GUI desktop client.
-- **yggterm-headless** — the headless client/control interface for agents.
-- **yggterm server** — the host daemon that owns PTYs and keeps sessions alive.
+**System and client terminology:**
+- **yggterm system** — the distributed operating layer: execution, memory,
+  identities, coordination, observation and governed repair.
+- **`ygg`** — the primary human/agent CLI porcelain over that system.
+- **yggterm GUI** — an optional desktop porcelain using the same daemon and
+  coordination contracts.
+- **Existing 3.x compatibility executable names:** `yggterm` launches the GUI,
+  `yggterm-headless` exposes headless control, and `yggterm server` addresses
+  the host daemon that owns PTYs. These executable names remain supported
+  while their canonical `ygg` mappings are implemented and qualified.
 
 **The Model:**
 1. **Server runs on EVERY host:** Local machine AND each SSH host. The server owning a session's PTY runs on the machine where the session lives. Remote sessions are held alive by the remote host's yggterm server.

@@ -67,6 +67,27 @@ configuration must survive migration. The
 [3.x GUI-first guide](https://github.com/yggdrasilhq/yggterm/blob/109b6608b6a924599b7c19e2f67cafeab991ede4/README.md)
 records the preceding install/client interface.
 
+## Install a porcelain from GitHub releases
+
+After installing the `ygg` CLI seed, install the optional yggterm desktop
+porcelain through its GitHub repository URL:
+
+```sh
+ygg ynpm https://github.com/yggdrasilhq/yggterm
+```
+
+This is the **4.0 target interface**, pending the release installer and
+schema qualification. The seed and desktop are separate managed packages;
+installing, upgrading or removing a desktop must preserve the seed, shared
+configuration and running workers. Other GUI, web and mobile porcelains can
+use the same versioned release metadata with explicit platform and delivery
+capabilities. A mobile package is a handoff to its platform installer, not a
+claim of local desktop execution.
+
+Release manifests identify exact versions, artifacts, platforms and checksums.
+An unsupported target, missing checksum or failed artifact validation must
+leave the active generation intact. See the [package contract](docs/ynpm.md).
+
 ## One system, multiple clients
 
 - **System:** host-resident daemons own execution and transport-independent
