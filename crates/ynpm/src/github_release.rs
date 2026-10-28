@@ -855,7 +855,13 @@ fn publish_release_generation(
                 .with_context(|| format!("publishing {}", generation.display()))?;
         }
     } else {
-        std::fs::create_dir_all(paths.generations())?;
+        // The generation lives at generations/<key>/<version>; the per-package
+        // parent is created here, never assumed, or the rename loses to ENOENT.
+        let parent = generation
+            .parent()
+            .context("generation path has no parent")?;
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
         std::fs::rename(&staging, &generation)
             .with_context(|| format!("publishing {}", generation.display()))?;
     }
@@ -1467,11 +1473,14 @@ mod tests {
         archives: &BTreeMap<String, PathBuf>,
         filter: Option<&str>,
     ) -> Result<Vec<ReleaseInstallResult>> {
+        // The simulated release resolves to the tag the manifest itself
+        // declares; a helper pinned to one tag fails every other version.
+        let tag = doc["release"]["tag"].as_str().unwrap_or("v4.0.0");
         let args = ReleaseInstallArgs {
             manifest_doc: doc,
             package_filter: filter,
             destination: None,
-            origin: "github:example/example@v4.0.0".to_string(),
+            origin: format!("github:example/example@{tag}"),
             explicit_tag: false,
             archives,
         };
@@ -1575,7 +1584,12 @@ mod tests {
         let mut archives = BTreeMap::new();
         archives.insert("gui.tar.gz".to_string(), archive);
         let error = run_install(&sandbox, &doc, &archives, None).unwrap_err();
-        assert!(error.to_string().contains("sha256 mismatch"));
+        // The digest gate reports under the per-package context chain; a bare
+        // to_string() hides it.
+        assert!(
+            format!("{error:#}").contains("sha256 mismatch"),
+            "digest refusal lost its context: {error:#}"
+        );
         let state = sandbox.paths().load_state().unwrap();
         assert!(state.packages.is_empty());
         assert!(!sandbox
@@ -1619,8 +1633,9 @@ mod tests {
         let mut archives = BTreeMap::new();
         archives.insert("bad.tar.gz".to_string(), archive);
         let error = run_install(&sandbox, &doc, &archives, None).unwrap_err();
-        assert!(error.to_string().contains("REFUSED"));
-        assert!(error.to_string().contains("9.9.9"));
+        let message = format!("{error:#}");
+        assert!(message.contains("REFUSED"), "version refusal lost context: {message}");
+        assert!(message.contains("9.9.9"));
         assert!(sandbox.paths().load_state().unwrap().packages.is_empty());
     }
 
@@ -1807,7 +1822,7 @@ mod tests {
             &["ygg", "ynpm", "ynpx"],
             None,
         );
-        let doc = manifest_doc(
+        let mut doc = manifest_doc(
             "4.0.0",
             "v4.0.0",
             "ygg-seed",
@@ -1816,17 +1831,24 @@ mod tests {
             &digest,
             serde_json::json!({}),
         );
+        // The seed fixture archive ships ygg/ynpm/ynpx; the artifact declares
+        // the bins the archive actually carries, never a desktop bin.
+        doc["packages"][0]["artifacts"][0]["bins"] =
+            serde_json::json!(["ygg", "ynpm", "ynpx"]);
         let mut archives = BTreeMap::new();
         archives.insert("seed.tar.gz".to_string(), archive);
         // Explicit selection is refused with the owning transaction named:
         // one policy owner, so a desktop `--package` can never stage seed
         // links a later removal would tear out.
         let error = run_install(&sandbox, &doc, &archives, Some("ygg-seed")).unwrap_err();
-        assert!(error.to_string().contains("seed-activate"));
+        assert!(
+            format!("{error:#}").contains("seed-activate"),
+            "seed ownership refusal lost context: {error:#}"
+        );
         // Unattended selection is desktop-only; a seed-only release says
         // where its seed goes instead of silently installing nothing.
         let error = run_install(&sandbox, &doc, &archives, None).unwrap_err();
-        let message = error.to_string();
+        let message = format!("{error:#}");
         assert!(message.contains("ships no installable package"));
         assert!(message.contains("seed-activate"));
         assert!(sandbox.paths().load_state().unwrap().packages.is_empty());
@@ -1870,6 +1892,10 @@ mod tests {
             }),
         );
         doc["packages"][0]["artifacts"][0]["bins"] = serde_json::json!([]);
+        // The top-level directory IS the bundle; declaring it is what keeps
+        // the extraction root un-unwrapped.
+        doc["packages"][0]["artifacts"][0]["bundle"] =
+            serde_json::json!("example-gui-linux");
         let mut archives = BTreeMap::new();
         archives.insert("bundle.tar.gz".to_string(), archive);
         let results = run_install(&sandbox, &doc, &archives, None).unwrap();
@@ -1916,7 +1942,10 @@ mod tests {
         let mut archives = BTreeMap::new();
         archives.insert("probe.tar.gz".to_string(), archive);
         let error = run_install(&sandbox, &doc, &archives, None).unwrap_err();
-        assert!(error.to_string().contains("does not name the release version"));
+        assert!(
+            format!("{error:#}").contains("does not name the release version"),
+            "probe refusal lost context: {error:#}"
+        );
         assert!(sandbox.paths().load_state().unwrap().packages.is_empty());
     }
 
@@ -1930,7 +1959,7 @@ mod tests {
             &["ygg", "ynpm", "ynpx"],
             None,
         );
-        let doc = manifest_doc(
+        let mut doc = manifest_doc(
             "4.0.0",
             "v4.0.0",
             "ygg-seed",
@@ -1939,6 +1968,10 @@ mod tests {
             &digest,
             serde_json::json!({}),
         );
+        // The seed fixture archive ships ygg/ynpm/ynpx; the artifact declares
+        // the bins the archive actually carries, never a desktop bin.
+        doc["packages"][0]["artifacts"][0]["bins"] =
+            serde_json::json!(["ygg", "ynpm", "ynpx"]);
         let manifest_path = sandbox.home.join("manifest.json");
         fs::write(&manifest_path, serde_json::to_string(&doc).unwrap()).unwrap();
         let seed_root = sandbox.home.join("seed");
@@ -2024,7 +2057,7 @@ mod tests {
             &["ygg", "ynpm", "ynpx"],
             None,
         );
-        let doc = manifest_doc(
+        let mut doc = manifest_doc(
             "4.0.0",
             "v4.0.0",
             "ygg-seed",
@@ -2033,6 +2066,10 @@ mod tests {
             &digest,
             serde_json::json!({}),
         );
+        // The seed fixture archive ships ygg/ynpm/ynpx; the artifact declares
+        // the bins the archive actually carries, never a desktop bin.
+        doc["packages"][0]["artifacts"][0]["bins"] =
+            serde_json::json!(["ygg", "ynpm", "ynpx"]);
         let manifest_path = sandbox.home.join("manifest.json");
         fs::write(&manifest_path, serde_json::to_string(&doc).unwrap()).unwrap();
         let seed_root = sandbox.home.join("seed");
@@ -2083,7 +2120,9 @@ mod tests {
             // unzip; the parser cannot be exercised here.
             return;
         }
-        let empty_zip = sandbox_home().join("empty.zip");
+        let zip_dir = sandbox_home();
+        std::fs::create_dir_all(&zip_dir).unwrap();
+        let empty_zip = zip_dir.join("empty.zip");
         std::fs::write(
             &empty_zip,
             [0x50, 0x4b, 0x05, 0x06, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
@@ -2093,7 +2132,7 @@ mod tests {
         assert!(entries.is_empty());
         let guard = guard_archive_entries(&entries).unwrap_err();
         assert!(guard.to_string().contains("no entries"));
-        let garbage = sandbox_home().join("garbage.zip");
+        let garbage = zip_dir.join("garbage.zip");
         std::fs::write(&garbage, b"this is not a zip").unwrap();
         assert!(unzip_listing(&garbage).is_err());
     }
