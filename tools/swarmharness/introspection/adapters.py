@@ -202,13 +202,16 @@ def _binding_failure(rows, claim):
                 "session %s" % (", ".join(sorted(sessions))[:80],
                                 str(claimed_session)[:40]))
     # The approved subject is the one the editor verdict actually authenticated
-    # (its snapshot_digest) — the chain's LAST verdict, the one a COMPLETE
-    # resolution closes over. Any staged snapshot is NOT approval: a chain
+    # — the chain's LAST verdict, the one a COMPLETE resolution closes over.
+    # The binding anchor and the receipt provenance anchor MUST be the same
+    # verdict: an earlier authenticated revise (or an earlier accept
+    # superseded by a later round) is not the acceptance, and a binding that
+    # collects every verdict's digest would verify claims the receipt check
+    # never authenticated. Staging a snapshot is not approving it: a chain
     # that staged subject A then B and received a verdict for B must never
     # verify a claim for the unapproved A just because A appears in history.
     verdicts = [r for r in rows if r.get("kind") == "editor_verdict"]
-    approved = {v.get("snapshot_digest") for v in verdicts
-                if isinstance(v.get("snapshot_digest"), str)}
+    approved = {verdicts[-1]["snapshot_digest"]} if verdicts else set()
     claimed_subject = claim.get("subject_digest")
     if not claimed_subject:
         return ("audit row carries no subject digest; the exact "

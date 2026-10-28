@@ -1153,6 +1153,72 @@ class ObservationFixFalsifiers(unittest.TestCase):
             claim={"session_id": "sess-fix-1", "subject_digest": subjects[1]})
         self.assertEqual(state, "editor-verified", why)
 
+    # --- binding round 2: the binding anchor is the chain's LAST verdict —
+    # an earlier AUTHENTICATED revise must never verify its subject
+    def test_binding_anchors_to_the_last_verdict_not_earlier_ones(self):
+        from swarmharness import session_review as sr
+        rid = "rev-multiverdict"
+        key_path = self.fix / ("control-" + rid + ".key")
+        key_path.write_bytes(b"fixture-control-key\n")
+        subjects = ["a" * 64, "b" * 64]
+        chained = []
+        prev = GENESIS
+
+        def append(body):
+            nonlocal prev
+            row = dict(body, seq=len(chained), prev_hash=prev)
+            row["record_hash"] = sr._sha(sr._canonical(row))
+            chained.append(row)
+            prev = row["record_hash"]
+
+        append({"kind": "review_opened", "review_id": rid, "session": "sess-fix-1",
+                "worker": "fixture-worker", "tier": "full",
+                "at": "2026-10-28T00:00:00Z"})
+        for i, subject in enumerate(subjects):
+            append({"kind": "snapshot_staged", "subject_digest": subject,
+                    "round": i + 1, "completion_claim": {"text": "fixture"},
+                    "at": "2026-10-28T00:0%d:00Z" % (i + 1)})
+        editor = {"name": "fixture-editor"}
+        # verdict 1: an AUTHENTICATED revise of subject A (round 1)
+        payload1 = {"overall": "revise", "findings": [
+            {"id": "Y4-X-001", "criterion": "c-1", "blocking": True,
+             "evidence": "e", "expected": "x", "observed": "y", "probe": "p"}]}
+        receipt1 = sr.editor_receipt(rid, chained[0], chained[1], editor,
+                                     payload1, key=key_path.read_bytes().strip(),
+                                     review_head=prev)
+        append({"kind": "editor_verdict", "snapshot_digest": subjects[0],
+                "editor": dict(editor, invocation_receipt=receipt1),
+                "overall": "revise", "signed_payload": payload1,
+                "verification_head": prev, "approval_scope": None,
+                "findings": payload1["findings"], "at": "2026-10-28T00:05:00Z"})
+        # verdict 2: an AUTHENTICATED accept of subject B (round 2) — the
+        # verdict the terminal COMPLETE resolution closes over
+        payload2 = {"overall": "COMPLETE", "findings": []}
+        receipt2 = sr.editor_receipt(rid, chained[0], chained[2], editor,
+                                     payload2, key=key_path.read_bytes().strip(),
+                                     review_head=prev)
+        append({"kind": "editor_verdict", "snapshot_digest": subjects[1],
+                "editor": dict(editor, invocation_receipt=receipt2),
+                "overall": "COMPLETE", "signed_payload": payload2,
+                "verification_head": prev, "approval_scope": "full",
+                "findings": [], "at": "2026-10-28T00:09:00Z"})
+        append({"kind": "resolution", "outcome": "COMPLETE",
+                "at": "2026-10-28T00:10:00Z"})
+        path = self.fix / "reviews" / (rid + ".jsonl")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("\n".join(json.dumps(r, sort_keys=True)
+                                  for r in chained) + "\n")
+        state, why = adapters._receipt_state(
+            rid, self.fix / "reviews", key_path=key_path,
+            claim={"session_id": "sess-fix-1", "subject_digest": subjects[0]})
+        self.assertEqual(state, "unverified",
+                         "the revised-then-superseded subject A verified")
+        self.assertIn("approved subject digest", why)
+        state, why = adapters._receipt_state(
+            rid, self.fix / "reviews", key_path=key_path,
+            claim={"session_id": "sess-fix-1", "subject_digest": subjects[1]})
+        self.assertEqual(state, "editor-verified", why)
+
     def test_repairs_never_verify_from_unrelated_complete_review(self):
         key_path = self._bound_chain("rev-unrel", "sess-x", "d" * 64)
         d = self.fix / "dreamer"
