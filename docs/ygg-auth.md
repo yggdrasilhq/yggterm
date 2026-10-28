@@ -14,11 +14,12 @@ provided. Keep this directory out of memory synchronization and git.
 `harnesses --json` reports the registered adapter inventory and capabilities.
 The current adapters are Codex, Claude, ZCode and AutoClaw. This inventory
 does not imply coverage of every CLI. All four support capture, local switch,
-rotation and the policy-gated fallback primitive. Device login, OAuth refresh
-and Codex quota measurement are supported only by the Codex adapter. Claude
-OAuth uses a different protocol; the helper does not send Claude grants to
-Codex endpoints. Plan records are switched in their native formats. Host
-keyring records are not collected or migrated.
+rotation, the policy-gated fallback primitive and the preflight exec gate
+described below. Device login, OAuth refresh and Codex quota measurement are
+supported only by the Codex adapter. Claude OAuth uses a different protocol;
+the helper does not send Claude grants to Codex endpoints. Plan records are
+switched in their native formats. Host keyring records are not collected or
+migrated.
 
 Both harness argument positions work:
 
@@ -149,13 +150,63 @@ collect every harness credential format, or complete the system-wide auth
 goal. Consumer integration and native-effect evidence remain release criteria
 for the parent worker. An auth activation is not worker completion.
 
+## Preflight exec and the native launch primitive
+
+`exec` is the pre-launch consumer: prove the bound grant, then hand the
+terminal to the native CLI. It never repairs or reloads a running process.
+
+```sh
+# bounded read: activation receipt, no spawn, no mutation, no network
+ygg auth exec --harness codex --preflight-only --json
+
+# launch: preflight, then replace this process with the native argv
+ygg auth exec --harness codex -- codex exec --skip-git-repo-check - | cat
+
+# adapter-observed typed failure: ONE policy-authorized fallback, CAS-bound
+ygg auth exec --harness codex --typed-failure rate_limited \
+  --event-id example-event --observed-active-hash DIGEST -- codex
+```
+
+The preflight gate fails closed before any native process starts. The live
+record must be usable, digest-bound to a vault profile (an unproven grant is
+refused, not guessed), and free of recorded auth failures. Expiry alone is
+not proof of a dead grant: an expired but refreshable Codex grant takes
+exactly ONE canonical refresh under the single-writer lineage law — a
+foreign writer's grant is held, never copied or refreshed here. Adapters
+without a refresher refuse with `reauthorization_required` and never touch
+Codex endpoints. `--measure` is the receipt's only optional network touch
+(one usage read, Codex only); without it the meter reports `unknown`, never
+free. The ready receipt binds harness, provider, the proven record digest
+and the meter, and reports `native_health: unknown`,
+`actual_effect: unknown` and `session_action:
+child_native_auth_proof_required` — a cache activation is not native health.
+
+The launch itself is an `exec`-family replacement at the same pid: the child
+inherits the activated native cache, and its args, signals and exit code are
+the native CLI's own (including nonzero exits and argv containing spaces or
+special characters). A concurrent rewrite of the native auth file between
+verification and launch aborts with `concurrent_change` instead of spawning
+against unverified auth. There is no restart and no replay: a nonzero child
+exit is observed once, never retried — a new launch is a fresh parent
+decision, and a new fallback needs a new typed observation with a fresh
+event id and the digest it was bound to. With `--json`, one receipt line is
+written to stderr before the replacement; without flags the launch is
+transparent. Free-form stderr is never classified by this helper.
+
+Exit codes: `0` ready or the child's own code, `2` no eligible fallback
+target, `3` no live auth file, `5` an unproven grant, health failure,
+foreign-writer hold, refresh rejection or concurrent change, `6` invalid
+usage, malformed policy, flags mismatch, or a native binary that could not
+start.
+
 ## Offline verification
 
-Run both focused suites with bytecode disabled and disk-backed scratch:
+Run the focused suites with bytecode disabled and disk-backed scratch:
 
 ```sh
 PYTHONDONTWRITEBYTECODE=1 python3 .agents/skills/yggterm-agent-fleet/tests/test_ygg_auth_policy.py
 PYTHONDONTWRITEBYTECODE=1 python3 .agents/skills/yggterm-agent-fleet/tests/test_ygg_auth_rotation.py
+PYTHONDONTWRITEBYTECODE=1 python3 .agents/skills/yggterm-agent-fleet/tests/test_ygg_auth_exec.py
 ```
 
 The policy suite redirects every auth path to isolated fixtures and stubs
