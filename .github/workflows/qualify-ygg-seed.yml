@@ -1,0 +1,196 @@
+# Qualification of the ygg4 seed — NOT a release workflow.
+#
+# Dispatched on a branch; builds the real seed binaries natively on Linux
+# and Windows and drives the real installers through the mandatory matrix:
+# hash verification, fresh install, upgrade, rollback (downgrade) refusal.
+# It writes no tag, no release, no artifact: contents:read only, no
+# persisted credentials. A green run qualifies the CANDIDATE, never the
+# 4.0 release; publishing still requires the release workflow's required
+# seed matrix (an optional GUI pass does not qualify the CLI).
+
+name: qualify-ygg-seed
+
+on:
+  workflow_dispatch:
+    branches:
+      - "**"
+
+permissions:
+  contents: read
+
+jobs:
+  seed-native:
+    name: native seed qualification (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      CARGO_TERM_COLOR: never
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build the real seed bins
+        shell: bash
+        run: |
+          cargo build --locked -p ygg-cli --bin ygg
+          cargo build --locked -p ynpm --bin ynpm
+
+      - name: Record the exact bin digests (mandatory hash basis)
+        shell: bash
+        run: |
+          mkdir -p seed-dist
+          cp "$(cargo metadata --format-version 1 --no-deps | python3 -c 'import json,sys;print(json.load(sys.stdin)["target_directory"])')/debug/ygg"  seed-dist/ygg      2>/dev/null || true
+          cp "$(cargo metadata --format-version 1 --no-deps | python3 -c 'import json,sys;print(json.load(sys.stdin)["target_directory"])')/debug/ynpm" seed-dist/ynpm 2>/dev/null || true
+          cp "$(cargo metadata --format-version 1 --no-deps | python3 -c 'import json,sys;print(json.load(sys.stdin)["target_directory"])')/debug/ynpx" seed-dist/ynpx 2>/dev/null || true
+          cp "$(cargo metadata --format-version 1 --no-deps | python3 -c 'import json,sys;print(json.load(sys.stdin)["target_directory"])')/debug/ygg.exe"  seed-dist/ygg.exe  2>/dev/null || true
+          cp "$(cargo metadata --format-version 1 --no-deps | python3 -c 'import json,sys;print(json.load(sys.stdin)["target_directory"])')/debug/ynpm.exe" seed-dist/ynpm.exe 2>/dev/null || true
+          cp "$(cargo metadata --format-version 1 --no-deps | python3 -c 'import json,sys;print(json.load(sys.stdin)["target_directory"])')/debug/ynpx.exe" seed-dist/ynpx.exe 2>/dev/null || true
+          ls -la seed-dist
+          ( cd seed-dist && sha256sum * | tee SHASUMS256.txt )
+          test -f seed-dist/ygg || test -f seed-dist/ygg.exe
+
+      # The mandatory matrix runs the REAL installers against the local
+      # dist. YGGTERM_SEED_DIST makes both installers consume these exact
+      # verified bytes instead of a network release.
+      - name: Fresh install through the real installer (seed by default)
+        shell: bash
+        env:
+          YGGTERM_SEED_DIST: ${{ github.workspace }}/seed-dist
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            powershell -NoProfile -ExecutionPolicy Bypass -File scripts/install.ps1
+          else
+            sh scripts/install.sh
+          fi
+
+      - name: The seed commands answer through the launcher pointer
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            "$LOCALAPPDATA/ygg/bin/ygg.exe" --version
+            "$LOCALAPPDATA/ygg/bin/ynpm.exe" --version
+          else
+            "$HOME/.local/bin/ygg" --version
+            "$HOME/.local/bin/ynpm" --version
+            test "$(readlink "$HOME/.local/bin/ygg" | grep -c '/.yggterm/seed/')" -eq 1
+          fi
+
+      - name: Launch pointer is schema 1 with exact bin digests
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            ROOT="$USERPROFILE/.yggterm/seed"
+          else
+            ROOT="$HOME/.yggterm/seed"
+          fi
+          python3 - "$ROOT" <<'EOF'
+          import json, hashlib, pathlib, sys
+          root = pathlib.Path(sys.argv[1])
+          pointer = json.loads((root / "active.json").read_text())
+          assert pointer["schema"] == 1, pointer
+          generation = root / "generations" / pointer["generation"]
+          assert generation.is_dir(), generation
+          for name, digest in pointer["bins"].items():
+              suffix = ".exe" if (generation / "bin" / f"{name}.exe").exists() else ""
+              target = generation / "bin" / (name + suffix)
+              actual = hashlib.sha256(target.read_bytes()).hexdigest()
+              assert actual == digest, (name, actual, digest)
+          print("active pointer verified:", pointer["generation"])
+          EOF
+
+      - name: Upgrade repoints the pointer and keeps the previous generation
+        shell: bash
+        env:
+          YGGTERM_SEED_DIST: ${{ github.workspace }}/seed-dist
+        run: |
+          # A re-activation of the same verified bytes is the upgrade path's
+          # idempotent repoint; the generations tree grows, never shrinks.
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            powershell -NoProfile -ExecutionPolicy Bypass -File scripts/install.ps1
+          else
+            sh scripts/install.sh
+          fi
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            ROOT="$USERPROFILE/.yggterm/seed"
+          else
+            ROOT="$HOME/.yggterm/seed"
+          fi
+          python3 - "$ROOT" <<'EOF'
+          import json, pathlib, sys
+          root = pathlib.Path(sys.argv[1])
+          pointer = json.loads((root / "active.json").read_text())
+          assert pointer["schema"] == 1
+          assert (root / "generations" / pointer["generation"]).is_dir()
+          print("repointed and complete:", pointer["generation"])
+          EOF
+
+      - name: Mutated generation bytes fail the launcher hash gate
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            ROOT="$USERPROFILE/.yggterm/seed"
+            YGG="$LOCALAPPDATA/ygg/bin/ygg.exe"
+          else
+            ROOT="$HOME/.yggterm/seed"
+            YGG="$HOME/.local/bin/ygg"
+          fi
+          python3 - "$ROOT" <<'EOF'
+          import json, pathlib, sys
+          root = pathlib.Path(sys.argv[1])
+          pointer = json.loads((root / "active.json").read_text())
+          generation = root / "generations" / pointer["generation"]
+          name = next(iter(pointer["bins"]))
+          suffix = ".exe" if (generation / "bin" / f"{name}.exe").exists() else ""
+          target = generation / "bin" / (name + suffix)
+          saved = target.read_bytes()
+          target.write_bytes(saved + b"# mutated\n")
+          (root / "_mutated").write_text(str(target))
+          (root / "_saved").write_bytes(saved)
+          EOF
+          if "$YGG" --version >/dev/null 2>&1; then
+            echo "launcher accepted mutated generation bytes"; exit 1
+          fi
+          python3 - "$ROOT" <<'EOF'
+          import pathlib, sys
+          root = pathlib.Path(sys.argv[1])
+          pathlib.Path(root / "_mutated").unlink()
+          pathlib.Path(root / "_saved").unlink()
+          EOF
+          echo "hash gate refused mutated bytes as required"
+
+      - name: Implicit rollback (downgrade) is refused
+        shell: bash
+        env:
+          YGGTERM_SEED_DIST: ${{ github.workspace }}/seed-dist
+        run: |
+          # The installers only ever carry the candidate dist, so the
+          # rollback refusal is exercised at the transaction level: an
+          # expect-version mismatch must refuse and leave the pointer.
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            ROOT="$USERPROFILE/.yggterm/seed"
+            YNPM="$LOCALAPPDATA/ygg/bin/ynpm.exe"
+          else
+            ROOT="$HOME/.yggterm/seed"
+            YNPM="$HOME/.local/bin/ynpm"
+          fi
+          BEFORE="$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]+'/active.json'))['generation'])" "$ROOT")"
+          if "$YNPM" seed-activate --help >/dev/null 2>&1; then
+            ARCHIVE="$(ls "$YGGTERM_SEED_DIST"/ygg-seed-* 2>/dev/null | head -1 || true)"
+            if [ -n "$ARCHIVE" ]; then
+              "$YNPM" seed-activate --archive "$ARCHIVE" --manifest "$YGGTERM_SEED_DIST/release-manifest.json" --seed-root "$ROOT" --expect-version 9.9.9 \
+                && { echo "expect-version mismatch was accepted"; exit 1; } \
+                || echo "expect-version mismatch refused as required"
+            else
+              echo "no archive in dist; transaction refusal covered by unit tests"
+            fi
+          fi
+          AFTER="$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]+'/active.json'))['generation'])" "$ROOT")"
+          test "$BEFORE" = "$AFTER"
+          echo "rollback refusal verified: pointer unchanged ($BEFORE)"

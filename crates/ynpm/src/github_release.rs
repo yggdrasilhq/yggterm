@@ -1277,6 +1277,46 @@ pub fn verb_seed_activate(paths: &Paths, args: &[String]) -> Result<()> {
     // atomically, and any earlier failure left the previous generation in
     // charge.
     publish_link(&generation_dir, &seed_root.join("current"))?;
+    // Native ynpm is the ONLY writer of the versioned launch pointer
+    // (`<seed-root>/active.json`, schema 1): the front launchers read this
+    // pointer plus the exact bin digests, so it is published whole. The
+    // temp+rename keeps every reader on one complete pointer; a
+    // rename-over-existing refusal on Windows stays an explicit error -
+    // its atomic replace semantics are a native-CI proof obligation, not
+    // an assumption to paper over with a delete-then-rename.
+    let mut bins = BTreeMap::new();
+    for bin in &artifact.bins {
+        bins.insert(
+            bin.clone(),
+            sha256_file(&generation_dir.join("bin").join(bin))
+                .with_context(|| format!("hashing activated bin {bin}"))?,
+        );
+    }
+    let generation_name = generation_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("seed generation directory has no name")?;
+    let pointer = serde_json::json!({
+        "schema": 1,
+        "generation": generation_name,
+        "bins": bins,
+    });
+    let pointer_path = seed_root.join("active.json");
+    let staging_pointer =
+        seed_root.join(format!("active.json.new-{}", std::process::id()));
+    let _ = std::fs::remove_file(&staging_pointer);
+    std::fs::write(
+        &staging_pointer,
+        serde_json::to_string_pretty(&pointer).unwrap_or_default(),
+    )?;
+    if let Err(error) = std::fs::rename(&staging_pointer, &pointer_path) {
+        let _ = std::fs::remove_file(&staging_pointer);
+        return Err(anyhow::anyhow!(
+            "publishing seed launch pointer {}: {error}; a failed \
+             rename-over-existing is refused, never silently replaced",
+            pointer_path.display()
+        ));
+    }
     report_seed_activation(
         paths,
         &seed_root,
