@@ -210,3 +210,14 @@ it never degrades to a silent no-op that reports success.
    it does not make the global lock fair or bound arbitrary changed-file I/O.
    Falsifier: `tests/test_native_watermark_io.py` in the fleet skill counts
    reads/writes and checks edit durability and recovery after a later failure.
+   Causal version lookups share one namespace journal snapshot per locked
+   adapter pass (or per tree when invoked without an adapter-wide snapshot),
+   keyed by file and digest in physical journal order. Device, inode, size,
+   mtime and ctime invalidate it on append, rewrite or replacement. A scan
+   overlapping a journal change uses the ordinary lookup and does not cache
+   the raced snapshot. Subsequent lookups recheck the journal identity.
+   Foreground namespace gates wait up to 60 seconds for the global lock,
+   matching bulk sync's bounded wait; the helper's ten-second default is
+   shorter than a full native pass even after these optimizations. Expiry
+   still fails. A subprocess falsifier holds the lock beyond ten seconds and
+   verifies that the foreground gate waits and actually synchronizes.

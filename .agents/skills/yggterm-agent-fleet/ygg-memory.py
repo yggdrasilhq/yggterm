@@ -251,6 +251,40 @@ def _safe_native_relative(raw: str) -> Path | None:
     return relative
 
 
+def _native_version_lookup(root: Path, namespace: str):
+    """One tree's version map, refreshed whenever journal identity changes.
+
+    Preserve last-physical-occurrence semantics without opening/refreshing the
+    journal index per document. Never cache a scan that overlapped a writer.
+    """
+    cached_token = object()
+    versions = {}
+
+    def token():
+        try:
+            st = get_journal_path(root).stat()
+            return st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns
+        except FileNotFoundError:
+            return None
+
+    def lookup(filename, digest):
+        nonlocal cached_token, versions
+        if not digest:
+            return None
+        before = token()
+        if before != cached_token:
+            records = read_journal_entries(root, namespace=namespace)
+            after = token()
+            if before != after:
+                return version_for_digest(root, namespace, filename, digest)
+            versions = {(r.get("file"), r.get("digest")): r.get("version_id")
+                        for r in records}
+            cached_token = after
+        return versions.get((filename, digest))
+
+    return lookup
+
+
 def _native_document_path(content: str) -> Path | None:
     match = re.search(r"^native_path:[ \t]*(.+)$", content, re.MULTILINE)
     return _safe_native_relative(match.group(1).strip()) if match else None
@@ -314,6 +348,7 @@ def _sync_native_document(
     native_path: str | None = None,
     state_scope: str | None = None,
     _watermark: dict | None = None,
+    _version_lookup=None,
 ) -> tuple[int, int, int]:
     """Three-way synchronize one sanctioned native Markdown document.
 
@@ -329,6 +364,7 @@ def _sync_native_document(
     entire harness checkpoint for every document. Changed document state is
     still saved before returning; unchanged state does not rewrite it.
     """
+    lookup_version = _version_lookup or (lambda name, digest: version_for_digest(root, namespace, name, digest))
     hub = get_namespace_dir(root, namespace) / filename
     local_exists = path.is_file()
     raw_local = path.read_text(encoding="utf-8") if local_exists else ""
@@ -426,7 +462,7 @@ def _sync_native_document(
         local_changed = (local_digest != base_digest) if semantic_local_exists else True
         hub_changed = (hub_digest != base_digest) if hub_exists else True
         if local_changed and not hub_changed:
-            publish_local(base_version or version_for_digest(root, namespace, filename, file_sha256(hub) if hub_exists else None))
+            publish_local(base_version or lookup_version(filename, file_sha256(hub) if hub_exists else None))
         elif local_changed and hub_changed and local_digest != hub_digest:
             # Both descend from the delivered base. The event graph retains two
             # heads and materialize_store makes the conflict observable.
@@ -470,7 +506,7 @@ def _sync_native_document(
     else:
         state["delivered_payload_digest"] = final_digest
         state["delivered_hub_digest"] = file_sha256(hub)
-        state["delivered_version"] = version_for_digest(root, namespace, filename, state["delivered_hub_digest"])
+        state["delivered_version"] = lookup_version(filename, state["delivered_hub_digest"])
     if new_state or removed_legacy or state != previous_state:
         save_watermark(root, watermark)
     return ingested, delivered, deleted
@@ -512,6 +548,7 @@ def _sync_native_tree(
     *,
     target_harness: str,
     exclude=None,
+    _version_lookup=None,
 ) -> tuple[int, int, int]:
     """Mirror semantic Markdown files while leaving indexes/state outside it."""
     exclude = exclude or (lambda _relative: False)
@@ -534,6 +571,7 @@ def _sync_native_tree(
     # Callers hold the global sync lock for this pass. Never retain this
     # snapshot across passes: another writer may update the checkpoint then.
     watermark = load_watermark(root, harness)
+    lookup_version = _version_lookup or _native_version_lookup(root, namespace)
     for relative in sorted(set(local) | set(hub)):
         safe_relative = _safe_native_relative(relative)
         if safe_relative is None:
@@ -555,6 +593,7 @@ def _sync_native_tree(
             native_path=relative,
             state_scope=str(directory),
             _watermark=watermark,
+            _version_lookup=lookup_version,
         )
         ingested += inc
         delivered += outc
@@ -1104,7 +1143,7 @@ class ZcodeMemoryAdapter(HarnessMemoryAdapter):
         ) != archive_rendered:
             archive_index.write_text(archive_rendered, encoding="utf-8")
 
-    def _project(self, root: Path, harness: str, memory_dir: Path) -> tuple:
+    def _project(self, root: Path, harness: str, memory_dir: Path, *, _version_lookup=None) -> tuple:
         ns_dir = get_namespace_dir(root, GLOBAL_NAMESPACE)
         target = memory_dir / "pinned" / "yggterm"
         target.mkdir(parents=True, exist_ok=True)
@@ -1136,6 +1175,7 @@ class ZcodeMemoryAdapter(HarnessMemoryAdapter):
             exclude=lambda relative: relative.name in ("MEMORY.md", "ARCHIVE-INDEX.md")
             or "archive" in relative.parts
             or relative.parts[:2] == ("pinned", "yggterm"),
+            _version_lookup=_version_lookup,
         )
         self._rebuild_index(memory_dir)
         return ingested, delivered + outc, deleted + delc
@@ -1143,8 +1183,9 @@ class ZcodeMemoryAdapter(HarnessMemoryAdapter):
     def sync_namespace(self, root: Path, harness: str, namespace: str) -> tuple:
         # The zcode store is global; a per-cwd namespace has no native home here.
         ingested = delivered = deleted = 0
+        lookup_version = _native_version_lookup(root, GLOBAL_NAMESPACE)
         for memory_dir in self.memory_dirs():
-            i, o, d = self._project(root, harness, memory_dir)
+            i, o, d = self._project(root, harness, memory_dir, _version_lookup=lookup_version)
             ingested += i
             delivered += o
             deleted += d
@@ -1154,8 +1195,9 @@ class ZcodeMemoryAdapter(HarnessMemoryAdapter):
     def sync_all(self, root: Path, harness: str) -> tuple:
         memory_dirs = self.memory_dirs()
         ingested = delivered = deleted = 0
+        lookup_version = _native_version_lookup(root, GLOBAL_NAMESPACE)
         for memory_dir in memory_dirs:
-            i, o, d = self._project(root, harness, memory_dir)
+            i, o, d = self._project(root, harness, memory_dir, _version_lookup=lookup_version)
             ingested += i
             delivered += o
             deleted += d
@@ -3060,7 +3102,10 @@ def _sync_harness_namespace(
 ) -> dict:
     """Synchronize one native area and return its convergence report."""
     adapter = get_harness_adapter(harness)
-    lock = _flock_open(root / ".ygg-memory.lock")
+    # An optimized all-native pass can still outlast the 10s helper default.
+    # Match the bulk writer's bounded wait instead of failing healthy gates
+    # mid-pass; expiration remains a failure, never a freshness exemption.
+    lock = _flock_open(root / ".ygg-memory.lock", timeout_seconds=60)
     try:
         migrate_legacy_store(root)
         if local_dir:
