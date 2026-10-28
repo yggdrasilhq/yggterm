@@ -66,6 +66,7 @@ mod clipboard_sweep;
 #[cfg(unix)]
 mod socket_sweep;
 mod managed_cli;
+mod managed_auth;
 #[allow(deprecated)]
 mod codex_cli {
     pub use crate::managed_cli::*;
@@ -39408,6 +39409,21 @@ pub(crate) fn configured_extra_args_for_kind(kind: SessionKind) -> String {
         Some(ref settings) => yggterm_core::agent_cli_effective_extra_args(settings, kind),
         None => yggterm_core::agent_cli_effective_extra_args(&yggterm_core::AppSettings::default(), kind),
     }
+}
+
+/// One named top-level STRING settings field, or None when the store cannot be
+/// read or the key is absent. The managed-auth gate reads its mode and script
+/// through here so the composition path carries one settings answer, and a
+/// store failure reads as "not configured" rather than enforcement.
+pub(crate) fn settings_string_field(key: &str) -> Option<String> {
+    let settings = SessionStore::open_or_init()
+        .and_then(|store| store.load_settings())
+        .ok()?;
+    serde_json::to_value(&settings)
+        .ok()?
+        .get(key)
+        .and_then(|value| value.as_str())
+        .map(ToOwned::to_owned)
 }
 
 fn legacy_codex_extra_args() -> String {

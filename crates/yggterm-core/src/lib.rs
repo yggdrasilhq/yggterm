@@ -597,6 +597,19 @@ pub struct AppSettings {
     /// whole point.
     #[serde(default)]
     pub agent_cli_install_wanted_remote: BTreeMap<String, BTreeMap<String, bool>>,
+    /// The managed-auth launch gate: "off" (the default — launch composition is
+    /// byte-identical to the pre-auth law), "observe" (the preflight receipt is
+    /// traced, the launch is untouched), or "enforce" (the launch is refused
+    /// unless the ygg-auth preflight says ready). Read ONLY by the daemon's
+    /// managed-auth wiring; an unknown value degrades to "off" at the point of
+    /// use, so a typo can never turn enforcement on.
+    #[serde(default)]
+    pub managed_auth_mode: String,
+    /// Explicit path to ygg-auth.py for the managed-auth seam. Empty ⇒ the
+    /// dispersed canonical location. A configured-but-missing path is a refusal
+    /// under enforce, never a fallback guess.
+    #[serde(default)]
+    pub managed_auth_script: String,
     pub default_agent_profile: AgentSessionProfile,
     pub in_app_notifications: bool,
     pub system_notifications: bool,
@@ -670,6 +683,8 @@ impl Default for AppSettings {
             agent_cli_install_consent: String::new(),
             agent_cli_install_wanted: BTreeMap::new(),
             agent_cli_install_wanted_remote: BTreeMap::new(),
+            managed_auth_mode: String::from("off"),
+            managed_auth_script: String::new(),
             default_agent_profile: AgentSessionProfile::Codex,
             in_app_notifications: true,
             system_notifications: false,
@@ -1440,6 +1455,14 @@ fn parse_settings_value(value: &Value) -> Result<AppSettings> {
         settings.default_agent_profile = serde_json::from_value(value.clone())
             .context("failed to parse default_agent_profile")?;
     }
+    if let Some(value) = object.get("managed_auth_mode") {
+        settings.managed_auth_mode = serde_json::from_value(value.clone())
+            .context("failed to parse managed_auth_mode")?;
+    }
+    if let Some(value) = object.get("managed_auth_script") {
+        settings.managed_auth_script = serde_json::from_value(value.clone())
+            .context("failed to parse managed_auth_script")?;
+    }
     if let Some(value) = object.get("in_app_notifications") {
         settings.in_app_notifications = serde_json::from_value(value.clone())
             .context("failed to parse in_app_notifications")?;
@@ -1576,6 +1599,8 @@ fn serialize_settings_value(settings: &AppSettings) -> Value {
         "agent_cli_install_consent": settings.agent_cli_install_consent,
         "agent_cli_install_wanted": settings.agent_cli_install_wanted,
         "agent_cli_install_wanted_remote": settings.agent_cli_install_wanted_remote,
+        "managed_auth_mode": settings.managed_auth_mode,
+        "managed_auth_script": settings.managed_auth_script,
         "litellm_endpoint": settings.litellm_endpoint,
         "litellm_api_key": settings.litellm_api_key,
         "interface_llm_model": settings.interface_llm_model,
@@ -5136,6 +5161,39 @@ mod tests {
                 .and_then(|map| map.get("qwen-code")),
             Some(&false)
         );
+    }
+
+    // ⛔ FALSIFIER for the serializer-omission class: `serialize_settings_value`
+    // is an EXPLICIT key list, so a settings field added to the struct and the
+    // parser but not to this key list survives in memory and silently
+    // disappears on the first settings save. The managed-auth fields shipped
+    // with this test because the omission was caught by reading the
+    // serializer, not by a green suite — this lock makes the next omission
+    // red instead.
+    #[test]
+    fn settings_round_trip_the_managed_auth_gate_fields() {
+        let mut original = AppSettings::default();
+        original.managed_auth_mode = "enforce".to_string();
+        original.managed_auth_script = "/opt/auth/ygg-auth.py".to_string();
+
+        let json = serialize_settings_value(&original);
+        assert_eq!(
+            json.get("managed_auth_mode").and_then(|value| value.as_str()),
+            Some("enforce"),
+            "the mode must survive a save — an omitted key would silently reset the gate to off"
+        );
+        assert_eq!(
+            json.get("managed_auth_script").and_then(|value| value.as_str()),
+            Some("/opt/auth/ygg-auth.py")
+        );
+        let round_tripped = parse_settings_value(&json).expect("parse settings");
+        assert_eq!(round_tripped, original);
+
+        // A settings file from a build WITHOUT these keys parses to Off/empty.
+        let legacy = serde_json::json!({"theme_mode": "dark"});
+        let parsed = parse_settings_value(&legacy).expect("legacy settings parse");
+        assert_eq!(parsed.managed_auth_mode, "off");
+        assert_eq!(parsed.managed_auth_script, "");
     }
 
     #[test]

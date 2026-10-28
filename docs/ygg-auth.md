@@ -199,6 +199,37 @@ foreign-writer hold, refresh rejection or concurrent change, `6` invalid
 usage, malformed policy, flags mismatch, or a native binary that could not
 start.
 
+## Daemon launch wiring (`managed_auth`)
+
+The daemon's managed-CLI composer (`crates/yggterm-server/src/managed_auth.rs`)
+wires this seam for codex, codex-litellm, claude and zcode launches. The gate
+lives in two settings keys and defaults to OFF: `managed_auth_mode`
+(`off` | `observe` | `enforce`) and `managed_auth_script` (explicit
+ygg-auth.py path; empty ⇒ the dispersed `~/.yggterm/bin/ygg/ygg-auth.py`).
+
+- **off (default):** launch composition is byte-identical to the pre-auth
+  law. A host that never configures the gate launches exactly as before.
+- **observe:** the bounded preflight (`--preflight-only --json`, no
+  `--measure`) runs before launch and ONE `auth_preflight` trace event
+  records the receipt's outcome (ready/blocked/unavailable, digest-grade
+  facts only). The launch itself is untouched.
+- **enforce:** the preflight must say `ready`. A ready launch composes
+  through the seam (`exec python3 <script> exec --harness <H> --json --
+  <invocation>`, same-pid replacement, receipt one line on stderr).
+  Anything else composes a VISIBLE refusal line — the reason on stderr,
+  exit 86 — and launches nothing.
+
+⛔ The refusal is a composed shell line, not a composer error, on purpose:
+the composer's error channel is the layout-resolution fallback, and every
+call site degrades an error to the legacy unauthenticated command. An error
+refusal would therefore downgrade to exactly the launch enforce exists to
+prevent. A CLI with no auth plane (pi, opencode, qwen, kimi, muse,
+antigravity, grok, devin, mimo) is never gated in any mode. A configured
+script path that does not exist is a refusal under enforce and
+`unavailable` under observe — never a guessed fallback script. The daemon
+never activates a policy, refreshes a grant, or mutates a live account:
+this wiring is a launch gate over the seam's own verbs, nothing more.
+
 ## Offline verification
 
 Run the focused suites with bytecode disabled and disk-backed scratch:

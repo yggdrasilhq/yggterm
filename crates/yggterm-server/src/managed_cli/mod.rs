@@ -6306,7 +6306,7 @@ pub(crate) fn managed_cli_shell_command_configured_with_identity(
     // and adding it here was a wrong-headed guess. The real wrapper-vs-manual
     // divergence lives in yggterm's PTY/preservation path, not in CLI flags.
     let descriptor = yggterm_core::agent_cli::agent_cli_descriptor(kind);
-    let (invocation, shape) = match action {
+    let (mut invocation, shape) = match action {
         ManagedCliAction::Launch => (
             format!("{}{}", tool.binary_name(), extra_args),
             CliInvocationShape {
@@ -6417,6 +6417,36 @@ pub(crate) fn managed_cli_shell_command_configured_with_identity(
             }
         }
     };
+    // Managed-auth launch wiring (see `managed_auth`): the mode gate lives in
+    // the settings store and defaults to Off, so an unconfigured host composes
+    // byte-identically to the pre-wiring law. Observe runs the bounded
+    // preflight, traces ONE receipt event, and launches untouched; Enforce
+    // composes a VISIBLE refusal line (reason on stderr, exit 86) or wraps
+    // the invocation in the exec seam — never an Err, which the legacy
+    // fallback would downgrade to an unauthenticated launch. A CLI with no
+    // auth plane is never gated, in any mode.
+    let auth_mode = crate::managed_auth::configured_mode();
+    if auth_mode != crate::managed_auth::ManagedAuthMode::Off
+        && let Some(harness) = crate::managed_auth::auth_harness_for(tool)
+    {
+        let script = crate::managed_auth::configured_script();
+        let probe = match script.as_deref() {
+            Some(script) => crate::managed_auth::run_preflight(script, harness),
+            None => crate::managed_auth::PreflightProbe::Unavailable(
+                "ygg-auth.py script unavailable".to_string(),
+            ),
+        };
+        crate::managed_auth::emit_preflight_event(kind, auth_mode, &probe);
+        match crate::managed_auth::plan_launch(auth_mode, tool, Some(&probe), script.as_deref()) {
+            crate::managed_auth::AuthLaunchPlan::PassThrough => {}
+            crate::managed_auth::AuthLaunchPlan::Wrap { script, harness } => {
+                invocation = crate::managed_auth::wrap_invocation(&script, harness, &invocation);
+            }
+            crate::managed_auth::AuthLaunchPlan::Refuse { reason } => {
+                invocation = crate::managed_auth::refusal_invocation(&reason);
+            }
+        }
+    }
     // ⭐ THE ONE COMPOSER, SO NO PER-CLI ARM CAN COMPOSE UNSEEN. This is where
     // "codex got `resume <id>`, Claude Code got `--resume <id>`, this one got
     // no selector at all" becomes a readable fact instead of something you
