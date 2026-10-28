@@ -890,3 +890,58 @@ def enrollment_report(paths, state=DEFAULT_STATE):
             unclassified.append(p)
         rows.append({"path": p, "tier": (r or {}).get("tier"), "area": (r or {}).get("area")})
     return {"ok": not unclassified, "rows": rows, "unclassified": unclassified}
+
+
+# ------------------------------------------------------- commitment ledger
+
+def commitments(state=DEFAULT_STATE, area="config"):
+    """Human-readable commitment ledger: every committed config change with
+    its PREDICATE (authority class, endorsement scheme, parent hash, chain
+    position) and revision/authority. Decisions and the ancestry check are
+    joined per change; unknown is kept unknown (a missing decision is a
+    row field, never a synthesized verdict). Read-only."""
+    decisions = {}
+    for d in _decisions_all(state, area):
+        decisions[d.get("change_id")] = d  # last decision per change wins
+    ok, bad_index = verify_ancestry(state, area)
+    rows = []
+    for rec in journal_records(state, area):
+        cid = rec.get("change_id")
+        dec = decisions.get(cid) or {}
+        rows.append({
+            "change_id": cid,
+            "revision": rec.get("revision"),
+            "authority_epoch": rec.get("authority_epoch"),
+            "principal": rec.get("principal"),
+            "authority": rec.get("authority_ref") or "none",
+            "predicate": ("owner-endorsed (hmac-sha256 verified)"
+                          if rec.get("authority_ref") == "hmac-sha256"
+                          else "agent-proposed under admission policy"),
+            "canonical_hash": rec.get("canonical_hash"),
+            "parent_hash": rec.get("parent_hash"),
+            "event_hash": rec.get("event_hash"),
+            "previous_event_hash": rec.get("previous_event_hash"),
+            "decision": dec.get("decision") or "unknown",
+            "decided_at": dec.get("at"),
+            "chain_verified": ok,
+            "chain_break_index": bad_index,
+        })
+    return rows, ok, bad_index
+
+
+def render_commitments(rows, ok, bad_index):
+    """Deterministic text rendering of the commitment ledger (one line per
+    revision, newest last; chain status in the header)."""
+    lines = ["config commitment ledger — chain %s%s" % (
+        "verified" if ok else "BROKEN at record %s" % bad_index if bad_index is not None else "unverified",
+        " (%d commitments)" % len(rows))]
+    for r in rows:
+        lines.append(
+            "r%-4s epoch=%-3s %-6s %-28.28s %s<-%s" % (
+                r.get("revision"), r.get("authority_epoch"),
+                r.get("principal") or "?", str(r.get("change_id"))[:28],
+                str(r.get("canonical_hash") or "")[:12],
+                str(r.get("parent_hash") or "")[:12]))
+        lines.append("      predicate: %s; decision: %s" % (
+            r.get("predicate"), r.get("decision")))
+    return "\n".join(lines)

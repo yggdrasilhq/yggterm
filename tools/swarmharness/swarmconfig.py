@@ -691,7 +691,10 @@ def _validate_introspection(f, cfg):
         _keys(f, path, source, {"kind", "host", "path", "enabled", "ttl_seconds", "privacy",
                               "units", "queue_source_ref", "note"},
               {"kind", "host", "enabled", "ttl_seconds", "privacy"})
-        if source.get("kind") not in kinds or source.get("host") not in hosts:
+        # Set/dict membership on an unhashable kind/ref raised TypeError and
+        # crashed whole-config validation; type-check before membership.
+        kind = source.get("kind")
+        if not isinstance(kind, str) or kind not in kinds or source.get("host") not in hosts:
             _fault(f, "inspection_schema", path + ": unknown kind or host")
         if type(source.get("enabled")) is not bool:
             _fault(f, "inspection_schema", path + ".enabled must be boolean")
@@ -701,7 +704,7 @@ def _validate_introspection(f, cfg):
         if source.get("privacy") != "inspection-metadata-v1":
             _fault(f, "inspection_schema", path + ": unsupported metadata privacy contract")
         source_path = source.get("path")
-        if source.get("kind") != "services":
+        if kind != "services":
             if not isinstance(source_path, str) or not source_path or any(c in source_path for c in "\x00\n\r"):
                 _fault(f, "inspection_schema", path + ".path required")
             elif any(part.lower() in {".ssh", ".gnupg", "auth", "credentials", "vault", "vaults"}
@@ -711,7 +714,8 @@ def _validate_introspection(f, cfg):
                 not isinstance(unit, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9@_.:-]*\.(?:service|timer)", unit)
                 for unit in source["units"])):
             _fault(f, "inspection_schema", path + ": invalid service units")
-        if source.get("queue_source_ref") is not None and source["queue_source_ref"] not in sources:
+        qref = source.get("queue_source_ref")
+        if qref is not None and (not isinstance(qref, str) or qref not in sources):
             _fault(f, "inspection_schema", path + ": unknown queue_source_ref")
     for section, fields in {
         "limits": {"read_timeout_seconds": (1, 30), "total_timeout_seconds": (1, 60),
