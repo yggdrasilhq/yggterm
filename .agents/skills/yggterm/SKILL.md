@@ -16,6 +16,12 @@ Run `ygg` or the relevant noun group for local next-word help and examples.
 `ygg help examples --search "unused quota"` searches tasks without a model or
 fleet probe. Do not preload the whole skill registry or every door below.
 
+On an installed seed, `ygg docs` lists its bundled documents. For example,
+`ygg docs yggterm-4-system.md` opens the versioned system contract without a
+source checkout. Repository links below are source navigation; installed
+readers use the corresponding bundled document when available. Documentation
+describes contracts and limits, not the current health of a node.
+
 Before recall or handover, synchronize the task's explicit area:
 
 ```text
@@ -40,6 +46,7 @@ blocked gate; they cannot declare recall fresh by bypassing it.
 | New host / seed / node readiness | `ygg init`, `ygg doctor`; [onboarding](../yggterm-onboarding/SKILL.md) |
 | Memory/provenance/conflicts | `ygg memory ...`; [memory contract](../../../docs/spec-unified-fleet-memory.md) |
 | Package/generation ownership | `ygg ynpm ...`; [package contract](../../../docs/ynpm.md) |
+| Auth vault and account rotation | `ygg auth status --harness all --json`, `ygg auth rotate --harness codex --fast --json`; inspect eligibility and policy before inferring native recovery |
 | Daemon, hierarchy, supervised execution, relay | `ygg daemon`, `ygg agent`, `ygg work`, `ygg relay`; [system contract](../../../docs/yggterm-4-system.md) |
 | Dreams, services, schedules, pressure, events, checks | `ygg dream`, `ygg service`, `ygg schedule`, `ygg swarm`; [inspection](../../../docs/swarm-introspection.md) |
 | Integration build / landing | `ygg ci ...`; [CI contract](../../../docs/spec-ygg-ci.md) |

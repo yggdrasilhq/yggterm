@@ -1076,9 +1076,10 @@ def dream_open(work_id, args, root=None):
         print("attempt   %s  state %s  evidence %s" % (a["id"], a.get("state"), a.get("evidence_state")))
     if session:
         print("session   %s" % session)
-        print("human jump (exact session): yggterm headless attach --session %s   # or: ssh <host> '<cli> resume %s'" % (session, session))
         print(JUMP_UNAVAILABLE)
-        return {"work_id": w["id"], "session_id": session}, 0
+        return {"work_id": w["id"], "session_id": session,
+                "jump": "unavailable",
+                "error": "native identity observed; a verified harness attach adapter is still required"}, 3
     print("session   unknown (no native session metadata is enrolled for inspection yet; "
           "the run-metadata bridge is daemon-lane scope)")
     print(JUMP_UNAVAILABLE)
