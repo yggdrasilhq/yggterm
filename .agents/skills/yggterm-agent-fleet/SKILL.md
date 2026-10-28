@@ -369,6 +369,14 @@ on you choosing to look.
 
 ### ⛔⛔ THE CONTEXT RITUAL — you GROSSLY underestimate your own context; VERIFY before you relay
 
+Codex readings require the exact session's native rollout input counter and
+recorded context window. Cached input is already included; cumulative usage
+and a model-name window guess are not context. `--cli codex --session <id>
+--report --json` publishes record offsets/hashes and refuses missing,
+ambiguous or mismatched sources with unknown/exit 3. A native-counter match
+does not claim a footer cross-check or execution liveness; those remain
+separate evidence.
+
 **Owner-directed 2026-08-20, after the opposite failure of the one above: the gauge hook
 divided a Fable session's 186k tokens by a 200k window it did not have — the true window was
 1M and `/context` said 19% — and the session relayed TWICE off the false wall, spinning
