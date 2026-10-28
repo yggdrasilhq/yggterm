@@ -551,7 +551,7 @@ mod tests {
     #[test]
     fn remote_host_validation_rejects_option_like_hosts() {
         assert!(validate_remote_host("build-host").is_ok());
-        assert!(validate_remote_host("user@10.0.0.7").is_ok());
+        assert!(validate_remote_host("user@lab-node.example.test").is_ok());
         assert!(validate_remote_host("-oProxyCommand=evil").is_err());
         assert!(validate_remote_host("host with space").is_err());
         assert!(validate_remote_host("").is_err());
