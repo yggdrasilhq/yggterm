@@ -1,10 +1,125 @@
 param(
   [string]$Repo = $(if ($env:YGGTERM_REPO) { $env:YGGTERM_REPO } else { "yggdrasilhq/yggterm" }),
-  [string]$InstallRoot = $(if ($env:YGGTERM_INSTALL_ROOT) { $env:YGGTERM_INSTALL_ROOT } else { Join-Path $env:LOCALAPPDATA "Yggterm" })
+  [string]$InstallRoot = $(if ($env:YGGTERM_INSTALL_ROOT) { $env:YGGTERM_INSTALL_ROOT } else { Join-Path $env:LOCALAPPDATA "Yggterm" }),
+  [switch]$Seed
 )
 
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
+
+# ------------------------------------------------------------- ygg4 seed path
+# The GUI-free seed install is selected EXPLICITLY (-Seed or YGGTERM_SEED=1).
+# The default flow below stays the 3.x direct/GUI installer. The seed path
+# never touches the direct/GUI install root, never starts a daemon, needs
+# no Python and no GUI, and delegates the staging/publication transaction
+# to `ynpm seed-activate` extracted from the verified archive itself.
+if ($Seed -or $env:YGGTERM_SEED -eq "1") {
+  $seedRoot = if ($env:YGGTERM_SEED_ROOT) { $env:YGGTERM_SEED_ROOT } else { Join-Path $env:USERPROFILE ".yggterm\seed" }
+  $seedDist = $env:YGGTERM_SEED_DIST
+  $scratchRoot = if ($env:YGGTERM_INSTALL_SCRATCH) { $env:YGGTERM_INSTALL_SCRATCH } else { Join-Path $env:USERPROFILE ".yggterm\scratchpad\ygg4-install" }
+  New-Item -ItemType Directory -Path $scratchRoot -Force | Out-Null
+  $tempDir = Join-Path $scratchRoot ("seed-" + [guid]::NewGuid().ToString("N"))
+  New-Item -ItemType Directory -Path $tempDir -Force | Out-Null
+
+  $arch = if ($env:PROCESSOR_ARCHITECTURE -match "ARM64") { "aarch64" } else { "x86_64" }
+  $targetLabel = if ($arch -eq "aarch64") { "windows-aarch64" } else { "windows-x86_64" }
+  $archiveName = "ygg-seed-$targetLabel.zip"
+
+  try {
+    $version = $env:YGGTERM_VERSION
+    if (-not $version) {
+      $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases/latest" -Headers @{ "User-Agent" = "yggterm-installer" }
+      $version = $release.tag_name.TrimStart("v")
+    }
+    $version = $version.TrimStart("v")
+    if (-not $version) { throw "could not resolve the seed version to install" }
+    $tag = "v$version"
+
+    $archivePath = Join-Path $tempDir $archiveName
+    $checksumPath = "$archivePath.sha256"
+    $manifestPath = Join-Path $tempDir "release-manifest.json"
+    if ($seedDist) {
+      $archiveSource = Join-Path $seedDist $archiveName
+      if (-not (Test-Path $archiveSource)) { throw "local seed dist has no $archiveName" }
+      Copy-Item $archiveSource $archivePath
+      $checksumSource = "$archiveSource.sha256"
+      if (-not (Test-Path $checksumSource)) { throw "local seed dist has no $archiveName.sha256" }
+      Copy-Item $checksumSource $checksumPath
+      $manifestSource = Join-Path $seedDist "release-manifest.json"
+      if (-not (Test-Path $manifestSource)) { throw "local seed dist has no release-manifest.json" }
+      Copy-Item $manifestSource $manifestPath
+    } else {
+      $baseUrl = "https://github.com/$Repo/releases/download/$tag"
+      Write-Host "downloading ygg4 seed $version for $targetLabel"
+      Invoke-WebRequest -Uri "$baseUrl/$archiveName" -OutFile $archivePath
+      # Checksum verification is mandatory: an unverifiable archive fails.
+      try {
+        Invoke-WebRequest -Uri "$baseUrl/$archiveName.sha256" -OutFile $checksumPath
+      } catch {
+        throw "no checksum published for $archiveName; refusing an unverifiable download"
+      }
+      Invoke-WebRequest -Uri "$baseUrl/release-manifest.json" -OutFile $manifestPath
+    }
+    $expected = (Get-Content $checksumPath).Split(" ")[0].Trim().ToLowerInvariant()
+    if ($expected -notmatch "^[0-9a-f]{64}$") { throw "published checksum for $archiveName is not a sha256 digest" }
+    $actual = (Get-FileHash -Algorithm SHA256 $archivePath).Hash.ToLowerInvariant()
+    if ($expected -ne $actual) { throw "seed checksum verification failed for $archiveName" }
+
+    # Extract only the transaction owner; seed-activate re-extracts and
+    # verifies the archive itself, staged before publication.
+    $bootstrapDir = Join-Path $tempDir "bootstrap"
+    Expand-Archive -Path $archivePath -DestinationPath $bootstrapDir
+    $ynpmBootstrap = Join-Path $bootstrapDir "ynpm.exe"
+    if (-not (Test-Path $ynpmBootstrap)) { throw "seed archive did not carry a ynpm.exe bootstrap" }
+
+    Write-Host "activating seed generation (staged by ynpm seed-activate)"
+    & $ynpmBootstrap seed-activate `
+      --archive $archivePath `
+      --manifest $manifestPath `
+      --package ygg-seed `
+      --expect-version $version `
+      --json
+    if ($LASTEXITCODE -ne 0) { throw "seed-activate refused the transaction (exit $LASTEXITCODE)" }
+
+    # Command publication: %LOCALAPPDATA%\ygg\bin is seed-owned by
+    # construction, so refreshing these copies never races another owner.
+    # A file in use fails the copy loudly (Windows running-binary
+    # constraint); the activated generation itself is never touched, so
+    # re-running the installer after the process exits repairs publication.
+    $binDir = Join-Path $env:LOCALAPPDATA "ygg\bin"
+    New-Item -ItemType Directory -Path $binDir -Force | Out-Null
+    $generationBin = Join-Path $seedRoot "current\bin"
+    if (-not (Test-Path $generationBin)) { throw "activated seed has no $generationBin" }
+    foreach ($name in @("ygg.exe", "ynpm.exe", "ynpx.exe")) {
+      $source = Join-Path $generationBin $name
+      $dest = Join-Path $binDir $name
+      $staged = Join-Path $binDir ($name + ".seed-publish")
+      Copy-Item $source $staged -Force
+      if (Test-Path $dest) {
+        try { Remove-Item $dest -Force } catch {
+          Remove-Item $staged -Force -ErrorAction SilentlyContinue
+          throw "$dest is locked (running process); close it and rerun the installer"
+        }
+      }
+      Move-Item $staged $dest -Force
+    }
+    $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+    $pathParts = @()
+    if ($userPath) { $pathParts = $userPath -split ";" | Where-Object { $_ } }
+    if ($pathParts -notcontains $binDir) {
+      [Environment]::SetEnvironmentVariable("Path", (($pathParts + $binDir) -join ";"), "User")
+    }
+    $env:Path = "$binDir;$env:Path"
+
+    Write-Host "installed ygg4 seed $version"
+    Write-Host "commands: $binDir\{ygg,ynpm,ynpx}.exe"
+    Write-Host "this host can now be operated over ssh as a ygg system; that is a remote-operator capability, not local worker readiness"
+    Write-Host "previous generations are preserved under $seedRoot\generations"
+    exit 0
+  } finally {
+    Remove-Item $tempDir -Recurse -Force -ErrorAction SilentlyContinue
+  }
+}
 
 $apiUrl = "https://api.github.com/repos/$Repo/releases/latest"
 $release = Invoke-RestMethod -Uri $apiUrl -Headers @{ "User-Agent" = "yggterm-installer" }
