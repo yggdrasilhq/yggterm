@@ -313,6 +313,7 @@ def _sync_native_document(
     managed_block: str | None,
     native_path: str | None = None,
     state_scope: str | None = None,
+    _watermark: dict | None = None,
 ) -> tuple[int, int, int]:
     """Three-way synchronize one sanctioned native Markdown document.
 
@@ -323,6 +324,10 @@ def _sync_native_document(
     ``state_scope`` (tree-synced documents) keys the three-way watermark
     state per native directory, so two project stores of one harness cannot
     mutate each other's base, and enables the delete liveness gate below.
+
+    A tree pass may supply its lock-scoped watermark to avoid reloading the
+    entire harness checkpoint for every document. Changed document state is
+    still saved before returning; unchanged state does not rewrite it.
     """
     hub = get_namespace_dir(root, namespace) / filename
     local_exists = path.is_file()
@@ -349,14 +354,18 @@ def _sync_native_document(
     )
     candidate_hub_digest = text_sha256(candidate_hub) if candidate_hub is not None else None
 
-    watermark = load_watermark(root, harness)
+    watermark = _watermark if _watermark is not None else load_watermark(root, harness)
     state_key = f"{namespace}/{filename}" + (f"::{state_scope}" if state_scope else "")
     documents = watermark.setdefault("native_documents", {})
+    legacy_key = f"{namespace}/{filename}"
+    removed_legacy = state_scope is not None and legacy_key in documents
     if state_scope is not None:
         # The pre-scope shared key was the churn vector (one project's base
         # mutated by another's pass); drop it once the scoped key takes over.
         documents.pop(f"{namespace}/{filename}", None)
+    new_state = state_key not in documents
     state = documents.setdefault(state_key, {})
+    previous_state = dict(state)
     base_digest = state.get("delivered_payload_digest", state.get("delivered_digest"))
     base_version = state.get("delivered_version")
     ingested = delivered = deleted = 0
@@ -462,7 +471,8 @@ def _sync_native_document(
         state["delivered_payload_digest"] = final_digest
         state["delivered_hub_digest"] = file_sha256(hub)
         state["delivered_version"] = version_for_digest(root, namespace, filename, state["delivered_hub_digest"])
-    save_watermark(root, watermark)
+    if new_state or removed_legacy or state != previous_state:
+        save_watermark(root, watermark)
     return ingested, delivered, deleted
 
 
@@ -521,6 +531,9 @@ def _sync_native_tree(
             hub[relative.as_posix()] = candidate.name
 
     ingested = delivered = deleted = 0
+    # Callers hold the global sync lock for this pass. Never retain this
+    # snapshot across passes: another writer may update the checkpoint then.
+    watermark = load_watermark(root, harness)
     for relative in sorted(set(local) | set(hub)):
         safe_relative = _safe_native_relative(relative)
         if safe_relative is None:
@@ -541,6 +554,7 @@ def _sync_native_tree(
             managed_block=None,
             native_path=relative,
             state_scope=str(directory),
+            _watermark=watermark,
         )
         ingested += inc
         delivered += outc
