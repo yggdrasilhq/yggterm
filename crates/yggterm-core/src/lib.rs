@@ -1580,7 +1580,7 @@ fn legacy_extra_args_mirror(settings: &AppSettings, slug: &str) -> String {
 }
 
 fn serialize_settings_value(settings: &AppSettings) -> Value {
-    serde_json::json!({
+    let mut value = serde_json::json!({
         "theme_mode": settings.theme,
         "theme": settings.yggui_theme,
         "show_tree": settings.show_tree,
