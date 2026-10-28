@@ -1,6 +1,7 @@
 [workspace]
 members = [
   "apps/yggterm",
+  "crates/ygg-cli",
   "crates/ynpm",
   "crates/yggterm-core",
   "crates/yggterm-server",

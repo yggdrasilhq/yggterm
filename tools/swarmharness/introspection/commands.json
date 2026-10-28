@@ -37,7 +37,11 @@
           "--limit"
         ],
         "help": "Maximum result rows.",
-        "default": "50"
+        "default": "50",
+        "int_range": [
+          1,
+          1000
+        ]
       },
       {
         "flags": [
@@ -246,6 +250,16 @@
           "command": "ygg dream open --pick --state failed",
           "tags": "picker session harness"
         }
+      ],
+      "require_one_of": [
+        "id",
+        "pick"
+      ],
+      "conflicts": [
+        [
+          "id",
+          "pick"
+        ]
       ]
     },
     {
@@ -270,7 +284,8 @@
       "legacy": [
         "ygg-dream-orchestrator.py",
         "status"
-      ]
+      ],
+      "component": "dream_tools"
     },
     {
       "path": [
@@ -288,7 +303,8 @@
       "legacy": [
         "ygg-dream-orchestrator.py",
         "topup"
-      ]
+      ],
+      "component": "dream_tools"
     },
     {
       "path": [
@@ -306,7 +322,8 @@
       "legacy": [
         "ygg-dream-orchestrator.py",
         "supervise"
-      ]
+      ],
+      "component": "dream_tools"
     },
     {
       "path": [
@@ -719,6 +736,9 @@
           "command": "ygg completion bash",
           "tags": ""
         }
+      ],
+      "operand_choices": [
+        "bash"
       ]
     },
     {
@@ -760,7 +780,8 @@
         "ygg-fleet.py",
         "agents",
         "ps"
-      ]
+      ],
+      "component": "fleet_tools"
     },
     {
       "path": [
@@ -785,7 +806,8 @@
         "ygg-fleet.py",
         "fleet",
         "pressure"
-      ]
+      ],
+      "component": "fleet_tools"
     },
     {
       "path": [
@@ -810,7 +832,8 @@
         "ygg-fleet.py",
         "board",
         "scan"
-      ]
+      ],
+      "component": "fleet_tools"
     },
     {
       "path": [
@@ -830,7 +853,8 @@
       "legacy": [
         "ygg-memory"
       ],
-      "strict": false
+      "strict": false,
+      "component": "memory"
     },
     {
       "path": [
@@ -850,7 +874,8 @@
       "legacy": [
         "ygg-auth.py"
       ],
-      "strict": false
+      "strict": false,
+      "component": "auth"
     },
     {
       "path": [
@@ -870,7 +895,8 @@
       "legacy": [
         "ygg-ci.py"
       ],
-      "strict": false
+      "strict": false,
+      "component": "ci"
     },
     {
       "path": [
@@ -891,7 +917,8 @@
         "ygg-init.sh",
         "init"
       ],
-      "strict": false
+      "strict": false,
+      "component": "init"
     },
     {
       "path": [
@@ -912,7 +939,8 @@
         "ygg-init.sh",
         "doctor"
       ],
-      "strict": false
+      "strict": false,
+      "component": "init"
     },
     {
       "path": [
@@ -925,7 +953,8 @@
       "legacy": [
         "ygg_row.py"
       ],
-      "strict": false
+      "strict": false,
+      "component": "row_plane"
     },
     {
       "path": [
@@ -938,7 +967,8 @@
       "legacy": [
         "ygg_bridge.py"
       ],
-      "strict": false
+      "strict": false,
+      "component": "bridge"
     },
     {
       "path": [
@@ -951,7 +981,8 @@
       "legacy": [
         "ygg-spawn.py"
       ],
-      "strict": false
+      "strict": false,
+      "component": "orchestration"
     },
     {
       "path": [
@@ -964,7 +995,8 @@
       "legacy": [
         "ygg-deliver.py"
       ],
-      "strict": false
+      "strict": false,
+      "component": "orchestration"
     },
     {
       "path": [
@@ -977,7 +1009,8 @@
       "legacy": [
         "ygg-fold.py"
       ],
-      "strict": false
+      "strict": false,
+      "component": "orchestration"
     },
     {
       "path": [
@@ -990,7 +1023,8 @@
       "legacy": [
         "ygg-land.py"
       ],
-      "strict": false
+      "strict": false,
+      "component": "orchestration"
     },
     {
       "path": [
@@ -1003,7 +1037,8 @@
       "legacy": [
         "ygg-claim.sh"
       ],
-      "strict": false
+      "strict": false,
+      "component": "orchestration"
     },
     {
       "path": [
@@ -1016,7 +1051,8 @@
       "legacy": [
         "ygg-panic.py"
       ],
-      "strict": false
+      "strict": false,
+      "component": "orchestration"
     },
     {
       "path": [
@@ -1029,7 +1065,8 @@
       "legacy": [
         "ygg-booter.py"
       ],
-      "strict": false
+      "strict": false,
+      "component": "orchestration"
     },
     {
       "path": [
@@ -1042,7 +1079,8 @@
       "legacy": [
         "ygg-monitor.py"
       ],
-      "strict": false
+      "strict": false,
+      "component": "orchestration"
     },
     {
       "path": [
@@ -1055,7 +1093,8 @@
       "legacy": [
         "ygg-babysit.py"
       ],
-      "strict": false
+      "strict": false,
+      "component": "orchestration"
     },
     {
       "path": [
@@ -1069,7 +1108,8 @@
       "legacy": [
         "ygg-board.py"
       ],
-      "strict": false
+      "strict": false,
+      "component": "row_board"
     },
     {
       "path": [
@@ -1083,7 +1123,8 @@
         "@msgboard",
         "read"
       ],
-      "strict": false
+      "strict": false,
+      "component": "msgboard"
     },
     {
       "path": [
@@ -1097,7 +1138,8 @@
         "@msgboard",
         "list"
       ],
-      "strict": false
+      "strict": false,
+      "component": "msgboard"
     },
     {
       "path": [
@@ -1111,7 +1153,8 @@
         "@msgboard",
         "summary"
       ],
-      "strict": false
+      "strict": false,
+      "component": "msgboard"
     },
     {
       "path": [
@@ -1126,7 +1169,8 @@
         "@msgboard",
         "post"
       ],
-      "strict": false
+      "strict": false,
+      "component": "msgboard"
     },
     {
       "path": [
@@ -1141,7 +1185,8 @@
         "@msgboard",
         "answer"
       ],
-      "strict": false
+      "strict": false,
+      "component": "msgboard"
     },
     {
       "path": [
@@ -1156,7 +1201,8 @@
         "@msgboard",
         "graduate"
       ],
-      "strict": false
+      "strict": false,
+      "component": "msgboard"
     },
     {
       "path": [
@@ -1170,7 +1216,8 @@
         "ygg-panic.py"
       ],
       "strict": false,
-      "hidden": true
+      "hidden": true,
+      "component": "orchestration"
     },
     {
       "path": [
@@ -1192,7 +1239,8 @@
         "ygg-init.sh"
       ],
       "strict": false,
-      "hidden": true
+      "hidden": true,
+      "component": "init"
     },
     {
       "path": [
@@ -1206,7 +1254,8 @@
         "ygg_row.py"
       ],
       "strict": false,
-      "hidden": true
+      "hidden": true,
+      "component": "row_plane"
     },
     {
       "path": [
@@ -1220,7 +1269,8 @@
         "ygg-spawn.py"
       ],
       "strict": false,
-      "hidden": true
+      "hidden": true,
+      "component": "orchestration"
     },
     {
       "path": [
@@ -1234,7 +1284,8 @@
         "ygg-claim.sh"
       ],
       "strict": false,
-      "hidden": true
+      "hidden": true,
+      "component": "orchestration"
     },
     {
       "path": [
@@ -1248,7 +1299,8 @@
         "ygg-memory"
       ],
       "strict": false,
-      "hidden": true
+      "hidden": true,
+      "component": "memory"
     },
     {
       "path": [
@@ -1262,7 +1314,8 @@
         "ygg-booter.py"
       ],
       "strict": false,
-      "hidden": true
+      "hidden": true,
+      "component": "orchestration"
     },
     {
       "path": [
@@ -1276,7 +1329,8 @@
         "ygg-fold.py"
       ],
       "strict": false,
-      "hidden": true
+      "hidden": true,
+      "component": "orchestration"
     },
     {
       "path": [
@@ -1290,7 +1344,8 @@
         "ygg-ci.py"
       ],
       "strict": false,
-      "hidden": true
+      "hidden": true,
+      "component": "ci"
     },
     {
       "path": [
@@ -1304,7 +1359,8 @@
         "ygg-land.py"
       ],
       "strict": false,
-      "hidden": true
+      "hidden": true,
+      "component": "orchestration"
     },
     {
       "path": [
@@ -1326,7 +1382,8 @@
         "ygg-auth.py"
       ],
       "strict": false,
-      "hidden": true
+      "hidden": true,
+      "component": "auth"
     },
     {
       "path": [
@@ -1340,7 +1397,8 @@
         "ygg_bridge.py"
       ],
       "strict": false,
-      "hidden": true
+      "hidden": true,
+      "component": "bridge"
     },
     {
       "path": [
@@ -1354,7 +1412,8 @@
         "ygg-deliver.py"
       ],
       "strict": false,
-      "hidden": true
+      "hidden": true,
+      "component": "orchestration"
     },
     {
       "path": [
@@ -1368,7 +1427,8 @@
         "ygg-board.py"
       ],
       "strict": false,
-      "hidden": true
+      "hidden": true,
+      "component": "row_board"
     },
     {
       "path": [
@@ -1382,7 +1442,8 @@
         "ygg-babysit.py"
       ],
       "strict": false,
-      "hidden": true
+      "hidden": true,
+      "component": "orchestration"
     },
     {
       "path": [
@@ -1396,7 +1457,8 @@
         "ygg-monitor.py"
       ],
       "strict": false,
-      "hidden": true
+      "hidden": true,
+      "component": "orchestration"
     },
     {
       "path": [
@@ -1517,6 +1579,388 @@
         "ygg-fleet.py",
         "pressure"
       ]
+    },
+    {
+      "path": [
+        "ynpm"
+      ],
+      "summary": "Package plumbing through the primary entry (verified installs, generations, skill registry).",
+      "effect": "change",
+      "handler": "legacy",
+      "component": "ynpm",
+      "legacy": [
+        "ynpm"
+      ],
+      "strict": false,
+      "passthrough": true,
+      "examples": [
+        {
+          "title": "Install the optional desktop client from its release",
+          "command": "ygg ynpm install https://github.com/yggdrasilhq/yggterm",
+          "tags": "package gui optional install"
+        },
+        {
+          "title": "List integrated packages with measured source, path and version",
+          "command": "ygg ynpm list",
+          "tags": "packages versions inventory"
+        }
+      ]
+    },
+    {
+      "path": [
+        "skills"
+      ],
+      "summary": "Progressive skill registry discovery through the package plane.",
+      "effect": "read",
+      "handler": "legacy",
+      "component": "ynpm",
+      "legacy": [
+        "ynpm",
+        "skills"
+      ],
+      "strict": false,
+      "passthrough": true,
+      "examples": [
+        {
+          "title": "Find the skill an owner phrase assumes",
+          "command": "ygg skills list",
+          "tags": "registry discovery assumed-context"
+        },
+        {
+          "title": "Read one skill's routing notes",
+          "command": "ygg skills info <name>",
+          "tags": "registry routing"
+        }
+      ]
+    },
+    {
+      "path": [
+        "payload"
+      ],
+      "summary": "Verify and materialize the bundled command contract, skill and doc payload (local).",
+      "options": []
+    },
+    {
+      "path": [
+        "payload",
+        "manifest"
+      ],
+      "summary": "Print the bundled seed payload manifest with per-file digests.",
+      "handler": "native",
+      "native": "payload_manifest",
+      "options": [
+        {
+          "$ref": "json"
+        }
+      ],
+      "examples": [
+        {
+          "title": "Show what a verified seed must contain",
+          "command": "ygg payload manifest --json",
+          "tags": "seed digests verify"
+        }
+      ]
+    },
+    {
+      "path": [
+        "payload",
+        "verify"
+      ],
+      "summary": "Verify an installed payload directory against the bundled manifest digests.",
+      "handler": "native",
+      "native": "payload_verify",
+      "options": [
+        {
+          "$ref": "json"
+        },
+        {
+          "flags": [
+            "--dir"
+          ],
+          "help": "Payload directory to verify (default: the dispersed ygg data tree)."
+        }
+      ],
+      "examples": [
+        {
+          "title": "Check the dispersed payload before trusting local help",
+          "command": "ygg payload verify --json",
+          "tags": "seed digests offline"
+        }
+      ]
+    },
+    {
+      "path": [
+        "payload",
+        "install"
+      ],
+      "summary": "Write the bundled payload files into an explicit directory; never touches PATH links.",
+      "effect": "change",
+      "handler": "native",
+      "native": "payload_install",
+      "options": [
+        {
+          "$ref": "json"
+        },
+        {
+          "flags": [
+            "--dir"
+          ],
+          "help": "Target directory; required.",
+          "default": ""
+        }
+      ],
+      "required_options": [
+        "dir"
+      ],
+      "examples": [
+        {
+          "title": "Stage a verifiable seed payload for an installer",
+          "command": "ygg payload install --dir /opt/example/ygg-payload",
+          "tags": "seed installer"
+        }
+      ]
+    },
+    {
+      "path": [
+        "daemon"
+      ],
+      "summary": "Host daemon lifecycle, diagnostics and supervised runtime (planned; not implemented in this generation).",
+      "role": "planned",
+      "options": []
+    },
+    {
+      "path": [
+        "agent"
+      ],
+      "summary": "Daemon-owned harness launch, attachment and identity inspection (planned; not implemented in this generation).",
+      "role": "planned",
+      "options": []
+    },
+    {
+      "path": [
+        "work"
+      ],
+      "summary": "Groups, admitted orchestrators and worker records (planned; not implemented in this generation).",
+      "role": "planned",
+      "options": []
+    },
+    {
+      "path": [
+        "relay"
+      ],
+      "summary": "Explicit predecessor/successor context handoff contracts (planned; not implemented in this generation).",
+      "role": "planned",
+      "options": []
+    },
+    {
+      "path": [
+        "gui"
+      ],
+      "summary": "Optional graphical client operations; the GUI is another porcelain, never an owner (planned).",
+      "role": "planned",
+      "options": []
     }
-  ]
+  ],
+  "contract": "ygg4-cli",
+  "frontend": {
+    "supported_schema": [
+      1
+    ]
+  },
+  "wired_adapters": {},
+  "components": {
+    "inspection": {
+      "runner": "internal",
+      "resolution": [
+        "internal"
+      ],
+      "interpreter": null,
+      "owns": [
+        "swarm inspection snapshots, coverage records and staged findings"
+      ]
+    },
+    "memory": {
+      "runner": "ygg-memory",
+      "aliases": [
+        "ygg-memory",
+        "ygg-memory.py"
+      ],
+      "resolution": [
+        "env:YGG_MEMORY_BIN",
+        "home_bin:ygg-memory",
+        "payload:ygg-memory"
+      ],
+      "interpreter": "python3",
+      "owner_managed": true,
+      "owns": [
+        "shared semantic memory hub namespaces, watermarks and sync receipts"
+      ]
+    },
+    "msgboard": {
+      "runner": "msgboard",
+      "aliases": [
+        "msgboard"
+      ],
+      "resolution": [
+        "path:msgboard"
+      ],
+      "interpreter": null,
+      "owns": [
+        "topic conversation boards"
+      ]
+    },
+    "row_board": {
+      "runner": "ygg-board.py",
+      "aliases": [
+        "ygg-board.py"
+      ],
+      "resolution": [
+        "env:YGG_BIN_DIR",
+        "payload:ygg-board.py"
+      ],
+      "interpreter": "python3",
+      "owns": [
+        "row registry board rows"
+      ]
+    },
+    "dream_tools": {
+      "runner": "ygg-dream-orchestrator.py",
+      "aliases": [
+        "ygg-dream-orchestrator.py"
+      ],
+      "resolution": [
+        "env:YGG_BIN_DIR",
+        "payload:ygg-dream-orchestrator.py"
+      ],
+      "interpreter": "python3",
+      "owns": [
+        "dream queue, attempt and repair ledgers"
+      ]
+    },
+    "fleet_tools": {
+      "runner": "ygg-fleet.py",
+      "aliases": [
+        "ygg-fleet.py"
+      ],
+      "resolution": [
+        "env:YGG_BIN_DIR",
+        "payload:ygg-fleet.py"
+      ],
+      "interpreter": "python3",
+      "owns": [
+        "fleet pressure views and agent rosters"
+      ],
+      "reads": [
+        "dream ledgers",
+        "topic boards"
+      ]
+    },
+    "auth": {
+      "runner": "ygg-auth.py",
+      "aliases": [
+        "ygg-auth.py"
+      ],
+      "resolution": [
+        "env:YGG_BIN_DIR",
+        "payload:ygg-auth.py"
+      ],
+      "interpreter": "python3",
+      "owns": [
+        "model account auth metadata and its credential-store handles"
+      ]
+    },
+    "ci": {
+      "runner": "ygg-ci.py",
+      "aliases": [
+        "ygg-ci.py"
+      ],
+      "resolution": [
+        "env:YGG_BIN_DIR",
+        "payload:ygg-ci.py"
+      ],
+      "interpreter": "python3",
+      "owns": [
+        "integration build lanes, subscriptions and build receipts"
+      ]
+    },
+    "init": {
+      "runner": "ygg-init.sh",
+      "aliases": [
+        "ygg-init.sh"
+      ],
+      "resolution": [
+        "env:YGG_BIN_DIR",
+        "payload:ygg-init.sh"
+      ],
+      "interpreter": "bash",
+      "owns": [
+        "node onboarding and readiness state"
+      ]
+    },
+    "row_plane": {
+      "runner": "ygg_row.py",
+      "aliases": [
+        "ygg_row.py"
+      ],
+      "resolution": [
+        "env:YGG_BIN_DIR",
+        "payload:ygg_row.py"
+      ],
+      "interpreter": "python3",
+      "owns": [
+        "row registry claims and liveness observations"
+      ]
+    },
+    "bridge": {
+      "runner": "ygg_bridge.py",
+      "aliases": [
+        "ygg_bridge.py"
+      ],
+      "resolution": [
+        "env:YGG_BIN_DIR",
+        "payload:ygg_bridge.py"
+      ],
+      "interpreter": "python3",
+      "owns": [
+        "bridge subscription mailboxes and audited intents"
+      ]
+    },
+    "orchestration": {
+      "runner": "payload",
+      "aliases": [
+        "ygg-spawn.py",
+        "ygg-deliver.py",
+        "ygg-fold.py",
+        "ygg-land.py",
+        "ygg-claim.sh",
+        "ygg-panic.py",
+        "ygg-booter.py",
+        "ygg-monitor.py",
+        "ygg-babysit.py"
+      ],
+      "resolution": [
+        "env:YGG_BIN_DIR",
+        "payload"
+      ],
+      "interpreter": "python3",
+      "owns": [
+        "spawn/verify, deliver, fold, land, claim, panic, booter, monitor and babysit execution records"
+      ]
+    },
+    "ynpm": {
+      "runner": "ynpm",
+      "aliases": [
+        "ynpm"
+      ],
+      "resolution": [
+        "env:YGG_YNPM_BIN",
+        "exe_sibling:ynpm",
+        "home_bin:ynpm"
+      ],
+      "interpreter": null,
+      "owns": [
+        "package generations, manifests and skill registry rows"
+      ]
+    }
+  }
 }
