@@ -16,7 +16,7 @@ HERE = Path(__file__).resolve().parent
 DISPERSE = HERE.parent / "ygg-disperse.py"
 SSOT = HERE.parent
 SPEC = json.loads((SSOT / "ygg-verbs.json").read_text())
-ALL_FILES = SPEC["tier_base"] + SPEC.get("owner_managed", []) + SPEC["tier_gui"]
+ALL_FILES = SPEC["tier_base"] + SPEC.get("owner_managed", []) + SPEC["tier_gui"] + SPEC.get("tier_data", [])
 FAILURES = []
 
 

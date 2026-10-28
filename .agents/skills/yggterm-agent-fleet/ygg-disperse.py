@@ -89,7 +89,7 @@ def load_shipment(ssot):
         die(f"{spec_path} not found - --repo must point at the fleet skill dir's repo")
     spec = json.loads(spec_path.read_text())
     files = list(dict.fromkeys(spec["tier_base"] + spec.get("owner_managed", [])
-                               + spec["tier_gui"]))
+                               + spec["tier_gui"] + spec.get("tier_data", [])))
     if SCRIPT_NAME not in spec["tier_base"]:
         die(f"{LIST_NAME} must list {SCRIPT_NAME} in tier_base")
     missing = [f for f in files if not (ssot / f).is_file()]
@@ -180,6 +180,7 @@ def build_manifest(spec, files, ssot, commit):
         "source_commit": commit,
         "ssot": str(ssot),
         "tier_base": spec["tier_base"],
+        "tier_data": spec.get("tier_data", []),
         "owner_managed": spec.get("owner_managed", []),
         "executable": spec["executable"],
         "files": {name: sha256(bin_dir / name) for name in hashed},
@@ -275,7 +276,9 @@ def cmd_finalize(args):
 
 def stage_tar(spec, files, ssot):
     buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w") as tar:
+    # Kernel source aliases are symlinks in the repository, but the remote
+    # shipment must contain standalone bytes, not links out of its tree.
+    with tarfile.open(fileobj=buf, mode="w", dereference=True) as tar:
         for name in files + [LIST_NAME]:
             info = tar.gettarinfo(str(ssot / name), arcname=name)
             info.mode = EXEC_MODE if name in spec["executable"] else DATA_MODE

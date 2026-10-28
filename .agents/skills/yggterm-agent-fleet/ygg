@@ -1,63 +1,11 @@
 #!/usr/bin/env bash
-# ygg — the swarm porcelain. One lightweight router dispatching to the
-# dispersed verbs in ~/.yggterm/bin/ygg/ (spec: docs/spec-ygg-verb-dispersal.md).
-# `yggterm` stays the GUI runtime; `ygg` is what agents and scripts call on any
-# headless node. JSON-first: supervisory verbs print --json when stdout is not
-# a TTY.
+# The shared portable command tree owns parsing/help; no source is queried
+# until it resolves a valid invocation. Missing installation is not fallback
+# permission to execute a backend with unvalidated arguments.
 set -euo pipefail
 YGGBIN="${YGG_BIN_DIR:-$HOME/.yggterm/bin/ygg}"
-
-usage() {
-  cat <<'USAGE'
-ygg — swarm porcelain (yggterm operating harness)
-
-usage: ygg <verb> [args...]
-
-core verbs:
-  ygg help                      this list (from the dispersal manifest)
-  ygg init [--tier N]           deterministic onboarding installer (tiers 0-3)
-  ygg doctor [--fix]            node sanity + service health (same engine as init)
-
-swarm verbs (dispatch to ygg-<verb>):
-  ygg agents ps [--json]        live agent sessions fleet-wide (row registry + /proc liveness)
-  ygg dream status|topup|supervise   dream orchestrator (spawner + supervision)
-  ygg fleet pressure [--json]   load + plan quotas + queue depth, one view
-  ygg board scan [--json]       unrealized dreams on the msgGraph boards
-  ygg auth status|switch|...    codex account rotation (ygg-auth.py)
-  ygg board ...                 msgGraph boards (ygg-board.py)
-  ygg memory ...                memory hub (owner-managed runner)
-  ygg ci|row|bridge|spawn ...   GUI-tier verbs (need a live daemon host)
-
-unknown verbs exit 2 with the nearest matches. Verbs resolve to
-$YGGBIN/ygg-<verb>.* — install/refresh with `ygg-disperse.py install`.
-USAGE
-}
-
-[ $# -lt 1 ] && { usage; exit 0; }
-verb="$1"; shift
-
-case "$verb" in
-  help|--help|-h) usage; exit 0 ;;
-  version|--version) echo "ygg porcelain (@ygghq/yggterm)"; exit 0 ;;
-esac
-
-# canonical multiword aliases -> script+subcommand
-case "$verb" in
-  agents) exec "$YGGBIN/ygg-fleet.py" agents "$@" ;;
-  fleet)  exec "$YGGBIN/ygg-fleet.py" fleet "$@" ;;
-  board)  exec "$YGGBIN/ygg-board.py" "$@" ;;
-  auth)   exec "$YGGBIN/ygg-auth.py" "$@" ;;
-  memory) exec "$YGGBIN/ygg-memory" "$@" ;;
-  ci)     exec "$YGGBIN/ygg-ci.py" "$@" ;;
-  row|bridge|spawn|deliver|fold|land|claim|panic|booter|monitor|babysit)
-          exec "$YGGBIN/ygg-$verb.py" "$@" ;;
-  dream)  exec "$YGGBIN/ygg-dream-orchestrator.py" "$@" ;;
-  init|doctor)
-          exec "$YGGBIN/ygg-init.sh" "$verb" "$@" ;;
-  *)
-        # direct script name fallback: `ygg ygg-row.py ...` or `ygg ygg_row.py`
-        if [ -x "$YGGBIN/$verb" ]; then exec "$YGGBIN/$verb" "$@"; fi
-        echo "ygg: unknown verb '$verb' — try `ygg help`" >&2
-        echo "ygg: is the fleet dispersed? run $YGGBIN/ygg-disperse.py install" >&2
-        exit 2 ;;
-esac
+if [ ! -r "$YGGBIN/ygg-inspect.py" ] || [ ! -r "$YGGBIN/ygg_command_tree.py" ]; then
+  echo 'ygg: command catalog unavailable; refresh with ygg-disperse.py install' >&2
+  exit 3
+fi
+exec python3 "$YGGBIN/ygg-inspect.py" "$@"

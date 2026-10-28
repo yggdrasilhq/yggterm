@@ -64,6 +64,15 @@ carries faithful replicas; one verb owns the copies.
 
 ## Acceptance
 
+### Portable library payloads
+
+`tier_data` lists non-executable modules/data that ship everywhere and are
+hashed in the manifest but receive no PATH links. A source file may be a
+relative alias into the portable kernel. Both local copies and remote tar
+shipments dereference it into standalone bytes; remote replicas cannot
+depend on links escaping the shipment tree. The command tree's first user
+is documented in [swarm-introspection.md](swarm-introspection.md).
+
 On ANY fleet host, fresh or old: `~/.yggterm/bin/ygg/` carries the verbs,
 `ygg-auth.py status` works from PATH without hand-staging, and
 `ygg-disperse.py verify` is green.
