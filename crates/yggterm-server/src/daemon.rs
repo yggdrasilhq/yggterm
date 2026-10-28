@@ -5087,6 +5087,7 @@ pub fn role_gate(request: &ServerRequest) -> ShadowAccess {
         // ---- read / observe: safe for a shadow view client ----
         ServerRequest::Ping
         | ServerRequest::Status
+        | ServerRequest::WorkerCapabilities
         | ServerRequest::WorkingFlags
         | ServerRequest::Snapshot
         | ServerRequest::RowOrderLedgerReport { .. }
@@ -24707,6 +24708,7 @@ pub fn ensure_shell_session(
         &ServerRequest::EnsureShellSession {
             session_id: session_id.to_string(),
             cwd: cwd.map(ToOwned::to_owned),
+            worker: None,
             initial_cols: initial_size.map(|(cols, _)| cols),
             initial_rows: initial_size.map(|(_, rows)| rows),
         },

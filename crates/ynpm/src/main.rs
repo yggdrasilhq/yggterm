@@ -7350,6 +7350,8 @@ fn main() -> anyhow::Result<()> {
     let args: Vec<String> = argv.collect();
     let operation = if invoked_as == "ynpx" {
         "ynpx"
+    } else if args.first().is_some_and(|arg| github_release::looks_like_github_release_source(arg)) {
+        "install"
     } else {
         args.first().map(String::as_str).unwrap_or("<none>")
     };
@@ -7533,6 +7535,9 @@ fn main() -> anyhow::Result<()> {
                     .get(1)
                     .context("rollback wants a package (example: ynpm rollback ychrome)")?;
                 verb_rollback(&paths, name)
+            }
+            source if github_release::looks_like_github_release_source(source) => {
+                verb_install(&paths, &args)
             }
             other => bail!(
                 "'{other}' is not an ynpm verb (install | list | check | doctor | sync | sync-fleet | self-update | seed-activate | export | import | import-yggterm | rollback | remove | prod | purge-legacy | dev)"

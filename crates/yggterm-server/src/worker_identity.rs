@@ -374,6 +374,18 @@ fn pid_start_ticks(pid: u32) -> Option<u64> {
         .and_then(|field| field.parse::<u64>().ok())
 }
 
+/// An absent or unreadable cgroup is unknown, never an inferred ownership.
+pub fn cgroup_v2_path_for_pid(pid: u32) -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?
+            .lines().find_map(|line| line.strip_prefix("0::"))
+            .map(str::trim).filter(|path| !path.is_empty()).map(ToOwned::to_owned)
+    }
+    #[cfg(not(target_os = "linux"))]
+    { let _ = pid; None }
+}
+
 #[cfg(target_os = "linux")]
 fn kernel_boot_id() -> Option<String> {
     fs::read_to_string("/proc/sys/kernel/random/boot_id")

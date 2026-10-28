@@ -1204,7 +1204,7 @@ fn workers_spawn_via_daemon(
 ) -> anyhow::Result<()> {
     ensure_local_server_ready_for_cli(store)?;
     let endpoint = cli_server_endpoint(store.home_dir());
-    let capability = crate::expect_ack(crate::send_request(
+    let capability = crate::daemon::expect_ack(crate::daemon::send_request(
         &endpoint, &crate::ServerRequest::WorkerCapabilities,
     )?)?.context("daemon did not provide worker launch capabilities")?;
     let capability: serde_json::Value = serde_json::from_str(&capability)
@@ -1213,7 +1213,7 @@ fn workers_spawn_via_daemon(
         anyhow::bail!("daemon has no compatible worker launch capability; no worker was launched");
     }
     let session_id = crate::worker_identity::worker_session_id(token)?;
-    let response = crate::send_request(
+    let response = crate::daemon::send_request(
         &endpoint,
         &crate::ServerRequest::EnsureShellSession {
             session_id,
@@ -1228,7 +1228,7 @@ fn workers_spawn_via_daemon(
             }),
         },
     )?;
-    let message = crate::expect_ack(response)?.with_context(|| {
+    let message = crate::daemon::expect_ack(response)?.with_context(|| {
         format!("daemon acknowledged worker spawn for {token:?} without a payload")
     })?;
     match serde_json::from_str::<serde_json::Value>(&message) {
