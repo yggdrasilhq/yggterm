@@ -904,7 +904,7 @@ mod tests {
             harness: Some("zcode".to_string()),
             title: None,
             source: None,
-            parent_token: Some("orch-1".to_string()),
+            parent_token: None,
             pid: None,
             ownership: None,
             pinned: false,
@@ -979,7 +979,9 @@ mod tests {
         // A valid chain: orch-1 (top) -> sub-1 (under it).
         let top = register(&home, request("orch-1", WorkerRole::Orchestrator)).expect("orch");
         assert!(matches!(top, RegisterOutcome::Created { .. }));
-        let child = register(&home, request("sub-1", WorkerRole::SubOrchestrator));
+        let mut child_request = request("sub-1", WorkerRole::SubOrchestrator);
+        child_request.parent_token = Some("orch-1".to_string());
+        let child = register(&home, child_request);
         assert!(child.is_ok(), "registered parent satisfies lineage");
         let _ = fs::remove_dir_all(&home);
     }
@@ -1061,7 +1063,10 @@ mod tests {
     #[test]
     fn unprovided_fields_serialize_as_explicit_nulls() {
         let home = temp_home("unknowns");
-        let outcome = register(&home, request("plain-1", WorkerRole::SubOrchestrator))
+        register(&home, request("orch-1", WorkerRole::Orchestrator)).expect("parent");
+        let mut child = request("plain-1", WorkerRole::SubOrchestrator);
+        child.parent_token = Some("orch-1".to_string());
+        let outcome = register(&home, child)
             .expect("register");
         let record = match outcome {
             RegisterOutcome::Created { record } => record,
@@ -1093,6 +1098,18 @@ mod tests {
         assert_eq!(shell_quote_single("plain"), "'plain'");
         assert_eq!(shell_quote_single("it's"), "'it'\\''s'");
         assert_eq!(shell_quote_single("a b;$(rm)"), "'a b;$(rm)'");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn shell_command_quoting_round_trips_through_a_real_shell() {
+        for value in ["", "it's literal", "two words", "$(exit 37)", "; exit 39", "line\nbreak"] {
+            let output = std::process::Command::new("sh")
+                .args(["-c", &format!("printf '%s' {}", shell_quote_single(value))])
+                .output().expect("POSIX fixture shell");
+            assert!(output.status.success());
+            assert_eq!(output.stdout, value.as_bytes());
+        }
     }
 
     #[test]

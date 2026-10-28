@@ -1306,6 +1306,8 @@ fn workers_attach_via_daemon(store: &SessionStore, token: &str, json: bool) -> a
 }
 
 pub fn run_server_workers_cli(store: &SessionStore, args: &[String]) -> anyhow::Result<()> {
+    if args.iter().any(|arg| arg == "--help" || arg == "-h") { return workers_usage(); }
+    validate_worker_arguments(args)?;
     let json = args.iter().any(|arg| arg == "--json");
     let home = store.home_dir().to_path_buf();
     let verb = args.first().map(String::as_str).unwrap_or("");
@@ -1509,5 +1511,62 @@ pub fn run_server_workers_cli(store: &SessionStore, args: &[String]) -> anyhow::
             Ok(())
         }
         _ => workers_usage(),
+    }
+}
+
+fn validate_worker_arguments(args: &[String]) -> anyhow::Result<()> {
+    let Some(verb) = args.first().map(String::as_str) else { return Ok(()) };
+    if matches!(verb, "--help" | "-h") { return Ok(()) }
+    let values: &[&str] = match verb {
+        "register" => &["--launch-token", "--role", "--session-marker", "--session-id", "--harness", "--title", "--source", "--parent-token", "--pid"],
+        "spawn" => &["--launch-token", "--role", "--parent-token", "--cwd", "--command"],
+        "attach" | "show" => &["--launch-token"],
+        "ls" => &["--role"],
+        "annotate" => &["--launch-token", "--pid", "--session-id", "--harness", "--title", "--pinned"],
+        "retire" => &["--launch-token", "--reason"],
+        _ => anyhow::bail!("unknown worker verb {verb:?}"),
+    };
+    let mut seen = std::collections::BTreeSet::new();
+    let mut index = 1;
+    while index < args.len() {
+        let arg = &args[index];
+        let (flag, inline) = arg.split_once('=').map_or((arg.as_str(), None), |(f, v)| (f, Some(v)));
+        if !seen.insert(flag) { anyhow::bail!("duplicate worker option {flag}") }
+        let boolean = flag == "--json" || (verb == "register" && flag == "--pinned")
+            || (verb == "retire" && flag == "--force");
+        if boolean {
+            if inline.is_some() { anyhow::bail!("worker option {flag} takes no value") }
+        } else if values.contains(&flag) {
+            if let Some(value) = inline {
+                if value.is_empty() { anyhow::bail!("worker option {flag} needs a value") }
+            } else {
+                index += 1;
+                if args.get(index).is_none_or(|v| v.is_empty() || v.starts_with("--")) {
+                    anyhow::bail!("worker option {flag} needs a value; use {flag}=VALUE for a value starting with --")
+                }
+            }
+        } else { anyhow::bail!("unknown worker option {flag:?} for {verb}") }
+        index += 1;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod worker_cli_argument_tests {
+    use super::validate_worker_arguments;
+    fn args(words: &[&str]) -> Vec<String> { words.iter().map(|s| s.to_string()).collect() }
+    #[test]
+    fn worker_mutations_reject_typos_missing_values_and_duplicates() {
+        for input in [
+            vec!["spawn", "--launch-token", "fixture", "--commnad", "echo hi"],
+            vec!["spawn", "--command", "--json"],
+            vec!["retire", "--launch-token", "a", "--launch-token", "b"],
+            vec!["retire", "--force=true"],
+        ] { assert!(validate_worker_arguments(&args(&input)).is_err(), "{input:?}"); }
+    }
+    #[test]
+    fn worker_argv_preserves_an_explicit_command_and_inline_literal() {
+        assert!(validate_worker_arguments(&args(&["spawn", "--launch-token", "fixture", "--command", "printf '%s' 'two words'", "--json"])).is_ok());
+        assert!(validate_worker_arguments(&args(&["annotate", "--launch-token=fixture", "--title=--literal", "--pinned", "false"])).is_ok());
     }
 }
