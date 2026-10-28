@@ -36,17 +36,35 @@ pub struct GitHubReleaseSource {
 }
 
 pub fn looks_like_github_release_source(spec: &str) -> bool {
-    spec.starts_with("https://github.com/")
-        || spec.starts_with("http://github.com/")
-        || spec.starts_with("github:")
+    spec.starts_with("https://github.com/") || spec.starts_with("github:")
+}
+
+/// Owner and repository name components are joined into download URLs and
+/// persisted into state, so each must be a strict slug: plaintext HTTP is a
+/// downgrade vector and anything outside `[A-Za-z0-9._-]` (or a `..`
+/// traversal) must never reach a URL.
+fn safe_repo_slug(slug: &str) -> Result<()> {
+    let ok = !slug.is_empty()
+        && slug.len() <= 100
+        && slug != "."
+        && slug != ".."
+        && slug
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'));
+    if !ok {
+        bail!("github repository component {slug:?} is not a safe owner/name slug");
+    }
+    Ok(())
 }
 
 pub fn parse_github_release_source(spec: &str) -> Result<GitHubReleaseSource> {
     let raw = spec
         .strip_prefix("https://github.com/")
-        .or_else(|| spec.strip_prefix("http://github.com/"))
         .or_else(|| spec.strip_prefix("github:"))
-        .context("not a github release source")?;
+        .context(
+            "not a github release source; use https://github.com/<owner>/<repo> \
+             or github:<owner>/<repo> (plaintext http is refused)",
+        )?;
     // An explicit tag rides a trailing @tag on either spelling. Splitting
     // BEFORE path checks keeps `.../tree/main@v4` from looking like a tag.
     let (path, tag) = match raw.rsplit_once('@') {
@@ -77,6 +95,8 @@ pub fn parse_github_release_source(spec: &str) -> Result<GitHubReleaseSource> {
     if owner == "." || name == "." {
         bail!("github release source has an empty path segment");
     }
+    safe_repo_slug(owner)?;
+    safe_repo_slug(name)?;
     Ok(GitHubReleaseSource {
         repo: format!("{owner}/{name}"),
         tag,
@@ -259,7 +279,14 @@ fn extract_with_guards(
 /// (GitHub source archives and common release tooling do). When the
 /// extraction holds exactly one directory and nothing else, that directory
 /// is the package root; otherwise the extraction root is.
-fn release_extraction_root(extracted: &Path) -> Result<PathBuf> {
+/// The probe must NAME the release version as a whole whitespace-delimited
+/// token, not merely contain it as a substring: a probe reading
+/// `14.0.0` or `4.0.0-rc1` must not validate against `4.0.0`.
+fn probe_text_names_version(text: &str, version: &str) -> bool {
+    text.split_whitespace().any(|token| token == version)
+}
+
+fn release_extraction_root(extracted: &Path, bundle: Option<&str>) -> Result<PathBuf> {
     let mut entries = std::fs::read_dir(extracted)
         .with_context(|| format!("reading {}", extracted.display()))?;
     let first = entries.next();
@@ -272,7 +299,18 @@ fn release_extraction_root(extracted: &Path) -> Result<PathBuf> {
     }
     let path = first.path();
     if first.file_type().with_context(|| format!("statting {}", path.display()))?.is_dir() {
-        Ok(path)
+        // A bundle-shaped archive whose only top-level entry IS the declared
+        // bundle (e.g. `yggterm.app/`) must keep the extraction root: the
+        // bundle checks resolve against root.join(bundle), and unwrapping
+        // would look for the bundle inside itself.
+        let is_declared_bundle = bundle.is_some_and(|bundle| {
+            path.file_name().and_then(|name| name.to_str()) == Some(bundle)
+        });
+        if is_declared_bundle {
+            Ok(extracted.to_path_buf())
+        } else {
+            Ok(path)
+        }
     } else {
         Ok(extracted.to_path_buf())
     }
@@ -359,17 +397,17 @@ pub fn install_from_release_manifest(
             vec![package]
         }
         None => {
+            // Unattended selection installs desktop packages only; seed
+            // packages are activated by their own transaction.
             let candidates: Vec<&ReleasePackage> = manifest
                 .packages
                 .iter()
                 .filter(|package| {
-                    matches!(
-                        package.role,
-                        ReleasePackageRole::Seed | ReleasePackageRole::Desktop
-                    ) && package
-                        .artifacts
-                        .iter()
-                        .any(|artifact| artifact.platform == host_platform)
+                    package.role == ReleasePackageRole::Desktop
+                        && package
+                            .artifacts
+                            .iter()
+                            .any(|artifact| artifact.platform == host_platform)
                 })
                 .collect();
             match candidates.len() {
@@ -388,11 +426,21 @@ pub fn install_from_release_manifest(
                             )
                         })
                         .collect();
+                    let seed_note = if manifest
+                        .packages
+                        .iter()
+                        .any(|package| package.role == ReleasePackageRole::Seed)
+                    {
+                        "; seed packages in this release are activated with `ynpm seed-activate`"
+                    } else {
+                        ""
+                    };
                     bail!(
                         "release {:?} ships no installable package for {host_platform}; \
-                         it declares: {}",
+                         it declares: {}{}",
                         manifest.release.tag,
-                        inventory.join("; ")
+                        inventory.join("; "),
+                        seed_note
                     );
                 }
                 1 => candidates,
@@ -485,7 +533,25 @@ fn install_release_package(
                 reason: "web delivery is owned by the yggterm web plane".to_string(),
             });
         }
-        ReleasePackageRole::Seed | ReleasePackageRole::Desktop => {}
+        ReleasePackageRole::Seed => {
+            // One policy owner: the seed transaction. Letting a seed package
+            // through the desktop generation path would stage
+            // `~/.local/bin/{ygg,ynpm,ynpx}` links and a desktop state row,
+            // and a later desktop removal would unlink the seed's binaries
+            // out from under every session.
+            ynpm_trace(
+                paths,
+                "release.declined",
+                serde_json::json!({ "package": &package.id, "role": "seed" }),
+            );
+            bail!(
+                "{} is a seed package; the seed transaction owns it - run \
+                 `ynpm seed-activate --archive <archive> --manifest <manifest>` \
+                 instead of the desktop generation path",
+                package.id
+            );
+        }
+        ReleasePackageRole::Desktop => {}
     }
     let Some(artifact) = package
         .artifacts
@@ -602,7 +668,7 @@ pub fn install_release_package_from_archive(
         let _ = std::fs::remove_dir_all(&scratch);
         return Err(error);
     }
-    let root = match release_extraction_root(&extracted) {
+    let root = match release_extraction_root(&extracted, artifact.bundle.as_deref()) {
         Ok(root) => root,
         Err(error) => {
             let _ = std::fs::remove_dir_all(&scratch);
@@ -705,9 +771,10 @@ fn verify_release_content(
                     probe.file, package.id
                 )
             })?;
-        if !text.contains(version.as_str()) {
+        if !probe_text_names_version(&text, version) {
             bail!(
-                "version probe {:?} of package {} does not contain the release version {version}",
+                "version probe {:?} of package {} does not name the release version {version} \
+                 as an exact token",
                 probe.file,
                 package.id
             );
@@ -925,13 +992,11 @@ pub fn install_github_release(
             .packages
             .iter()
             .filter(|package| {
-                matches!(
-                    package.role,
-                    ReleasePackageRole::Seed | ReleasePackageRole::Desktop
-                ) && package
-                    .artifacts
-                    .iter()
-                    .any(|artifact| artifact.platform == host_platform)
+                package.role == ReleasePackageRole::Desktop
+                    && package
+                        .artifacts
+                        .iter()
+                        .any(|artifact| artifact.platform == host_platform)
             })
             .collect(),
     };
@@ -950,9 +1015,12 @@ pub fn install_github_release(
         let url = release_download_url(&source.repo, &tag, &artifact.filename);
         let body = crate::curl(&url)
             .with_context(|| format!("downloading {url}"))?;
-        let staged = paths
-            .scratch()
-            .join(format!("release-dl-{}-{}", package_storage_key(&package.id), tag));
+        let staged = paths.scratch().join(format!(
+            "release-dl-{}-{}-{}",
+            package_storage_key(&package.id),
+            tag,
+            std::process::id()
+        ));
         std::fs::create_dir_all(staged.parent().context("scratch has no parent")?)?;
         std::fs::write(&staged, &body)
             .with_context(|| format!("staging {}", staged.display()))?;
@@ -1037,6 +1105,18 @@ pub fn verb_seed_activate(paths: &Paths, args: &[String]) -> Result<()> {
     }
     let archive = archive.context("seed-activate wants --archive PATH")?;
     let manifest_path = manifest.context("seed-activate wants --manifest PATH")?;
+    if cfg!(windows) {
+        // The unix flip is a staged-symlink rename over `current`. On
+        // Windows publish_link copies instead of linking, and the source
+        // here is a whole generation directory - a copy the pointer needs
+        // but cannot become. Until a native junction-based current flip is
+        // qualified, refuse BEFORE any byte moves.
+        bail!(
+            "seed activation is declared in the release schema but the windows \
+             generation pointer (a junction-based `current` flip) is not yet \
+             qualified; refusing before any bytes move"
+        );
+    }
     if !archive.is_file() {
         bail!("seed archive {} is not a file", archive.display());
     }
@@ -1124,7 +1204,7 @@ pub fn verb_seed_activate(paths: &Paths, args: &[String]) -> Result<()> {
     let extraction = (|| -> Result<PathBuf> {
         let extracted = scratch.join("extracted");
         extract_with_guards(&archive, artifact.format, &extracted)?;
-        release_extraction_root(&extracted)
+        release_extraction_root(&extracted, artifact.bundle.as_deref())
     })();
     let root = match extraction {
         Ok(root) => root,
@@ -1163,7 +1243,25 @@ pub fn verb_seed_activate(paths: &Paths, args: &[String]) -> Result<()> {
         return Err(error);
     }
     if generation_dir.exists() {
-        let _ = std::fs::remove_dir_all(&staging);
+        // Keep a COMPLETE generation (idempotent repoint); an incomplete or
+        // corrupt one - a crashed earlier activation, an emptied directory -
+        // is replaced wholesale, never trusted and flipped onto `current`.
+        let complete = artifact
+            .bins
+            .iter()
+            .all(|bin| generation_dir.join("bin").join(bin).is_file());
+        if complete {
+            let _ = std::fs::remove_dir_all(&staging);
+        } else {
+            std::fs::remove_dir_all(&generation_dir).with_context(|| {
+                format!(
+                    "replacing incomplete seed generation {}",
+                    generation_dir.display()
+                )
+            })?;
+            std::fs::rename(&staging, &generation_dir)
+                .with_context(|| format!("publishing {}", generation_dir.display()))?;
+        }
     } else {
         std::fs::rename(&staging, &generation_dir)
             .with_context(|| format!("publishing {}", generation_dir.display()))?;
@@ -1286,6 +1384,9 @@ mod tests {
             fs::write(&path, bin_script(&format!("example-{bin} {version}"))).unwrap();
             set_executable(&path).unwrap();
         }
+        // Every fixture carries a top-level version probe file so manifests
+        // can gate `version_probe: {file: "version"}`.
+        fs::write(build.join("version"), format!("fixture {version}\n")).unwrap();
         if let Some(bundle) = bundle {
             fs::create_dir_all(build.join(bundle)).unwrap();
             fs::write(
@@ -1304,6 +1405,7 @@ mod tests {
         for bin in bins {
             args.push(bin.to_string());
         }
+        args.push("version".to_string());
         if let Some(bundle) = bundle {
             args.push(bundle.to_string());
         }
@@ -1389,6 +1491,27 @@ mod tests {
             parse_github_release_source("https://github.com/example/example/tree/main").unwrap_err();
         assert!(error.to_string().contains("repository root"));
         assert!(!looks_like_github_release_source("https://gitlab.com/a/b"));
+    }
+
+    #[test]
+    fn plaintext_http_and_hostile_slugs_are_refused() {
+        // Plaintext http is a transport downgrade, never a synonym for https.
+        assert!(!looks_like_github_release_source("http://github.com/example/example"));
+        assert!(parse_github_release_source("http://github.com/example/example").is_err());
+        // Slugs are joined into download URLs and persisted into state; a
+        // traversal or stray character never reaches one.
+        for evil in [
+            "https://github.com/../evil",
+            "https://github.com/example/..",
+            "https://github.com/a b/c",
+            "https://github.com/example/exa mple",
+        ] {
+            let error = parse_github_release_source(evil).unwrap_err();
+            assert!(
+                error.to_string().contains("slug"),
+                "{evil:?} was not refused as a slug: {error:#}"
+            );
+        }
     }
 
     #[test]
@@ -1658,28 +1781,202 @@ mod tests {
             &digest,
             serde_json::json!({ "version_probe": { "file": "version" } }),
         );
-        doc["packages"].as_array_mut().unwrap().push(
-            manifest_doc(
-                "4.0.0",
-                "v4.0.0",
-                "example-seed",
-                "seed",
-                "gui.tar.gz",
-                &digest,
-                serde_json::json!({}),
-            )["packages"][0]
-                .clone(),
-        );
+        let mut second = doc["packages"][0].clone();
+        second["id"] = serde_json::json!("example-gui-b");
+        doc["packages"].as_array_mut().unwrap().push(second);
         let mut archives = BTreeMap::new();
         archives.insert("gui.tar.gz".to_string(), archive);
+        // Two desktop candidates for one host: unattended is ambiguous.
         let error = run_install(&sandbox, &doc, &archives, None).unwrap_err();
         assert!(error.to_string().contains("--package"));
         // Explicit selection installs exactly the chosen package.
-        let results = run_install(&sandbox, &doc, &archives, Some("example-seed")).unwrap();
+        let results = run_install(&sandbox, &doc, &archives, Some("example-gui-b")).unwrap();
         assert!(matches!(
             &results[0],
             ReleaseInstallResult::Installed(_)
         ));
+    }
+
+    #[test]
+    fn seed_package_is_never_installed_through_the_desktop_transaction() {
+        let sandbox = Sandbox::new("seedowner");
+        let (archive, digest) = fixture_archive(
+            &sandbox,
+            "seed",
+            "4.0.0",
+            &["ygg", "ynpm", "ynpx"],
+            None,
+        );
+        let doc = manifest_doc(
+            "4.0.0",
+            "v4.0.0",
+            "ygg-seed",
+            "seed",
+            "seed.tar.gz",
+            &digest,
+            serde_json::json!({}),
+        );
+        let mut archives = BTreeMap::new();
+        archives.insert("seed.tar.gz".to_string(), archive);
+        // Explicit selection is refused with the owning transaction named:
+        // one policy owner, so a desktop `--package` can never stage seed
+        // links a later removal would tear out.
+        let error = run_install(&sandbox, &doc, &archives, Some("ygg-seed")).unwrap_err();
+        assert!(error.to_string().contains("seed-activate"));
+        // Unattended selection is desktop-only; a seed-only release says
+        // where its seed goes instead of silently installing nothing.
+        let error = run_install(&sandbox, &doc, &archives, None).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("ships no installable package"));
+        assert!(message.contains("seed-activate"));
+        assert!(sandbox.paths().load_state().unwrap().packages.is_empty());
+    }
+
+    #[test]
+    fn top_level_bundle_directory_is_not_unwrapped() {
+        let sandbox = Sandbox::new("bundle");
+        // An archive whose ONLY top-level entry IS the declared bundle: the
+        // extraction root must stay the root, or the bundle check would look
+        // for the bundle inside itself and refuse a good release.
+        let build = sandbox.home.join("build-bundle");
+        fs::create_dir_all(build.join("example-gui-linux")).unwrap();
+        fs::write(
+            build.join("example-gui-linux/version"),
+            "example bundle 4.0.0\n",
+        )
+        .unwrap();
+        set_executable(&build.join("example-gui-linux/version")).unwrap();
+        let archive = sandbox.home.join("bundle.tar.gz");
+        let output = Command::new("tar")
+            .args(["-czf"])
+            .arg(&archive)
+            .arg("-C")
+            .arg(&build)
+            .arg("example-gui-linux")
+            .output()
+            .expect("tar fixture");
+        assert!(output.status.success());
+        let digest = sha256_file(&archive).unwrap();
+        let mut doc = manifest_doc(
+            "4.0.0",
+            "v4.0.0",
+            "example-gui",
+            "desktop",
+            "bundle.tar.gz",
+            &digest,
+            serde_json::json!({
+                "version_probe": { "file": "example-gui-linux/version" },
+                "launch": { "entry": "example-gui-linux/version" },
+            }),
+        );
+        doc["packages"][0]["artifacts"][0]["bins"] = serde_json::json!([]);
+        let mut archives = BTreeMap::new();
+        archives.insert("bundle.tar.gz".to_string(), archive);
+        let results = run_install(&sandbox, &doc, &archives, None).unwrap();
+        assert!(matches!(&results[0], ReleaseInstallResult::Installed(_)));
+        let paths = sandbox.paths();
+        assert!(paths.dest().join("example-gui-linux").symlink_metadata().is_ok());
+        assert!(paths
+            .generation_dir("example-gui", "4.0.0")
+            .join("example-gui-linux/version")
+            .is_file());
+    }
+
+    #[test]
+    fn version_probe_requires_the_exact_version_token() {
+        let sandbox = Sandbox::new("probe");
+        let build = sandbox.home.join("build-probe");
+        fs::create_dir_all(&build).unwrap();
+        fs::write(build.join("example-gui"), bin_script("example-gui 4.0.0")).unwrap();
+        set_executable(&build.join("example-gui")).unwrap();
+        // A probe naming a DIFFERENT version must not validate; under the
+        // old substring rule "14.0.0" would have matched a "4.0.0" release.
+        fs::write(build.join("release-notes"), "yggterm 14.0.0 released\n").unwrap();
+        let archive = sandbox.home.join("probe.tar.gz");
+        let output = Command::new("tar")
+            .args(["-czf"])
+            .arg(&archive)
+            .arg("-C")
+            .arg(&build)
+            .arg("example-gui")
+            .arg("release-notes")
+            .output()
+            .expect("tar fixture");
+        assert!(output.status.success());
+        let digest = sha256_file(&archive).unwrap();
+        let doc = manifest_doc(
+            "4.0.0",
+            "v4.0.0",
+            "example-gui",
+            "desktop",
+            "probe.tar.gz",
+            &digest,
+            serde_json::json!({ "version_probe": { "file": "release-notes" } }),
+        );
+        let mut archives = BTreeMap::new();
+        archives.insert("probe.tar.gz".to_string(), archive);
+        let error = run_install(&sandbox, &doc, &archives, None).unwrap_err();
+        assert!(error.to_string().contains("does not name the release version"));
+        assert!(sandbox.paths().load_state().unwrap().packages.is_empty());
+    }
+
+    #[test]
+    fn seed_activate_replaces_incomplete_generation_and_keeps_complete() {
+        let sandbox = Sandbox::new("seedrepair");
+        let (archive, digest) = fixture_archive(
+            &sandbox,
+            "seed",
+            "4.0.0",
+            &["ygg", "ynpm", "ynpx"],
+            None,
+        );
+        let doc = manifest_doc(
+            "4.0.0",
+            "v4.0.0",
+            "ygg-seed",
+            "seed",
+            "seed.tar.gz",
+            &digest,
+            serde_json::json!({}),
+        );
+        let manifest_path = sandbox.home.join("manifest.json");
+        fs::write(&manifest_path, serde_json::to_string(&doc).unwrap()).unwrap();
+        let seed_root = sandbox.home.join("seed");
+        let args = vec![
+            "--archive".to_string(),
+            archive.display().to_string(),
+            "--manifest".to_string(),
+            manifest_path.display().to_string(),
+            "--seed-root".to_string(),
+            seed_root.display().to_string(),
+        ];
+        verb_seed_activate(&sandbox.paths(), &args).unwrap();
+        let generation_dir = seed_root
+            .join("generations")
+            .join(format!("4.0.0-{}", &digest[..12]));
+        assert!(generation_dir.join("bin/ygg").is_file());
+        // A complete generation is kept across a re-activation (idempotent
+        // repoint), never restaged over.
+        fs::write(generation_dir.join(".marker"), "kept").unwrap();
+        let _ = std::fs::remove_file(seed_root.join("current"));
+        let gen_name = format!("4.0.0-{}", &digest[..12]);
+        verb_seed_activate(&sandbox.paths(), &args).unwrap();
+        assert_eq!(
+            std::fs::read_link(seed_root.join("current"))
+                .unwrap()
+                .file_name(),
+            Some(std::ffi::OsStr::new(gen_name.as_str()))
+        );
+        assert!(generation_dir.join(".marker").exists());
+        // An incomplete generation - a crashed earlier activation - is
+        // replaced wholesale, never trusted and flipped onto `current`.
+        std::fs::remove_dir_all(&generation_dir).unwrap();
+        std::fs::create_dir_all(&generation_dir).unwrap();
+        verb_seed_activate(&sandbox.paths(), &args).unwrap();
+        assert!(generation_dir.join("bin/ygg").is_file());
+        assert!(generation_dir.join("bin/ynpm").is_file());
+        assert!(generation_dir.join("bin/ynpx").is_file());
+        assert!(!generation_dir.join(".marker").exists());
     }
 
     #[test]

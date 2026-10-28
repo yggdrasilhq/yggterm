@@ -423,6 +423,23 @@ fn validate_release_package(package: &ReleasePackage) -> Result<()> {
             }
         }
         ReleasePackageRole::Desktop => {
+            // Seed binaries have exactly one owner: the seed transaction. A
+            // desktop package declaring `ygg`/`ynpm`/`ynpx` would overwrite
+            // the seed's link in the destination and a later desktop removal
+            // would unlink the seed's binaries (neighbour loss), so the
+            // manifest is refused at validation time.
+            const RESERVED_SEED_BINS: [&str; 3] = ["ygg", "ynpm", "ynpx"];
+            for artifact in &package.artifacts {
+                for bin in &artifact.bins {
+                    if RESERVED_SEED_BINS.contains(&bin.as_str()) {
+                        bail!(
+                            "desktop package {:?} declares reserved seed bin {bin:?}; \
+                             seed binaries are owned by the seed transaction",
+                            package.id
+                        );
+                    }
+                }
+            }
             if package.launch.is_none() && package.artifacts.iter().all(|a| a.bins.is_empty()) {
                 bail!(
                     "desktop package {:?} declares neither bins nor a launch entry; \
@@ -507,33 +524,49 @@ pub fn parse_tar_listing_line(line: &str) -> Result<ArchiveEntry> {
         && looks_like_iso_date(tokens[3])
     {
         let name = tokens[5..].join(" ");
-        return entry_from_listing_name(&name, tokens[2].parse::<u64>().ok());
+        return entry_from_listing_name(tokens[0], &name, tokens[2].parse::<u64>().ok());
     }
     // bsdtar shape (macOS): `perms nlink owner group size Mon DD time name`.
     // GNU lines cannot reach here: their owner/group token carries a '/' and
     // is checked first.
     if tokens.len() >= 9 && all_digits(tokens[1]) && all_digits(tokens[4]) {
         let name = tokens[8..].join(" ");
-        return entry_from_listing_name(&name, tokens[4].parse::<u64>().ok());
+        return entry_from_listing_name(tokens[0], &name, tokens[4].parse::<u64>().ok());
     }
     bail!("archive listing line does not match a known tar -tv format");
 }
 
-fn entry_from_listing_name(listing_name: &str, size: Option<u64>) -> Result<ArchiveEntry> {
-    if let Some((name, target)) = listing_name.split_once(" -> ") {
+/// Classify one listing entry. Link detection consults the entry's mode
+/// token, never the name alone: a plain file whose path happens to contain
+/// ` -> ` is a file, and a link spelled without a visible target is
+/// unguardable and refused.
+fn entry_from_listing_name(
+    mode: &str,
+    listing_name: &str,
+    size: Option<u64>,
+) -> Result<ArchiveEntry> {
+    if mode.starts_with('h') {
+        // GNU -tv spells hard links as mode `h...` + "<name> link to <target>".
+        return Ok(ArchiveEntry {
+            name: listing_name
+                .split_once(" link to ")
+                .map(|(name, _)| name.trim_end_matches('/').to_string())
+                .unwrap_or_else(|| listing_name.trim_end_matches('/').to_string()),
+            size,
+            kind: ArchiveEntryKind::Other("hardlink"),
+        });
+    }
+    if mode.starts_with('l') {
+        let Some((name, target)) = listing_name.split_once(" -> ") else {
+            bail!(
+                "archive declares a symlink whose listing carries no target; \
+                 a link we cannot read is a link we cannot guard"
+            );
+        };
         return Ok(ArchiveEntry {
             name: name.trim_end_matches('/').to_string(),
             size,
             kind: ArchiveEntryKind::Symlink(target.to_string()),
-        });
-    }
-    // GNU -tv spells hard links as "<name> link to <target>".
-    if let Some(position) = listing_name.find(" link to ") {
-        let name = listing_name[..position].trim_end_matches('/').to_string();
-        return Ok(ArchiveEntry {
-            name,
-            size,
-            kind: ArchiveEntryKind::Other("hardlink"),
         });
     }
     if listing_name.ends_with('/') {
@@ -946,6 +979,16 @@ mod tests {
             ArchiveEntryKind::Symlink("A".to_string())
         );
 
+        // A plain file whose name merely contains an arrow is a FILE: link
+        // detection reads the mode token, never the name.
+        let arrow_file = "-rw-r--r-- pi/pi 4096 2026-10-28 12:00 docs/a -> b.txt";
+        let entry = parse_tar_listing_line(arrow_file).unwrap();
+        assert_eq!(entry.name, "docs/a -> b.txt");
+        assert_eq!(entry.kind, ArchiveEntryKind::File);
+
+        // A symlink spelled without a visible target is unguardable: refused.
+        assert!(parse_tar_listing_line("lrwxrwxrwx pi/pi 0 2026-10-28 12:00 bundle/current").is_err());
+
         assert!(parse_tar_listing_line("garbage line").is_err());
         assert!(parse_tar_listing_line("").is_err());
     }
@@ -997,9 +1040,24 @@ mod tests {
 
     #[test]
     fn hardlinks_and_exotic_entries_are_refused() {
-        let hardlink = parse_tar_listing_line("-rw-r--r-- pi/pi 12 2026-10-28 12:00 dup link to bin/ygg")
+        // GNU -tv spells hard links with a leading `h` in the mode token.
+        let hardlink = parse_tar_listing_line("hrw-r--r-- pi/pi 12 2026-10-28 12:00 dup link to bin/ygg")
             .unwrap();
+        assert_eq!(hardlink.name, "dup");
         assert_eq!(hardlink.kind, ArchiveEntryKind::Other("hardlink"));
         assert!(guard_archive_entries(&[hardlink]).is_err());
+    }
+
+    #[test]
+    fn desktop_manifest_cannot_declare_reserved_seed_bins() {
+        for bin in ["ygg", "ynpm", "ynpx"] {
+            let mut doc = manifest_value(VALID_DESKTOP_MANIFEST);
+            doc["packages"][0]["artifacts"][0]["bins"] = serde_json::json!([bin]);
+            let error = validate_release_manifest(&doc).unwrap_err();
+            assert!(
+                error.to_string().contains("reserved seed bin"),
+                "desktop bin {bin:?} was not refused: {error:#}"
+            );
+        }
     }
 }

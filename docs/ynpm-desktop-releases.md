@@ -77,6 +77,11 @@ Every GitHub release that ynpm can install publishes a machine-readable
    relative forward-slash paths with no `..`, no absolute, no backslash.
 9. A release tag is a safe git tag; the manifest's `release.tag` MUST
    agree with the tag the release actually resolved to.
+10. Release SOURCES are `https://github.com/<owner>/<repo>` or the
+   `github:owner/repo` shorthand only — plaintext `http://` is refused,
+   never accepted as a synonym. Owner and repository components MUST be
+   strict slugs (`[A-Za-z0-9._-]`, no `.`/`..`/traversal): they are joined
+   into download URLs and persisted into state verbatim.
 
 ### 1.2 Roles and install policy
 
@@ -93,12 +98,18 @@ Every GitHub release that ynpm can install publishes a machine-readable
   `--version` with a string CONTAINING the release version before anything
   is published.
 - A `desktop`/`seed` artifact with no bins MUST ship a `version_probe`:
-  a file inside the archive whose bytes contain the release version.
-  Pure bundles have no bin to interrogate; the probe is the contract the
-  release pipeline satisfies (e.g. ship `yggterm/version` inside the
-  bundle).
+  a file inside the archive whose bytes NAME the release version as an
+  exact whitespace-delimited token. Substring containment is NOT enough —
+  a probe reading `14.0.0` or `4.0.0-rc1` must not validate a `4.0.0`
+  release. Pure bundles have no bin to interrogate; the probe is the
+  contract the release pipeline satisfies (e.g. ship `yggterm/version`
+  inside the bundle).
 - `web` and `mobile` artifacts are shape-validated only; their
   verification belongs to the plane that delivers them.
+- A `desktop` package MUST NOT declare a reserved seed bin
+  (`ygg`, `ynpm`, `ynpx`): seed binaries have exactly one owner (§5), and
+  a desktop claim on them would overwrite the seed's link and be torn out
+  by a later desktop removal. The manifest is refused at validation.
 
 ## 2. The install transaction
 
@@ -109,10 +120,14 @@ package, `--dest <dir>` overrides the publication destination):
 1. Resolve the release: explicit tag, else the `releases/latest` redirect.
 2. Fetch and validate `release-manifest.json` from that tag's assets; the
    manifest tag must equal the resolved tag.
-3. Select packages: `--package <id>`, else the single seed/desktop
-   package carrying this host's platform. Zero candidates → an honest
-   refusal listing what the release DOES ship per platform. Multiple → a
-   refusal asking for `--package`.
+3. Select packages: `--package <id>`, else the single DESKTOP package
+   carrying this host's platform — unattended selection is desktop-only.
+   A seed package is never installed through this transaction (one policy
+   owner, §5): explicit `--package <seed-id>` refuses naming
+   `seed-activate`, and a release with no desktop candidate refuses
+   listing what it DOES ship, with the same pointer when it carries seed
+   packages. Multiple desktop candidates → a refusal asking for
+   `--package`.
 4. Download the selected artifact(s) to disk-backed scratch
    (`~/.yggterm/scratchpad/ynpm`, never /tmp).
 5. Verify the exact sha256 (and declared size) BEFORE extraction.
@@ -151,7 +166,11 @@ Refusals happen BEFORE extraction, deterministically, from the listing:
   extraction root (a link is kept or refused as spelled, never resolved
   against the live filesystem);
 - hard links and exotic entries: refused outright — release archives
-  carry plain files, directories and relative symlinks only;
+  carry plain files, directories and relative symlinks only. Link
+  detection reads the listing MODE token (`l…` symlink, `h…` GNU
+  hardlink), never the name: a plain file whose path contains ` -> ` is a
+  file, and a link spelled without a visible target is unguardable and
+  refused;
 - an archive whose `tar -tvzf` listing cannot be parsed line-for-line is
   REFUSED (GNU tar fleet-wide; bsdtar line shapes accepted for macOS) —
   a listing we cannot read is a listing we cannot guard;
@@ -170,8 +189,8 @@ residual, stated, not assumed-away.
 | platform | declared | exercised by this lane |
 |---|---|---|
 | linux-x64 / linux-arm64 tar.gz | yes | YES — full transaction tested with real tar fixtures |
-| macos-x64 / macos-arm64 tar.gz (`.app` bundle) | yes | schema + listing parser tested (bsdtar line shapes, bundle checks); LIVE macOS installation is NOT tested from this Linux lane |
-| windows-x64 / windows-arm64 zip | yes (schema) | schema validation + `unzip -l` guard tested; live Windows install untested; bundle publication on Windows is explicitly UNSHIPPED (needs symlink support) |
+| macos-x64 / macos-arm64 tar.gz (`.app` bundle) | yes | schema + listing parser tested (bsdtar line shapes, bundle checks); a bundle-shaped archive whose only entry IS the bundle keeps its extraction root; LIVE macOS installation is NOT tested from this Linux lane |
+| windows-x64 / windows-arm64 zip | yes (schema) | schema validation + `unzip -l` guard tested; live Windows install untested; bundle publication AND `seed-activate` are explicitly UNSHIPPED on Windows — the unix `current` flip is a staged-symlink rename, the windows pointer (junction flip) is not qualified, and seed activation refuses before any byte moves instead of copying a generation directory onto `current` |
 | android-arm64 apk / ios-arm64 ipa | handoff only | never installed; handoff message tested |
 
 macOS/Windows GUI packaging capability is therefore DECLARED and
@@ -199,6 +218,21 @@ Re-running with the same version+digest is an idempotent `already-active`.
 Any failure before the flip leaves the previous generation in charge.
 Alias/PATH wiring (`~/.local/bin`) stays with the installer, which
 receives the generation path (human or `--json` output).
+
+**Generation layout contract (one contract for installer + ynpm):** the
+generation directory is
+`<seed-root>/generations/<version>-<digest12>/` where `digest12` is the
+first 12 hex of the ARCHIVE digest; each declared bin lands at
+`<generation>/bin/<bin>` (the declared archive-root bins are moved into
+the generation `bin/` table at staging, exactly like the desktop
+transaction); any remaining archive content (docs, bundle) stays at the
+generation root. A complete existing generation is KEPT (idempotent
+repoint); an incomplete or corrupt one is replaced wholesale, never
+trusted and flipped onto `current`. The flip is the LAST write: on unix
+it is a staged-symlink rename and is atomic; no multi-link rollback or
+crash-consistency is implied beyond that — earlier failures leave the
+previous generation in charge, and alias/PATH wiring is the installer's
+own step.
 
 This matches the parent proposal's
 `~/.yggterm/seed/generations/<version>-<digest>` layout with one
