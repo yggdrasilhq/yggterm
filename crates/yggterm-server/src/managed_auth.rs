@@ -242,9 +242,31 @@ pub fn run_preflight(script: &Path, harness: &str) -> PreflightProbe {
             Err(error) => return PreflightProbe::Unavailable(format!("wait failed: {error}")),
         }
     }
-    if let Some(mut pipe) = child.stdout.take() {
+    if let Some(pipe) = child.stdout.take() {
         use std::io::Read;
-        let _ = pipe.read_to_end(&mut stdout);
+        use std::sync::mpsc;
+        // The deadline must cover draining stdout too, not only the child's
+        // exit: a descendant that inherits the pipe (the helper spawned a
+        // child of its own) holds the write end open, and an unbounded
+        // `read_to_end` would block the daemon launch path past the deadline.
+        // The reader thread is abandoned, never killed — dropping its pipe end
+        // closes our descriptor and the reaper owns the descendant.
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut pipe = pipe;
+            let mut drained = Vec::new();
+            let _ = pipe.read_to_end(&mut drained);
+            let _ = sender.send(drained);
+        });
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match receiver.recv_timeout(remaining) {
+            Ok(bytes) => stdout = bytes,
+            Err(_) => {
+                return PreflightProbe::Unavailable(
+                    "preflight timed out reading stdout".to_string(),
+                );
+            }
+        }
     }
     match parse_receipt(&String::from_utf8_lossy(&stdout)) {
         Some(receipt) if receipt.is_ready() => PreflightProbe::Ready(receipt),
@@ -270,15 +292,48 @@ pub enum AuthLaunchPlan {
     Refuse { reason: String },
 }
 
+/// The marker every refusal invocation carries, and the one test a wrapper
+/// needs before it appends its own tokens: a refused launch runs nothing, so
+/// suffixes must not ride after `exit 86` (bash would fail the line with
+/// `exit: too many arguments` and the promised status 86 is lost).
+pub const REFUSAL_MARKER: &str = "yggterm managed-auth refused this launch:";
+
+/// True when `command` is a managed-auth refusal line rather than a launch.
+pub fn is_refusal_invocation(command: &str) -> bool {
+    command.contains(REFUSAL_MARKER)
+}
+
 /// The composed refusal line. `86` is deliberately not a CLI exit code a
 /// caller would mistake for the CLI's own verdict — the row shows the reason
 /// and stops.
 pub fn refusal_invocation(reason: &str) -> String {
     format!(
         "printf '%s\\n' {} >&2; exit 86",
-        crate::shell_single_quote(&format!(
-            "yggterm managed-auth refused this launch: {reason}"
-        ))
+        crate::shell_single_quote(&format!("{REFUSAL_MARKER}{reason}"))
+    )
+}
+
+/// The legacy-downgrade guard for the three `legacy_agent_launch_command`
+/// fallback sites. A composition failure that happens BEFORE the auth gate
+/// runs (an invalid launch option, an unresolvable descriptor) must not
+/// downgrade to the unauthenticated legacy launch under Enforce — the
+/// downgrade IS the bypass. Off and Observe keep the historical fallback
+/// byte-identically; a CLI with no auth plane is never gated in any mode.
+/// Under Enforce the fallback becomes a visible refusal, composed here as an
+/// `Ok` string exactly like every other refusal — never an `Err`, which the
+/// fallback would downgrade again.
+pub fn guard_legacy_downgrade(kind: yggterm_core::SessionKind, fallback_command: String) -> String {
+    if configured_mode() != ManagedAuthMode::Enforce {
+        return fallback_command;
+    }
+    let gated = crate::managed_cli::ManagedCliTool::from_session_kind(kind)
+        .and_then(auth_harness_for)
+        .is_some();
+    if !gated {
+        return fallback_command;
+    }
+    refusal_invocation(
+        "managed-auth enforce: launch composition failed before the auth gate; refusing rather than downgrading to an unauthenticated legacy launch",
     )
 }
 

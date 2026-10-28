@@ -13978,18 +13978,21 @@ impl YggtermServer {
             configured_extra_args,
             Some(&start_carried_identity_exports),
         );
-        let launch_command = if kind == SessionKind::ClaudeCode {
-            composed
-                .map(|command| format!("{command} --session-id {}", shell_single_quote(session_id)))
-                .unwrap_or_else(|_| {
-                    format!(
-                        "{} --session-id {}",
-                        legacy_agent_launch_command(kind, cwd, None),
-                        shell_single_quote(session_id)
-                    )
-                })
-        } else {
-            composed.unwrap_or_else(|_| legacy_agent_launch_command(kind, cwd, None))
+        let launch_command = {
+            let base = composed.unwrap_or_else(|_| {
+                managed_auth::guard_legacy_downgrade(
+                    kind,
+                    legacy_agent_launch_command(kind, cwd, None),
+                )
+            });
+            // A refusal launches nothing: the `--session-id` suffix must not
+            // ride after its `exit 86` (bash `exit: too many arguments` would
+            // return 1 instead of the promised 86).
+            if kind != SessionKind::ClaudeCode || managed_auth::is_refusal_invocation(&base) {
+                base
+            } else {
+                format!("{base} --session-id {}", shell_single_quote(session_id))
+            }
         };
         let home = self
             .yggterm_home
@@ -39506,7 +39509,12 @@ fn agent_launch_command_with_options_and_identity(
         None,
         carried_identity_exports,
     )
-    .unwrap_or_else(|_| legacy_agent_launch_command(kind, cwd, session_id))
+    .unwrap_or_else(|_| {
+        managed_auth::guard_legacy_downgrade(
+            kind,
+            legacy_agent_launch_command(kind, cwd, session_id),
+        )
+    })
 }
 
 /// A FRESH Claude Code session must be BORN with its identity: launch
@@ -39541,17 +39549,21 @@ fn claude_code_fresh_launch_command_with_identity(
     launch: &AgentLaunchOptions,
     carried_identity_exports: Option<&[String]>,
 ) -> String {
-    format!(
-        "{} --session-id {}",
-        agent_launch_command_with_options_and_identity(
-            SessionKind::ClaudeCode,
-            cwd,
-            None,
-            launch,
-            carried_identity_exports
-        ),
-        shell_single_quote(session_id)
-    )
+    let composed = agent_launch_command_with_options_and_identity(
+        SessionKind::ClaudeCode,
+        cwd,
+        None,
+        launch,
+        carried_identity_exports,
+    );
+    // A refused launch runs nothing, so the identity suffix must not ride
+    // after the refusal's `exit 86` — bash would fail the line with `exit:
+    // too many arguments` and return 1 instead of the promised 86.
+    if managed_auth::is_refusal_invocation(&composed) {
+        composed
+    } else {
+        format!("{} --session-id {}", composed, shell_single_quote(session_id))
+    }
 }
 
 fn persistent_agent_resume_command(
@@ -39617,7 +39629,12 @@ fn persistent_agent_resume_command_with_terminal_appearance_configured_with_iden
         configured_extra_args,
         carried_identity_exports,
     )
-    .unwrap_or_else(|_| legacy_agent_launch_command(kind, cwd, Some(session_id)))
+    .unwrap_or_else(|_| {
+        managed_auth::guard_legacy_downgrade(
+            kind,
+            legacy_agent_launch_command(kind, cwd, Some(session_id)),
+        )
+    })
 }
 
 /// Whether a LOCAL Claude Code session can actually be resumed — i.e. CC wrote its
@@ -40867,6 +40884,129 @@ mod tests {
             elapsed < std::time::Duration::from_secs(10),
             "the bound must actually bound: took {elapsed:?}"
         );
+    }
+
+    /// Run `body` with `YGGTERM_HOME` pointed at a throwaway store configured
+    /// for managed-auth Enforce with a script path that does not exist — the
+    /// state an Enforce host is in before its operator provisions ygg-auth.py.
+    fn with_enforce_missing_script<R>(
+        body: impl FnOnce() -> R,
+    ) -> R {
+        let home = std::env::temp_dir().join(format!(
+            "ygg-mauth-enforce-{}-{}",
+            std::process::id(),
+            std::time::UNIX_EPOCH.elapsed().unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        let previous = std::env::var_os("YGGTERM_HOME");
+        unsafe { std::env::set_var("YGGTERM_HOME", &home) };
+        let store = SessionStore::open_or_init().unwrap();
+        let mut settings = store.load_settings().unwrap();
+        settings.managed_auth_mode = "enforce".to_owned();
+        settings.managed_auth_script = home.join("absent-ygg-auth.py").display().to_string();
+        assert!(!std::path::Path::new(&settings.managed_auth_script).exists());
+        store.save_settings(&settings).unwrap();
+        let result = body();
+        unsafe { restore_env_var("YGGTERM_HOME", previous) };
+        std::fs::remove_dir_all(&home).ok();
+        result
+    }
+
+    /// Y4-MAUTH-002 (editor round r2): a helper that prints its receipt and
+    /// exits while a DESCENDANT keeps the stdout pipe open must not hold the
+    /// daemon launch path past the preflight deadline — the drain is bounded
+    /// and answers Unavailable, and the descendant is abandoned, not killed.
+    #[test]
+    #[cfg(unix)]
+    fn the_preflight_deadline_covers_stdout_after_parent_exit() {
+        let dir = std::env::temp_dir().join(format!(
+            "ygg-mauth-drain-{}-{}",
+            std::process::id(),
+            std::time::UNIX_EPOCH.elapsed().unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let helper = dir.join("pipe-holder.py");
+        std::fs::write(
+            &helper,
+            "import subprocess,sys\nsubprocess.Popen([sys.executable,'-c','import time; time.sleep(4)'])\nprint('{\"outcome\":\"ready\"}', flush=True)\n",
+        )
+        .unwrap();
+        let started = std::time::Instant::now();
+        let probe = managed_auth::run_preflight(&helper, "codex");
+        let elapsed = started.elapsed();
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(
+            elapsed < std::time::Duration::from_secs(3),
+            "the 2s preflight deadline must cover draining stdout: took {elapsed:?}"
+        );
+        assert!(
+            matches!(probe, managed_auth::PreflightProbe::Unavailable(_)),
+            "a drain past the deadline must answer Unavailable, got {probe:?}"
+        );
+    }
+
+    /// Y4-MAUTH-003 (editor round r2): appending `--session-id` after a
+    /// refusal's `exit 86` made bash fail the line with `exit: too many
+    /// arguments` and return 1 instead of the promised 86. A refused launch
+    /// runs nothing, so the fresh-Claude identity suffix must be dropped.
+    #[test]
+    #[cfg(unix)]
+    fn a_fresh_claude_refusal_keeps_exit_86_without_a_trailing_session_id() {
+        with_enforce_missing_script(|| {
+            let command = claude_code_fresh_launch_command_with_options(
+                None,
+                "00000000-0000-0000-0000-000000000000",
+                &AgentLaunchOptions::default(),
+            );
+            assert!(
+                managed_auth::is_refusal_invocation(&command),
+                "a missing script must refuse, got {command}"
+            );
+            assert!(
+                !command.contains("--session-id"),
+                "the identity suffix must not ride a refusal: {command}"
+            );
+            let output = std::process::Command::new("bash")
+                .args(["-c", &command])
+                .output()
+                .unwrap();
+            assert_eq!(
+                output.status.code(),
+                Some(86),
+                "the refusal must keep its status: {command}"
+            );
+        });
+    }
+
+    /// Y4-MAUTH-004 (editor round r2): a composition failure that happens
+    /// BEFORE the auth gate (an invalid launch option) must not downgrade to
+    /// the unauthenticated legacy launch under Enforce — the downgrade IS the
+    /// bypass. It must refuse visibly instead.
+    #[test]
+    #[cfg(unix)]
+    fn a_composer_error_under_enforce_refuses_instead_of_downgrading() {
+        with_enforce_missing_script(|| {
+            let control = agent_launch_command_with_options(
+                SessionKind::Codex,
+                None,
+                None,
+                &AgentLaunchOptions::default(),
+            );
+            assert!(
+                managed_auth::is_refusal_invocation(&control),
+                "control: the missing script must refuse, got {control}"
+            );
+            let invalid = AgentLaunchOptions {
+                model: Some(" ".to_owned()),
+                ..Default::default()
+            };
+            let command =
+                agent_launch_command_with_options(SessionKind::Codex, None, None, &invalid);
+            assert!(
+                managed_auth::is_refusal_invocation(&command),
+                "enforce must not be bypassed by a composition failure: {command}"
+            );
+        });
     }
 
     /// ⛔ THE BRIDGE WATCHDOG MUST FIRE AND MUST BAIL BY NAME ([11.164 v2]).

@@ -5213,7 +5213,9 @@ mod tests {
         assert_eq!(round_tripped, original);
 
         // A settings file from a build WITHOUT these keys parses to Off/empty.
-        let legacy = serde_json::json!({"theme_mode": "dark"});
+        // `zed_dark`, not `dark` — ThemeMode has no bare `dark` variant, and a
+        // fixture the parser rejects proves nothing about the missing keys.
+        let legacy = serde_json::json!({"theme_mode": "zed_dark"});
         let parsed = parse_settings_value(&legacy).expect("legacy settings parse");
         assert_eq!(parsed.managed_auth_mode, "off");
         assert_eq!(parsed.managed_auth_script, "");
