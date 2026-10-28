@@ -107,6 +107,7 @@ pub mod cwdtree_ls;
 pub mod row_sanity;
 pub use row_sanity::{load_sweep_records, print_row_sanity_report, save_sweep_records};
 pub mod session_tenancy;
+pub mod worker_identity;
 pub mod transcript_view;
 mod row_order_ledger;
 mod terminal;
