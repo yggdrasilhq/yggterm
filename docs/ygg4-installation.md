@@ -10,20 +10,24 @@ into a repository.
 
 ## Bootstrap a fresh host
 
-Unix (Linux, macOS):
+Unix (Linux, macOS) — the seed is the DEFAULT entry; the 3.x channel is
+explicit:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/yggdrasilhq/yggterm/main/scripts/install.sh -o install.sh
-YGGTERM_SEED=1 sh install.sh            # or: sh install.sh seed
-YGGTERM_VERSION=vX.Y.Z sh install.sh seed   # pin an exact release
+sh install.sh                            # seed install (the default)
+YGGTERM_VERSION=vX.Y.Z sh install.sh     # pin an exact release
+YGGTERM_LEGACY=1 sh install.sh           # explicit 3.x direct/GUI channel
+                                         #   (same as: sh install.sh legacy)
 ```
 
-Windows (PowerShell, no Python and no GUI required):
+Windows (PowerShell, no Python and no GUI required) — same default:
 
 ```powershell
 Invoke-WebRequest https://raw.githubusercontent.com/yggdrasilhq/yggterm/main/scripts/install.ps1 -OutFile install.ps1
-./install.ps1 -Seed
-$env:YGGTERM_VERSION = "vX.Y.Z"; ./install.ps1 -Seed   # pin an exact release
+./install.ps1                            # seed install (the default; -Seed also selects it)
+$env:YGGTERM_VERSION = "vX.Y.Z"; ./install.ps1   # pin an exact release
+./install.ps1 -Legacy                    # explicit 3.x direct/GUI channel
 ```
 
 Hosts that already run `ygg` skip the bootstrap script and use the manager
@@ -47,6 +51,13 @@ ygg ynpm install https://github.com/yggdrasilhq/yggterm
   `~/.yggterm/seed/generations/<version>-<digest12>` and only then does the
   `current` symlink flip atomically. A failure leaves the previous
   generation in charge.
+- **One launch pointer.** Native ynpm is the only writer of
+  `~/.yggterm/seed/active.json` (schema 1: generation name plus exact bin
+  sha256 digests), published whole by temp+rename. The bootstrap launchers
+  (`ygg --seed-launch`, mirrors under `launchers/`) read that pointer,
+  enforce the hash gate and refuse self-recursion, and resolve BEFORE any
+  installed command IR — an older launcher forwards to a newer generation
+  it has never seen. See `crates/ygg-cli/src/seed_launcher.rs`.
 - **Rollback.** Previous generations are never deleted; re-activate the
   previous seed archive (or `ynpm rollback`) to go back.
 - **Windows running binaries.** Publication copies are staged and swapped;

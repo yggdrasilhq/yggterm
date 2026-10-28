@@ -6,6 +6,7 @@ mod dispatch;
 mod grammar;
 mod ir;
 mod payload;
+mod seed_launcher;
 
 use grammar::{ParseOutcome, ArgValue};
 use std::io::Write as _;
@@ -36,6 +37,14 @@ fn main() -> ExitCode {
 }
 
 fn run(mut argv: Vec<String>) -> Result<u32, String> {
+    // The seed front launcher is a bootstrap surface that resolves its
+    // target BEFORE any installed IR loads: an older launcher generation
+    // must forward to a newer seed generation whose command contract it
+    // has never seen, not reject it through the IR gate below.
+    if argv.first().map(|s| s.as_str()) == Some("--seed-launch") {
+        return seed_launcher::launch(&argv[1..]);
+    }
+
     let loaded = ir::load().map_err(|e| format!("{e}"))?;
 
     if argv.first().map(|s| s.as_str()) == Some("--version") {

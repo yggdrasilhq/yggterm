@@ -132,15 +132,16 @@ publish_aux_link() {
 }
 
 # ------------------------------------------------------------- ygg4 seed path
-# The GUI-free seed install is selected EXPLICITLY (`install.sh seed` or
-# YGGTERM_SEED=1). The default flow below stays the 3.x direct/GUI installer
-# so every older release keeps its documented behavior. The seed path never
-# touches the direct/GUI install root, never starts a daemon, and delegates
-# the entire staging/publication/rollback transaction to `ynpm
-# seed-activate`; this script only fetches verified bytes and publishes the
-# command links afterwards.
+# The GUI-free seed install is the DEFAULT 4.0 entry. The 3.x direct/GUI
+# installer stays available EXPLICITLY (`install.sh legacy` or
+# YGGTERM_LEGACY=1) for version compatibility and is never removed. The
+# seed path never touches the direct/GUI install root, never starts a
+# daemon, and delegates the entire staging/publication/rollback transaction
+# to `ynpm seed-activate`; this script only fetches verified bytes and
+# publishes the command links afterwards.
 seed_requested() {
-  [ "${YGGTERM_SEED:-0}" = "1" ] || [ "${1:-}" = "seed" ]
+  # Seed by default; the 3.x channel only by explicit operator intent.
+  ! { [ "${YGGTERM_LEGACY:-0}" = "1" ] || [ "${1:-}" = "legacy" ]; }
 }
 
 seed_link_is_ours() {

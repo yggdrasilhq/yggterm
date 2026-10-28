@@ -39,10 +39,12 @@ implemented command contract. A documented target is not a shipped capability.
 
 The **4.0 installation contract** is a verified user-space CLI generation,
 with local help and explicit capability readiness. GUI installation and paid
-autonomy are separate operations. The installer/artifact cutover is not yet
-qualified; the existing scripts below still describe the 3.x compatibility
-channel until that work lands. They must not be used as proof of a CLI-only
-4.0 installation.
+autonomy are separate operations. The two entries below install the **ygg4
+seed by default**. The 3.x direct/GUI channel remains available explicitly
+(`install.sh legacy` or `YGGTERM_LEGACY=1`; `install.ps1 -Legacy` or
+`YGGTERM_LEGACY=1`) and is never removed. The 4.0 qualification workflow is
+still landing; these entries must not be cited as proof of a qualified
+4.0 release.
 
 Unix install entry:
 

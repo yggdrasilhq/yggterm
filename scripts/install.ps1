@@ -1,6 +1,7 @@
 param(
   [string]$Repo = $(if ($env:YGGTERM_REPO) { $env:YGGTERM_REPO } else { "yggdrasilhq/yggterm" }),
   [string]$InstallRoot = $(if ($env:YGGTERM_INSTALL_ROOT) { $env:YGGTERM_INSTALL_ROOT } else { Join-Path $env:LOCALAPPDATA "Yggterm" }),
+  [switch]$Legacy,
   [switch]$Seed
 )
 
@@ -8,12 +9,14 @@ $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
 
 # ------------------------------------------------------------- ygg4 seed path
-# The GUI-free seed install is selected EXPLICITLY (-Seed or YGGTERM_SEED=1).
-# The default flow below stays the 3.x direct/GUI installer. The seed path
-# never touches the direct/GUI install root, never starts a daemon, needs
-# no Python and no GUI, and delegates the staging/publication transaction
-# to `ynpm seed-activate` extracted from the verified archive itself.
-if ($Seed -or $env:YGGTERM_SEED -eq "1") {
+# The GUI-free seed install is the DEFAULT 4.0 entry (-Seed still selects
+# it). The 3.x direct/GUI installer stays available EXPLICITLY (-Legacy or
+# YGGTERM_LEGACY=1) for version compatibility and is never removed. The
+# seed path never touches the direct/GUI install root, never starts a
+# daemon, needs no Python and no GUI, and delegates the staging/publication
+# transaction to `ynpm seed-activate` extracted from the verified archive
+# itself.
+if (-not ($Legacy -or $env:YGGTERM_LEGACY -eq "1")) {
   $seedRoot = if ($env:YGGTERM_SEED_ROOT) { $env:YGGTERM_SEED_ROOT } else { Join-Path $env:USERPROFILE ".yggterm\seed" }
   $seedDist = $env:YGGTERM_SEED_DIST
   $scratchRoot = if ($env:YGGTERM_INSTALL_SCRATCH) { $env:YGGTERM_INSTALL_SCRATCH } else { Join-Path $env:USERPROFILE ".yggterm\scratchpad\ygg4-install" }
