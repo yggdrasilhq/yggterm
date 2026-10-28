@@ -36,8 +36,9 @@ looking at a screen.
   gauge exists to make the relay land with runway — ~300k tokens on a 1M window —
   never to squeeze the last 3% out of a context.
 
-⛔ IT NEVER FAILS A SESSION. Every path exits 0, and anything unexpected exits 0
-  silently. A gauge that can break the thing it measures is worse than no gauge.
+Hook mode never fails a session. Explicit CLI --report failures must remain
+visible: the native Codex reader reports unknown/exit 3 rather than guessing
+another session or silently returning a healthy-looking success.
 
 ⛔ IT IS SILENT BELOW `NOTICE`. A warning printed on every turn is read on none.
 
@@ -77,9 +78,18 @@ ZCODE_ROLLOUT = HOME / ".zcode" / "cli" / "rollout"
 # is not needed because AutoClaw names the file after the session.
 AUTOCLAW_CONFIGS = tuple(sorted((HOME / ".config").glob("AutoClaw*")))
 
-NOTICE = int(os.environ.get("CTX_NOTICE", "55"))
-LAND = int(os.environ.get("CTX_LAND", "70"))
-CRITICAL = int(os.environ.get("CTX_CRITICAL", "85"))
+_THRESHOLD_ERROR = False
+NOTICE, LAND, CRITICAL = 55, 70, 85
+try:
+    NOTICE, LAND, CRITICAL = (int(os.environ.get("CTX_NOTICE", "55")),
+                             int(os.environ.get("CTX_LAND", "70")),
+                             int(os.environ.get("CTX_CRITICAL", "85")))
+    if not 0 <= NOTICE < LAND < CRITICAL <= 100:
+        raise ValueError("invalid threshold order/range")
+except ValueError:
+    # Keep module import/hook nonfatal; main refuses to use fallback values
+    # for an explicit reading. Never leak an arbitrary environment value.
+    _THRESHOLD_ERROR = True
 
 # ⚠ Read from the END. These transcripts reach 6 MB and this runs on every prompt;
 #   a full parse would put a visible pause in front of every thing the owner types.
@@ -395,6 +405,150 @@ def verdict(pct, notice=None, land=None, critical=None):
     return "OK"
 
 
+def codex_usage(session_id, codex_home=None):
+    """Read only an exact session's native counter; never a latest-file guess.
+
+    Input already contains cached input. The native context window is
+    mandatory: cumulative account usage and model-name window guesses are
+    not substitutes. Offsets/hashes bind the reported counter to its record.
+    """
+    import hashlib
+    import uuid
+    session_id = str(uuid.UUID(session_id))
+    root = Path(codex_home or os.environ.get("CODEX_HOME") or HOME / ".codex")
+    candidates = set()
+    for directory in (root / "sessions", root / "archived_sessions"):
+        if directory.is_dir():
+            candidates.update(p.resolve() for p in directory.glob(f"**/*{session_id}.jsonl"))
+    if len(candidates) != 1:
+        raise ValueError("missing_or_ambiguous_exact_codex_rollout")
+    path = candidates.pop()
+    with path.open("rb") as source:
+        header = json.loads(source.readline(1048576))
+        if (not isinstance(header, dict) or header.get("type") != "session_meta"
+                or not isinstance(header.get("payload"), dict) or header["payload"].get("id") != session_id):
+            raise ValueError("codex_rollout_identity_mismatch")
+        size = path.stat().st_size
+        start = max(0, size - 8388608)
+        source.seek(start)
+        if start:
+            source.readline()  # known partial first line, never a record
+        offset = source.tell()
+        blob = source.read(8388608)
+    used = cached = window = None
+    usage_offset = window_offset = None
+    usage_hash = window_hash = None
+    observed_at = None
+    primary = None
+    for raw in blob.splitlines(keepends=True):
+        at = offset
+        offset += len(raw)
+        if not raw.strip():
+            continue
+        try:
+            record = json.loads(raw)
+        except ValueError as exc:
+            raise ValueError("codex_rollout_tail_corrupt_or_partial") from exc
+        if not isinstance(record, dict):
+            raise ValueError("codex_rollout_record_shape_invalid")
+        payload = record.get("payload")
+        if not isinstance(payload, dict):
+            raise ValueError("codex_rollout_payload_shape_invalid")
+        if record.get("type") == "event_msg" and payload.get("type") == "token_count":
+            info = payload.get("info")
+            if not isinstance(info, dict):
+                used = window = None
+                continue
+            reported = info.get("model_context_window")
+            if type(reported) is int and reported > 0:
+                window, window_offset = reported, at
+                window_hash = hashlib.sha256(raw).hexdigest()
+            else:
+                window = window_offset = window_hash = None
+            usage = info.get("last_token_usage") or {}
+            if not isinstance(usage, dict):
+                used = None
+                continue
+            value = usage.get("input_tokens")
+            used = value if type(value) is int and value >= 0 else None
+            cached = usage.get("cached_input_tokens")
+            usage_offset, usage_hash = at, hashlib.sha256(raw).hexdigest()
+            observed_at = record.get("timestamp")
+        elif record.get("type") == "token_usage_record":
+            usage = payload.get("usage") or {}
+            if not isinstance(usage, dict):
+                primary = (None, None, at, hashlib.sha256(raw).hexdigest(), record.get("timestamp"))
+                continue
+            value = usage.get("input_tokens")
+            primary = (value if type(value) is int and value >= 0 else None,
+                       usage.get("cached_input_tokens"), at,
+                       hashlib.sha256(raw).hexdigest(), record.get("timestamp"))
+    if primary is not None:
+        # The per-request record owns input; token_count supplies the window.
+        # A later summary must not replace the native input with an aggregate.
+        used, cached, usage_offset, usage_hash, observed_at = primary
+    elif start:
+        raise ValueError("codex_primary_usage_not_found_in_bounded_tail")
+    if used is None or window is None:
+        raise ValueError("codex_native_input_or_window_unavailable")
+    if used > 2**64 - 1 or window > 2**64 - 1:
+        raise ValueError("codex_native_counter_outside_wire_range")
+    if cached is not None and (type(cached) is not int or not 0 <= cached <= used):
+        raise ValueError("codex_cached_counter_inconsistent")
+    return {"session": session_id, "cli": "codex", "quality": "verified",
+            "measurement_kind": "native-context-input",
+            "usage_record_kind": "token_usage_record" if primary is not None else "legacy-token-count",
+            "used": used, "window": window, "cached_input_tokens": cached,
+            "cache_included_in_input": True, "window_assumed": False,
+            "source": str(path), "usage_record_offset": usage_offset,
+            "usage_record_sha256": usage_hash, "window_record_offset": window_offset,
+            "window_record_sha256": window_hash, "observed_at": observed_at,
+            "footer_crosscheck": "unavailable-not-probed"}
+
+
+def run_codex(session_id, report=False, as_json=False, used_override=None, window_override=None):
+    import datetime
+    strict_report = report or as_json
+    try:
+        if used_override is not None or window_override is not None:
+            raise ValueError("codex_overrides_are_not_native_measurements")
+        result = codex_usage(session_id)
+        result["pct"] = round(100 * result["used"] / result["window"], 2)
+        result["verdict"] = verdict(result["pct"])
+        result["dead"] = None  # context occupancy is not execution liveness
+    except (ValueError, OSError, TypeError, OverflowError) as exc:
+        result = {"session": session_id, "cli": "codex", "quality": "unknown",
+                  "used": None, "window": None, "pct": None, "verdict": "UNKNOWN",
+                  "error": str(exc).splitlines()[0][:160], "window_assumed": False}
+    result["sampled_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    # CLI publication must be observable and atomic. Hook failure remains
+    # nonfatal, but a failed --report cannot be a silent successful reading.
+    try:
+        import uuid
+        destination_id = str(uuid.UUID(session_id))
+        PUBLISH.mkdir(parents=True, exist_ok=True)
+        path = PUBLISH / f"{destination_id}.json"
+        temp = PUBLISH / f".{destination_id}.{os.getpid()}.tmp"
+        temp.write_text(json.dumps(result, allow_nan=False))
+        os.replace(temp, path)
+        if json.loads(path.read_text()) != result:
+            raise ValueError("codex_gauge_publication_readback_mismatch")
+    except (ValueError, OSError):
+        if strict_report:
+            print("gauge: UNKNOWN — Codex publication failed", file=sys.stderr)
+            return 3
+    if as_json:
+        print(json.dumps(result))
+    elif report or result["verdict"] not in ("OK", "UNKNOWN"):
+        if result["quality"] == "unknown":
+            print("gauge: UNKNOWN — " + result["error"], file=sys.stderr)
+        else:
+            print(f"CONTEXT GAUGE — {result['pct']}% ({result['used']:,}/{result['window']:,}) "
+                  f"Codex native input/window; cached input already included. {result['verdict']}. "
+                  "Footer cross-check not probed.")
+    return 3 if strict_report and result["quality"] == "unknown" else 0
+
+
 # ⚠ The wording is deliberately an INSTRUCTION, not a statistic. "context 72%" is a
 #   number an agent can note and ignore; "stop taking new work" is a thing it either
 #   did or did not do, and the next session can tell which from the transcript.
@@ -663,6 +817,13 @@ def run_antigravity(session_id: str, report: bool, used_override=None, window_ov
 def main():
     argv = sys.argv[1:]
     report = "--report" in argv
+    if _THRESHOLD_ERROR:
+        if "--json" in argv:
+            print(json.dumps({"quality":"unknown","verdict":"UNKNOWN",
+                              "error":"invalid_threshold_configuration"}))
+        elif report:
+            print("gauge: UNKNOWN — invalid threshold configuration",file=sys.stderr)
+        return 3 if report or "--json" in argv else 0
     cli = "claude"
     if "--cli" in argv:
         try:
@@ -681,6 +842,27 @@ def main():
             window_override = int(argv[argv.index("--window") + 1])
         except (IndexError, ValueError):
             pass
+    if cli == "codex":
+        # This new adapter has an explicit contract, including refusal of
+        # guessed overrides and unknown flags. Legacy hook modes are unchanged.
+        i = 0
+        while i < len(argv):
+            flag = argv[i]
+            if flag in ("--report", "--json"):
+                i += 1
+            elif flag in ("--cli", "--session") and i + 1 < len(argv) and not argv[i + 1].startswith("--"):
+                i += 2
+            else:
+                print("gauge: invalid Codex report arguments", file=sys.stderr)
+                return 2
+        session_id = None
+        if "--session" in argv:
+            try:
+                session_id = argv[argv.index("--session") + 1]
+            except IndexError:
+                pass
+        session_id = session_id or os.environ.get("CODEX_THREAD_ID") or "unknown"
+        return run_codex(session_id, report, "--json" in argv, used_override, window_override)
     if cli == "autoclaw":
         session_id = None
         if "--session" in argv:
@@ -844,7 +1026,9 @@ def run_autoclaw(session_id: str, report: bool, used_override=None, window_overr
 if __name__ == "__main__":
     try:
         sys.exit(main())
-    except Exception:
-        # ⛔ Silence, and exit 0. See the header: this must never be able to break a
-        #    session, and a traceback on stdout would be injected into the context.
+    except Exception as exc:
+        if "--report" in sys.argv or "--json" in sys.argv:
+            print("gauge: UNKNOWN — report failed (" + type(exc).__name__ + ")", file=sys.stderr)
+            sys.exit(3)
+        # A hook must not break its session or inject a traceback into context.
         sys.exit(0)
