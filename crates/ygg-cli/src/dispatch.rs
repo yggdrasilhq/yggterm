@@ -38,7 +38,7 @@ fn home_bin(name: &str) -> Option<PathBuf> {
     std::env::var("HOME")
         .ok()
         .filter(|h| !h.trim().is_empty())
-        .map(|h| Path::new(&h).join(".local/bin").join(name))
+        .and_then(|h| first_existing(&Path::new(&h).join(".local/bin"), name))
 }
 
 /// Candidate names for an executable on this platform: the exact declared
@@ -235,7 +235,14 @@ pub fn plan_query(loaded: &Loaded, path: &[String], args: &Args, rest: &[String]
     let mut candidates: Vec<PathBuf> = Vec::new();
     if let Ok(value) = std::env::var("YGG_INSPECT_BIN") {
         if !value.trim().is_empty() {
-            candidates.push(PathBuf::from(value));
+            let selected = PathBuf::from(value);
+            if !selected.is_file() {
+                return Dispatch::Refused(format!(
+                    "ygg: explicitly selected inspection adapter {} is unavailable; repair that generation or unset YGG_INSPECT_BIN",
+                    selected.display()
+                ));
+            }
+            candidates.push(selected);
         }
     }
     for dir in [root.join("components"), root.clone()] {
@@ -331,10 +338,10 @@ pub fn plan_remote(rest: &[String]) -> Result<Dispatch, String> {
         remote_argv.remove(0);
     }
     let Some(ssh) = find_on_path("ssh") else {
-        return Err(
+        return Ok(Dispatch::Refused(
             "ygg: ssh client unavailable on PATH; the remote-operator door needs an ssh client"
                 .into(),
-        );
+        ));
     };
     let argv: Vec<String> = vec!["--".into(), host.clone(), remote_command(&remote_argv)];
     Ok(Dispatch::Exec {
@@ -361,11 +368,7 @@ pub fn staged_snapshot_json(path: &[String], request_json: &str) -> String {
         .take(16)
         .collect();
     let source = path.join(".");
-    let findings_command = request_json
-        .split("\"command\": ")
-        .nth(1)
-        .and_then(|rest| rest.strip_suffix("}"))
-        .unwrap_or("[]");
+    let findings_command = python_style_list(path);
     format!(
         "{{\"schema_version\": 1, \"snapshot_id\": \"unavailable-{short}\", \"as_of\": null, \"config_hash\": null, \"coverage\": [{{\"source\": \"{source}\", \"quality\": \"unavailable\", \"reason\": \"adapter_not_implemented\"}}], \"items\": [], \"next_cursor\": null, \"findings\": [{{\"code\": \"ADAPTER_NOT_IMPLEMENTED\", \"command\": {findings_command}}}]}}"
     )
@@ -506,11 +509,7 @@ mod tests {
     #[test]
     fn wired_adapter_forwards_with_generation_identity() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let broken = ir::EMBEDDED_IR.replace(
-            "\"wired_adapters\": {}",
-            "\"wired_adapters\": {\"dream\": {\"adapter\": \"ygg-inspect.py\"}}",
-        );
-        let loaded = ir::finish(broken, ir::ContractSource::Embedded).expect("loads");
+        let loaded = ir::finish(ir::EMBEDDED_IR.to_string(), ir::ContractSource::Embedded).expect("loads");
         let bin_dir =
             std::env::temp_dir().join(format!("ygg-cli-adapter-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&bin_dir);
@@ -526,6 +525,8 @@ mod tests {
         let absent = plan_query(&loaded, &path, &Args::new(), &rest);
         std::fs::write(bin_dir.join("components").join("ygg-inspect.py"), "# adapter\n")
             .expect("adapter file");
+        let broken_override = plan_query(&loaded, &path, &Args::new(), &rest);
+        unsafe { std::env::remove_var("YGG_INSPECT_BIN") };
         let forwarded = plan_query(&loaded, &path, &Args::new(), &rest);
         unsafe {
             std::env::remove_var("YGG_INSPECT_BIN");
@@ -534,6 +535,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&bin_dir);
         // Declared but absent is an explicit refusal, never a staged empty.
         assert!(matches!(absent, Dispatch::Refused(_)), "{absent:?}");
+        assert!(matches!(broken_override, Dispatch::Refused(_)), "{broken_override:?}");
         match forwarded {
             Dispatch::Exec {
                 program,

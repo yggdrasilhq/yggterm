@@ -1070,7 +1070,7 @@
         "ygg-claim.sh"
       ],
       "strict": false,
-      "component": "orchestration"
+      "component": "claim_shell"
     },
     {
       "path": [
@@ -1317,7 +1317,7 @@
       ],
       "strict": false,
       "hidden": true,
-      "component": "orchestration"
+      "component": "claim_shell"
     },
     {
       "path": [
@@ -2208,7 +2208,6 @@
         "ygg-deliver.py",
         "ygg-fold.py",
         "ygg-land.py",
-        "ygg-claim.sh",
         "ygg-panic.py",
         "ygg-booter.py",
         "ygg-monitor.py",
@@ -2236,6 +2235,20 @@
       "interpreter": null,
       "owns": [
         "package generations, manifests and skill registry rows"
+      ]
+    },
+    "claim_shell": {
+      "runner": "ygg-claim.sh",
+      "aliases": [
+        "ygg-claim.sh"
+      ],
+      "resolution": [
+        "env_dir:YGG_BIN_DIR",
+        "payload:ygg-claim.sh"
+      ],
+      "interpreter": "bash",
+      "owns": [
+        "shell-based compatibility row claiming"
       ]
     }
   }

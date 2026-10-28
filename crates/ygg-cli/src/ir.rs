@@ -454,7 +454,8 @@ pub fn load() -> Result<Loaded, LoadError> {
     }
     if let Some(dir) = payload_dir() {
         let path = dir.join("commands.json");
-        if let Ok(bytes) = std::fs::read(&path) {
+        match std::fs::read(&path) {
+            Ok(bytes) => {
             let raw = String::from_utf8(bytes).map_err(|_| {
                 LoadError::Refused(format!(
                     "command contract at {} is not UTF-8; install a matching generation",
@@ -462,6 +463,12 @@ pub fn load() -> Result<Loaded, LoadError> {
                 ))
             })?;
             return finish(raw, ContractSource::File(path));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(LoadError::Refused(format!(
+                "installed command contract at {} is unreadable ({error}); repair the selected generation",
+                path.display()
+            ))),
         }
     }
     finish(EMBEDDED_IR.to_string(), ContractSource::Embedded)

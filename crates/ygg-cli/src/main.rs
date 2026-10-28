@@ -79,16 +79,6 @@ fn run(mut argv: Vec<String>) -> Result<u32, String> {
     if argv[0] == "board" && argv.len() > 1 && argv[1].starts_with('-') {
         argv.insert(1, "rows".into());
     }
-    // Native/component generation gate: an env-pinned contract hash must
-    // match the loaded bytes exactly, or nothing may execute.
-    if let Ok(expected) = std::env::var("YGG_COMMAND_CONTRACT_HASH") {
-        if !expected.is_empty() && expected != loaded.contract_hash {
-            eprintln!(
-                "ygg: native/component command contracts differ; install a matching generation"
-            );
-            return Ok(3);
-        }
-    }
     let parsed = match grammar::parse(&loaded, &argv) {
         ParseOutcome::Parsed { path, args, .. } => (path, args),
         ParseOutcome::PlannedFamily { message, .. } => {
@@ -102,6 +92,20 @@ fn run(mut argv: Vec<String>) -> Result<u32, String> {
     };
     let (path, args) = parsed;
     let node = &loaded.tree[&path];
+
+    // Local diagnostic reads remain available to repair a mismatched
+    // installation. Queries, dispatch and payload installation fail closed.
+    let diagnostic = matches!(node.record.handler.as_str(), "version" | "examples")
+        || (node.record.handler == "native"
+            && matches!(node.record.native.as_str(), "payload_manifest" | "payload_verify" | "docs"));
+    if !diagnostic {
+        if let Ok(expected) = std::env::var("YGG_COMMAND_CONTRACT_HASH") {
+            if !expected.is_empty() && expected != loaded.contract_hash {
+                eprintln!("ygg: native/component command contracts differ; install a matching generation");
+                return Ok(3);
+            }
+        }
+    }
 
     match node.record.handler.as_str() {
         "version" => {
