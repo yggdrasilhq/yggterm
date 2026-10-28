@@ -185,6 +185,36 @@ def read_events(root=None, since=None, until=None, subsystem=None, limit=2000):
     return rows[:limit]
 
 
+def _review_cited_snapshot_ids(reviews_dir=None, max_files=100):
+    """Snapshot IDs a sessionReview chain cites (subject_digest on
+    snapshot_staged rows). Retention never deletes evidence a review may
+    still be verifying; an unreadable reviews dir protects nothing extra but
+    never widens deletion — pruning stays age/bounded either way."""
+    base = Path(reviews_dir or os.environ.get("YGG_INSPECT_REVIEWS",
+                                              str(Path.home() / ".yggterm/swarm/reviews"))).expanduser()
+    cited = set()
+    try:
+        entries = sorted(base.glob("*.jsonl"))[:max_files]
+    except OSError:
+        return cited
+    for p in entries:
+        try:
+            with p.open("rb") as f:
+                raw = f.read(262144)
+        except OSError:
+            continue
+        for line in raw.splitlines():
+            try:
+                row = json.loads(line)
+            except Exception:
+                continue
+            if isinstance(row, dict) and row.get("kind") == "snapshot_staged":
+                d = row.get("subject_digest")
+                if isinstance(d, str) and re.fullmatch(r"[a-f0-9]{64}", d):
+                    cited.add(d)
+    return cited
+
+
 def prune(root=None, now=None, retention=None):
     """Bound the store: drop snapshots older than raw_days and monthly event
     partitions entirely past the window; then enforce the byte cap by
@@ -194,10 +224,15 @@ def prune(root=None, now=None, retention=None):
     cap = int(retention.get("max_store_bytes", 256 * 1024 * 1024))
     now = now if now else time.time()
     horizon = now - days * 86400
-    removed = {"snapshots": 0, "event_files": 0, "bytes": 0}
+    removed = {"snapshots": 0, "event_files": 0, "bytes": 0,
+               "protected_by_review": 0}
+    cited = _review_cited_snapshot_ids()
     d = snapshots_dir(root)
     if d.is_dir():
         for p in sorted(d.glob("*.json"), key=lambda q: q.stat().st_mtime):
+            if p.stem in cited:
+                removed["protected_by_review"] += 1
+                continue  # a review may still be verifying this snapshot
             if p.stat().st_mtime < horizon:
                 removed["bytes"] += p.stat().st_size
                 p.unlink(missing_ok=True)
@@ -206,6 +241,9 @@ def prune(root=None, now=None, retention=None):
         for p in sorted(d.glob("*.json"), key=lambda q: q.stat().st_mtime):
             if total <= cap:
                 break
+            if p.stem in cited:
+                removed["protected_by_review"] += 1
+                continue
             removed["bytes"] += p.stat().st_size
             total -= p.stat().st_size
             p.unlink(missing_ok=True)

@@ -106,7 +106,8 @@ def validate_frame(value):
                 or not all(isinstance(c.get(k), str) for k in ("source", "host", "kind"))):
             raise ValueError("invalid snapshot coverage record")
     allowed = {"dreams", "attempts", "services", "schedules", "plans", "events",
-               "heartbeat", "findings", "summary", "repairs", "workers"}
+               "heartbeat", "findings", "summary", "repairs", "workers",
+               "composer", "reviews"}
     if set(value["datasets"]) - allowed:
         raise ValueError("unenrolled snapshot dataset")
     if any(not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows)
@@ -243,6 +244,7 @@ def query(snapshot, path, args, now):
     until = boundary(args.get("until"), anchor, future=True)
     def row_time(r):
         return epoch(r.get("finished_at") or r.get("at") or r.get("updated_at")
+                     or r.get("last_at") or r.get("resolution_at")
                      or r.get("started_at") or r.get("created_at") or r.get("observed_at"))
     def in_window(r):
         t = row_time(r)
@@ -250,6 +252,10 @@ def query(snapshot, path, args, now):
                 and (since is None or t >= since) and (until is None or t <= until))
     if family == "dream":
         name, needed = "dreams", {"queue"}
+    elif family in ("worker", "workers"):
+        name, needed = "workers", {"workers"}
+    elif family in ("composer", "reviews"):
+        name, needed = family, {family, "memory_lock"}
     elif family == "service":
         name, needed = "services", {"services"}
     elif family == "schedule":
