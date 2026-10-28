@@ -103,6 +103,23 @@ STANDING_NOTE = ("standing read-only operator default (introspection config "
                  "not activated; not configured-complete)")
 
 
+def _file_mtime(path):
+    """The source file's own write time — its observation clock. The reader's
+    clock never substitutes for it."""
+    try:
+        return Path(path).stat().st_mtime
+    except OSError:
+        return None
+
+
+def _max_epoch(rows, keys):
+    """Newest recorded time across bounded rows, or None. A row without a
+    usable time contributes nothing rather than now."""
+    return max((t for r in rows if isinstance(r, dict)
+                for t in (model.epoch(r.get(k)) for k in keys) if t),
+               default=None)
+
+
 def _coverage(source, kind, state, now, ttl, source_observed_at=None,
               reason=None, host="local", collection_mode=None):
     """One coverage record. ``observed_at`` is the SOURCE's own observation
@@ -127,7 +144,7 @@ def _coverage(source, kind, state, now, ttl, source_observed_at=None,
                 quality = "stale"
                 reason = ("source observation age %ds exceeds ttl %ds"
                           % (int(age), int(ttl)))
-            elif age < -120:
+            elif age < -model.CLOCK_SKEW_SECONDS:
                 quality = "conflicting"
                 reason = "source clock ahead of reader by %ds" % int(-age)
     if collection_mode == "standing" and reason:
@@ -147,12 +164,62 @@ def _reviews_dir():
                                str(HOME / ".yggterm/swarm/reviews"))).expanduser()
 
 
-def _receipt_state(review_id, review_dir=None, key_path=None):
+def _chain_sessions(rows):
+    """Session identities a review chain records. The existing chain format
+    may carry only worker.session; anything else stays absent."""
+    out = set()
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        for k in ("session", "session_id", "worker_session"):
+            v = r.get(k)
+            if isinstance(v, str) and v:
+                out.add(v)
+        w = r.get("worker")
+        if isinstance(w, dict) and isinstance(w.get("session"), str) and w["session"]:
+            out.add(w["session"])
+    return out
+
+
+def _binding_failure(rows, claim, snaps):
+    """Trusted-review association: the chain must be BOUND to this exact
+    work — the audit row's native session identity must appear in the chain,
+    and the chain's approved subject digest must equal the claimed repair's
+    subject digest. A valid COMPLETE receipt of ANOTHER work never verifies
+    this repair just because an audit row carries its review_id; missing
+    proof of any binding stays unverified with the exact reason."""
+    claimed_session = claim.get("session_id")
+    if not claimed_session:
+        return ("audit row records no native session identity; review "
+                "association cannot be established")
+    sessions = _chain_sessions(rows)
+    if not sessions:
+        return ("review chain records no worker session identity; "
+                "association cannot be established")
+    if claimed_session not in sessions:
+        return ("review chain is bound to session(s) %s, not the audit row's "
+                "session %s" % (", ".join(sorted(sessions))[:80],
+                                str(claimed_session)[:40]))
+    approved = [s.get("subject_digest") for s in snaps
+                if isinstance(s.get("subject_digest"), str)]
+    claimed_subject = claim.get("subject_digest")
+    if not claimed_subject:
+        return ("audit row carries no subject digest; the exact "
+                "accepted-subject binding is missing")
+    if claimed_subject not in approved:
+        return ("approved subject digest does not match the claimed "
+                "repair's subject")
+    return None
+
+
+def _receipt_state(review_id, review_dir=None, key_path=None, claim=None):
     """Validate one sessionReview chain for repair verification. Returns
     (verification, reason). ``editor-verified`` requires ALL of: an intact
     hash chain (any corruption raises on read), a terminal COMPLETE
-    resolution, a recorded editor verdict, and an editor invocation receipt
-    that authenticates against the control key on this reader. A
+    resolution, a recorded editor verdict, an editor invocation receipt
+    that authenticates against the control key on this reader, and — when a
+    claim row is given — a trusted work association: session identity and
+    exact approved subject digest matching the claimed repair. A
     structurally valid chain without a verifiable receipt stays unverified —
     a verdict claim, even PASS, is never editor-verified by itself."""
     try:
@@ -171,8 +238,18 @@ def _receipt_state(review_id, review_dir=None, key_path=None):
     verdicts = [r for r in rows if r.get("kind") == "editor_verdict"]
     if not verdicts:
         return "unverified", "review chain carries no editor verdict"
+    if claim is not None:
+        # Association is checked before provenance: a receipt that cannot be
+        # bound to THIS work is rejected for the binding reason even before
+        # the control key is consulted.
+        binding = _binding_failure(rows, claim,
+                                   [r for r in rows if r.get("kind") == "snapshot_staged"])
+        if binding:
+            return "unverified", binding
     try:
-        verifier = sr.hmac_provenance_verifier(sr._load_key(key_path))
+        # the verifier factory takes the key PATH and loads it itself; passing
+        # the loaded key bytes here made every verification fail closed
+        verifier = sr.hmac_provenance_verifier(key_path)
     except Exception:
         return "unverified", ("review chain structurally valid; editor "
                               "provenance not verifiable (no control key on "
@@ -282,7 +359,8 @@ def _repairs_from_audit(audit_rows, now, reviews_dir=None):
         review_id = row.get("review_id")
         if review_id:
             rec["review_id"] = model.text(review_id, 80)
-            state, why = _receipt_state(str(review_id)[:80], reviews_dir)
+            state, why = _receipt_state(str(review_id)[:80], reviews_dir,
+                                        claim=row)
             rec["verification"] = state
             rec["verification_reason"] = why or None
         else:
@@ -514,50 +592,73 @@ def _capture_standing(spec, now, root, host):
                             "events": len(events), "heartbeat_planes": len(hb["planes"]),
                             "active_findings": len([f for f in hb["findings"] if f.get("active")])}]
 
+    # Source observation clocks: every file-backed source carries its OWN
+    # clock (embedded as-of, newest row time, or file mtime) — never the
+    # reader's now. Only live OS queries (the queue CLI, systemctl, dmesg)
+    # may use the read clock, because there the observation IS the read.
+    metrics_clock = (_max_epoch(q["events"], ("t",))
+                     or _file_mtime(collectors.QUEUE_STATE / "metrics.jsonl"))
+    dream_clock = model.epoch(dstate["state"].get("as_of"))
+    ledger_clock = (_max_epoch(dl["audit"], ("audited_at",))
+                    or _max_epoch(dl["dispatch"], ("created_at", "at", "t"))
+                    or _file_mtime(collectors.DREAMER_STATE / "audit-ledger.jsonl"))
+    maint_clock = model.epoch(maint["pass"].get("at"))
+    workers_clock = (wdetail.get("newest_mtime") if isinstance(wdetail, dict) else None)
+    commit_clock = (cmtdetail.get("observed_at") if isinstance(cmtdetail, dict) else None)
     cov = [
+        # queue: live queue-CLI query (subprocess read of the live
+        # orchestrator); a failed read is not an observation, so no clock
         _coverage("queue:" + host, "queue", qstate, now, DEFAULT_TTLS["queue"],
-                  source_observed_at=now,
+                  source_observed_at=now if qstate == "ok" else None,
                   reason=None if qstate == "ok" else str(qdetail)[:120], host=host,
                   collection_mode=mode),
+        # queue-metrics: metrics.jsonl is a file — its newest event / mtime
         _coverage("queue-metrics:" + host, "attempt_history", qdetail.get("metrics_state", "absent") if isinstance(qdetail, dict) else qstate,
-                  now, DEFAULT_TTLS["attempt_history"], source_observed_at=now,
+                  now, DEFAULT_TTLS["attempt_history"], source_observed_at=metrics_clock,
                   reason=str(qdetail)[:120] if qstate != "ok" else None, host=host,
                   collection_mode=mode),
+        # dream-state: the state file's own as_of
         _coverage("dream-state:" + host, "schedule", dst, now, DEFAULT_TTLS["dream_state"],
-                  source_observed_at=now,
+                  source_observed_at=dream_clock,
                   reason=str(ddetail)[:120] if dst != "ok" else None, host=host,
                   collection_mode=mode),
+        # dreamer-ledgers: audit/dispatch row times, else the ledger mtime
         _coverage("dreamer-ledgers:" + host, "attempt_history", dlst, now, DEFAULT_TTLS["dreamers"],
-                  source_observed_at=now,
+                  source_observed_at=ledger_clock,
                   reason=str(dldetail)[:120] if dlst != "ok" else None, host=host,
                   collection_mode=mode),
         _coverage("heartbeat:" + host, "heartbeat", hbst, now, DEFAULT_TTLS["heartbeat"],
                   source_observed_at=hb.get("as_of"),
                   reason=str(hbdetail)[:120] if hbst != "ok" else None, host=host,
                   collection_mode=mode),
+        # services/timers: live systemctl reads
         _coverage("services:" + host, "services", svst, now, DEFAULT_TTLS["services"],
-                  source_observed_at=now,
+                  source_observed_at=now if svst == "ok" else None,
                   reason=sv_reason if svst == "ok" else
                   (str(svdetail)[:120] if not isinstance(svdetail, dict) else json.dumps(svdetail, sort_keys=True)[:120]),
                   host=host, collection_mode=mode),
         _coverage("timers:" + host, "schedule", scst, now, DEFAULT_TTLS["schedule"],
-                  source_observed_at=now,
+                  source_observed_at=now if scst == "ok" else None,
                   reason=str(scdetail)[:120] if scst != "ok" else None, host=host,
                   collection_mode=mode),
+        # maintenance: supervisor.json's own pass time
         _coverage("maintenance:" + host, "services", mst, now, DEFAULT_TTLS["maintenance"],
-                  source_observed_at=now,
+                  source_observed_at=maint_clock,
                   reason=str(mdetail)[:120] if mst != "ok" else None, host=host,
                   collection_mode=mode),
+        # workers-registry: newest registry file mtime
         _coverage("workers-registry:" + host, "workers", wst, now, DEFAULT_TTLS["services"],
-                  source_observed_at=now,
+                  source_observed_at=workers_clock,
                   reason=str(wdetail)[:120] if wst != "ok" else None, host=host,
                   collection_mode=mode),
+        # kernel-ring: live kernel ring read
         _coverage("kernel-ring:" + host, "events", kst, now, DEFAULT_TTLS["kernel"],
-                  source_observed_at=now,
+                  source_observed_at=now if kst == "ok" else None,
                   reason=str(kdetail)[:120] if kst != "ok" else None, host=host,
                   collection_mode=mode),
+        # commitments: the journal rows' own recorded time
         _coverage("commitments:" + host, "task_ledger", cmtst, now, DEFAULT_TTLS["commitments"],
-                  source_observed_at=now,
+                  source_observed_at=commit_clock,
                   reason=str(cmtdetail)[:120] if cmtst != "ok" else None, host=host,
                   collection_mode=mode),
         _coverage("composer:" + host, "composer", compst, now,
@@ -597,7 +698,7 @@ def _capture_standing(spec, now, root, host):
 
 _CONFIGURED_KINDS = ("queue", "attempt_history", "heartbeat", "services",
                      "schedule", "task_ledger", "composer", "reviews",
-                     "memory_lock")
+                     "memory_lock", "workers", "pressure")
 
 
 def _capture_configured(spec, now, root, host):
@@ -620,6 +721,9 @@ def _capture_configured(spec, now, root, host):
     hb = {"planes": [], "findings": [], "as_of": None}
     services = []
     compst = revst = "unobserved"
+    wst = pst = "unobserved"
+    wdetail = pdetail = {}
+    enrolled_host = lambda s: str(s.get("host") or host)
     for s in spec["sources"]:
         sid, kind = str(s.get("id", "")), s.get("kind")
         ttl = s.get("ttl_seconds") if isinstance(s.get("ttl_seconds"), int) else DEFAULT_TTLS.get(kind, 120)
@@ -627,18 +731,19 @@ def _capture_configured(spec, now, root, host):
         if not s.get("enabled"):
             coverage.append(_coverage(src, kind or "unknown", "unobserved", now, ttl,
                                       reason="enrolled source disabled; not collected",
-                                      collection_mode=mode))
+                                      host=enrolled_host(s), collection_mode=mode))
             continue
         if kind not in _CONFIGURED_KINDS:
             coverage.append(_coverage(src, kind or "unknown", "unobserved", now, ttl,
-                                      reason="unsupported source kind", collection_mode=mode))
+                                      reason="unsupported source kind",
+                                      host=enrolled_host(s), collection_mode=mode))
             continue
         if not served(s):
             coverage.append(_coverage(src, kind, "unobserved", now, ttl,
                                       reason="enrolled host %r is not served by this "
                                              "local adapter (not silently widened)"
                                              % str(s.get("host"))[:40],
-                                      collection_mode=mode))
+                                      host=enrolled_host(s), collection_mode=mode))
             continue
         if kind in ("queue", "attempt_history"):
             if have_queue:
@@ -654,7 +759,8 @@ def _capture_configured(spec, now, root, host):
                 w["origin"] = "queue-admitted"
             datasets["dreams"] = work
             datasets["attempts"] = attempts
-            coverage.append(_coverage(src, kind, qstate, now, ttl, source_observed_at=now,
+            coverage.append(_coverage(src, kind, qstate, now, ttl,
+                                      source_observed_at=now if qstate == "ok" else None,
                                       reason=None if qstate == "ok" else str(qdetail)[:120],
                                       collection_mode=mode))
         elif kind == "heartbeat":
@@ -683,12 +789,14 @@ def _capture_configured(spec, now, root, host):
             elif sst != "ok":
                 reason = json.dumps(sdetail, sort_keys=True)[:160] if isinstance(sdetail, dict) else str(sdetail)[:120]
             datasets["services"].extend(rows)
-            coverage.append(_coverage(src, kind, sst, now, ttl, source_observed_at=now,
+            coverage.append(_coverage(src, kind, sst, now, ttl,
+                                      source_observed_at=now if sst == "ok" else None,
                                       reason=reason, collection_mode=mode))
         elif kind == "schedule":
             rows, schst, schdetail = collectors.collect_timers(s.get("units") or [], now, limits)
             datasets["schedules"].extend(rows)
-            coverage.append(_coverage(src, kind, schst, now, ttl, source_observed_at=now,
+            coverage.append(_coverage(src, kind, schst, now, ttl,
+                                      source_observed_at=now if schst == "ok" else None,
                                       reason=str(schdetail)[:120] if schst != "ok" else None,
                                       collection_mode=mode))
         elif kind == "task_ledger":
@@ -736,17 +844,34 @@ def _capture_configured(spec, now, root, host):
                                           default=0) or None,
                                       reason=str(mdt)[:140] if mst != "ok" else None,
                                       collection_mode=mode))
+        elif kind == "workers":
+            rows_w, wst, wdetail = collectors.collect_workers(now, s.get("path"))
+            datasets["workers"].extend(rows_w)
+            coverage.append(_coverage(src, kind, wst, now, ttl,
+                                      source_observed_at=(wdetail.get("newest_mtime")
+                                                          if isinstance(wdetail, dict) else None),
+                                      reason=str(wdetail)[:140] if wst != "ok" else None,
+                                      host=enrolled_host(s), collection_mode=mode))
+        elif kind == "pressure":
+            rows_p, pst, pdetail = collectors.collect_pressure(now, ttl)
+            datasets["plans"].extend(
+                {"id": "plan:" + r["kind"] + ":" + str(r.get("plane", ""))[:60], **r}
+                for r in rows_p)
+            coverage.append(_coverage(src, kind, pst, now, ttl,
+                                      source_observed_at=(pdetail.get("heartbeat_as_of")
+                                                          if isinstance(pdetail, dict) else None),
+                                      reason=str(pdetail)[:140] if pst != "ok" else None,
+                                      host=enrolled_host(s), collection_mode=mode))
         else:
             coverage.append(_coverage(src, kind, "unobserved", now, ttl,
                                       reason="collector not implemented for kind %s "
                                              "(recorded open, not healthy-empty)" % kind,
                                       collection_mode=mode))
 
-    workers, wst, wdetail = collectors.collect_workers(now)
-    datasets["workers"] = workers
-    pressure, pst, pdetail = collectors.collect_pressure(now, DEFAULT_TTLS["heartbeat"])
-    datasets["plans"] = [{"id": "plan:" + r["kind"] + ":" + str(r.get("plane", ""))[:60], **r}
-                         for r in pressure]
+    # Workers and pressure exist here ONLY when enrolled: a configured capture
+    # with zero enrolled sources (or a disabled heartbeat) reads neither —
+    # hidden unenrolled reads would silently widen the enrollment.
+    workers = datasets["workers"]
     datasets["findings"] = _checks(datasets,
                                    {"serve": {}}, hb, services, {"state": {}}, now)
     datasets["summary"] = [{"id": "summary:1", "collection_mode": mode,
@@ -768,14 +893,7 @@ def _capture_configured(spec, now, root, host):
                             "heartbeat_planes": len(hb["planes"]),
                             "sources_enrolled": len(spec["sources"]),
                             "queue_is_not_whole_compute": True}]
-    cov = coverage + [
-        _coverage("workers-registry:" + host, "workers", wst, now, DEFAULT_TTLS["services"],
-                  source_observed_at=now,
-                  reason=str(wdetail)[:120] if wst != "ok" else None, host=host,
-                  collection_mode=mode),
-        _coverage("pressure:" + host, "heartbeat", pst, now, DEFAULT_TTLS["pressure"],
-                  source_observed_at=hb.get("as_of"), host=host, collection_mode=mode),
-    ]
+    cov = coverage  # coverage rows were appended per enrolled source above
     frame = model.frame(model.digest({"sources": sorted(c["source"] + ":" + c["kind"] for c in cov),
                                       "limits": limits, "retention": spec["retention"],
                                       "activated": True, "mode": mode}),
@@ -996,13 +1114,16 @@ def _attempt_for(frame, work_id, attempt_id=None):
     return None, None
 
 
-def dream_logs(work_id, attempt_id=None, root=None):
+def dream_logs(work_id, attempt_id=None, frame=None, root=None):
     """Live bounded tail of ONE attempt's run log, gated by capture-time
-    coverage. The log body is shown to the human, redacted, never stored."""
+    coverage. The log body is shown to the human, redacted, never stored.
+    The selection happens in the frame the caller pinned (--snapshot): a
+    history selection never silently jumps to the latest frame."""
     now = time.time()
-    frame = store.latest_snapshot(root=root, since=now - 30)
     if frame is None:
-        frame = capture(now=now, root=root)
+        frame = store.latest_snapshot(root=root, since=now - 30)
+        if frame is None:
+            frame = capture(now=now, root=root)
     w, a = _attempt_for(frame, work_id, attempt_id)
     if w is None:
         return {"error": "work %s not in current snapshot; run ygg dream ls" % work_id}, 3
@@ -1059,16 +1180,24 @@ JUMP_UNAVAILABLE = ("GUI jump is not available from this adapter: the daemon "
                     "command selects and prints exact facts only, never resumes work.")
 
 
-def dream_open(work_id, args, root=None):
-    """Selectable human jump: resolve the work item to its exact current
-    attempt and any native session identity, print the exact facts."""
+def dream_open(work_id, args, frame=None, root=None):
+    """Selectable human jump: resolve the work item to its exact current —
+    or --attempt-selected — attempt in the frame the caller pinned
+    (--snapshot) and any native session identity, print the exact facts.
+    Selecting a history frame or a physical attempt never silently falls
+    back to the latest frame or the current attempt."""
     now = time.time()
-    frame = store.latest_snapshot(root=root, since=now - 30)
     if frame is None:
-        frame = capture(now=now, root=root)
-    w, a = _attempt_for(frame, work_id)
+        frame = store.latest_snapshot(root=root, since=now - 30)
+        if frame is None:
+            frame = capture(now=now, root=root)
+    wanted_attempt = args.get("attempt")
+    w, a = _attempt_for(frame, work_id, wanted_attempt)
     if w is None:
-        return {"error": "work %s not in current snapshot; run ygg dream ls" % work_id}, 3
+        return {"error": "work %s not in the selected snapshot; run ygg dream ls" % work_id}, 3
+    if wanted_attempt and a is None:
+        return {"error": "attempt %s is not in the selected snapshot for %s"
+                         % (wanted_attempt, work_id)}, 3
     session = (a or {}).get("session_id")
     print("work      %s" % w["id"])
     print("queue_id  %s   state %s   route %s" % (w.get("queue_id"), w.get("state"), w.get("route")))
@@ -1093,30 +1222,38 @@ def serve(path, args, root=None):
     effects. Returns the exit code."""
     now = time.time()
     as_json = bool(args.pop("json", False))
+    refresh = bool(args.pop("refresh", False))
     requested = args.get("snapshot")
     try:
         if requested:
+            # An explicitly selected snapshot is a pin: refresh cannot bypass
+            # it, and a cursor can never escape it.
             frame = store.load_snapshot(requested, root=root)
             if frame is None:
                 print("ygg: retained snapshot %s not found" % requested, file=sys.stderr)
                 return 3
         else:
-            frame = store.latest_snapshot(root=root, since=now - 120)
-            if frame is not None:
-                # Reuse only while every source is still inside its own TTL:
-                # a stale cached snapshot must not impersonate fresh data.
-                as_of = model.epoch(frame.get("as_of")) or 0
-                ttls = [c.get("ttl_seconds") for c in frame.get("coverage", [])
-                        if isinstance(c.get("ttl_seconds"), (int, float)) and c["ttl_seconds"] > 0]
-                if not ttls or now - as_of >= min(ttls):
-                    frame = None
+            frame = None
+            if not refresh:
+                frame = store.latest_snapshot(root=root, since=now - 120)
+                if frame is not None:
+                    # Reuse only while every source is still inside its own
+                    # TTL: a stale cached snapshot must not impersonate
+                    # fresh data.
+                    as_of = model.epoch(frame.get("as_of")) or 0
+                    ttls = [c.get("ttl_seconds") for c in frame.get("coverage", [])
+                            if isinstance(c.get("ttl_seconds"), (int, float)) and c["ttl_seconds"] > 0]
+                    if not ttls or now - as_of >= min(ttls):
+                        frame = None
             if frame is None:
+                # refresh=True (or an expired cache) forces an exact new frame.
                 frame = capture(now=now, root=root)
     except ValueError as exc:
         print("ygg: " + str(exc), file=sys.stderr)
         return 3
     if path == ("dream", "logs"):
-        result, code = dream_logs(args.get("id"), args.get("attempt"), root=root)
+        result, code = dream_logs(args.get("id"), args.get("attempt"),
+                                  frame=frame, root=root)
         if code:
             print("ygg dream logs: " + result["error"], file=sys.stderr)
             return code
@@ -1127,7 +1264,7 @@ def serve(path, args, root=None):
         print(result["note"])
         return 0
     if path == ("dream", "open"):
-        result, code = dream_open(args.get("id"), args, root=root)
+        result, code = dream_open(args.get("id"), args, frame=frame, root=root)
         if code:
             print("ygg dream open: " + result["error"], file=sys.stderr)
         return code

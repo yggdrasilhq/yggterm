@@ -12,6 +12,7 @@ saving an ID that already exists is an idempotent no-op, never an overwrite.
 Retention is bounded (raw days + store bytes); pruning removes whole expired
 artifacts and reports exactly what it removed.
 """
+import calendar
 import fcntl
 import json
 import os
@@ -107,37 +108,38 @@ def append_events(rows, root=None, now=None):
     month_file = events_partition(now)
     path = events_dir(root) / month_file
     path.parent.mkdir(parents=True, exist_ok=True)
-    existing = {}
-    try:
-        for line in path.read_text().splitlines():
-            try:
-                row = json.loads(line)
-            except Exception:
-                continue
-            if isinstance(row, dict) and row.get("id"):
-                existing[row["id"]] = row
-    except FileNotFoundError:
-        pass
-    appended, kept = [], []
-    for row in rows:
-        if not isinstance(row, dict) or not row.get("id") or "summary" not in row:
-            continue
-        if row["id"] in existing:
-            continue
-        kept.append(row)
-        existing[row["id"]] = row
-        appended.append(row["id"])
-    if not kept:
-        return {"appended": 0, "partitions": [month_file]}
+    # Dedupe and append are ONE critical section: reading existing IDs before
+    # taking the lock lets two writers read the same un-updated file, both
+    # conclude a row is absent, and both append it.
     lock = path.with_suffix(".lock")
+    kept = []
     with open(lock, "a+") as lf:
         fcntl.flock(lf, fcntl.LOCK_EX)
         try:
-            with open(path, "a") as f:
-                for row in kept:
-                    f.write(json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n")
-                f.flush()
-                os.fsync(f.fileno())
+            existing = {}
+            try:
+                for line in path.read_text().splitlines():
+                    try:
+                        row = json.loads(line)
+                    except Exception:
+                        continue
+                    if isinstance(row, dict) and row.get("id"):
+                        existing[row["id"]] = row
+            except FileNotFoundError:
+                pass
+            for row in rows:
+                if not isinstance(row, dict) or not row.get("id") or "summary" not in row:
+                    continue
+                if row["id"] in existing:
+                    continue
+                kept.append(row)
+                existing[row["id"]] = row
+            if kept:
+                with open(path, "a") as f:
+                    for row in kept:
+                        f.write(json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n")
+                    f.flush()
+                    os.fsync(f.fileno())
         finally:
             fcntl.flock(lf, fcntl.LOCK_UN)
     return {"appended": len(kept), "partitions": [month_file]}
@@ -215,6 +217,21 @@ def _review_cited_snapshot_ids(reviews_dir=None, max_files=100):
     return cited
 
 
+def _snapshot_time(p):
+    """Retention age basis for a snapshot: the frame's own recorded as_of —
+    the observation time — falling back to the write mtime only when the
+    file does not parse. Wall-clock mtime would keep a days-old observation
+    freshly written, and would let any capture whose caller clock leads the
+    wall clock prune the very frame it just wrote."""
+    try:
+        as_of = model.epoch(json.loads(p.read_text()).get("as_of"))
+        if as_of is not None:
+            return as_of
+    except (OSError, ValueError):
+        pass
+    return p.stat().st_mtime
+
+
 def prune(root=None, now=None, retention=None):
     """Bound the store: drop snapshots older than raw_days and monthly event
     partitions entirely past the window; then enforce the byte cap by
@@ -233,7 +250,7 @@ def prune(root=None, now=None, retention=None):
             if p.stem in cited:
                 removed["protected_by_review"] += 1
                 continue  # a review may still be verifying this snapshot
-            if p.stat().st_mtime < horizon:
+            if _snapshot_time(p) < horizon:
                 removed["bytes"] += p.stat().st_size
                 p.unlink(missing_ok=True)
                 removed["snapshots"] += 1
@@ -259,10 +276,13 @@ def prune(root=None, now=None, retention=None):
 
 
 def _partition_end(stem):
+    """First epoch second AFTER the partition, in UTC — the same clock
+    events_partition() names partitions with. Local-time interpretation
+    pruned whole-month evidence hours early in positive UTC offsets."""
     year, month = int(stem[:4]), int(stem[5:7])
     if month == 12:
-        return time.mktime((year + 1, 1, 1, 0, 0, 0, 0, 0, 0))
-    return time.mktime((year, month + 1, 1, 0, 0, 0, 0, 0, 0))
+        return calendar.timegm((year + 1, 1, 1, 0, 0, 0, 0, 0, 0))
+    return calendar.timegm((year, month + 1, 1, 0, 0, 0, 0, 0, 0))
 
 
 def store_bytes(root=None):
