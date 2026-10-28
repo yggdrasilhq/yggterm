@@ -4537,6 +4537,12 @@ pub enum ServerRequest {
     },
     /// Daemon-owned resumable plain-shell session (tmux replacement for
     /// `server attach`). The host daemon owns/persists the shell PTY.
+    /// `worker` (ygg4 lifecycle lane) turns the SAME ensure into a worker
+    /// launch: the daemon derives the session id from the launch token,
+    /// composes the command into the PTY's own launch command, and writes
+    /// the identity record itself with `daemon-attested` ownership — the
+    /// daemon, not the caller, is the metadata authority. Wire-safe both
+    /// directions: old clients omit the field, old daemons ignore it.
     EnsureShellSession {
         session_id: String,
         cwd: Option<String>,
@@ -4544,6 +4550,8 @@ pub enum ServerRequest {
         initial_cols: Option<u16>,
         #[serde(default)]
         initial_rows: Option<u16>,
+        #[serde(default)]
+        worker: Option<crate::worker_identity::WorkerLaunchSpec>,
     },
     FocusLive {
         key: String,
@@ -14475,14 +14483,77 @@ impl DaemonRuntime {
                 cwd,
                 initial_cols,
                 initial_rows,
+                worker,
             } => {
+                // Worker launches are keyed by the TOKEN, not by whatever
+                // session id the caller typed: the same launch token always
+                // asks for the same row, which is what makes a retried or
+                // ambiguous ensure idempotent instead of a second spawn.
+                let (ensure_id, worker_spec) = match worker.as_ref() {
+                    Some(spec) => {
+                        // Shape validation happens at the authority: a bad
+                        // role or missing lineage fails here, before any row
+                        // or record exists.
+                        spec.resolved_role()?;
+                        (
+                            crate::worker_identity::worker_session_id(&spec.launch_token)?,
+                            Some(spec),
+                        )
+                    }
+                    None => (session_id.clone(), None),
+                };
                 let key = self
                     .server
-                    .ensure_shell_runtime_session(&session_id, cwd.as_deref())?;
+                    .ensure_shell_runtime_session_with_command(
+                        &ensure_id,
+                        cwd.as_deref(),
+                        worker_spec.and_then(|spec| spec.command.as_deref()),
+                    )?;
                 let _ = self.ensure_terminal_for_path_with_initial_size(
                     &key,
                     valid_initial_terminal_size(initial_cols, initial_rows),
                 )?;
+                if let Some(spec) = worker_spec {
+                    // THE DAEMON WRITES THE RECORD: real ownership evidence
+                    // (it just created/adopted this row in its own session
+                    // table), never a caller's pid claim. Registration is
+                    // idempotent by token; the existing record comes back
+                    // verbatim, so an ambiguous retry cannot mint a second
+                    // identity or overwrite observed facts.
+                    let home = yggterm_core::resolve_yggterm_home()?;
+                    let outcome = crate::worker_identity::register(
+                        &home,
+                        crate::worker_identity::RegisterRequest {
+                            launch_token: spec.launch_token.clone(),
+                            role: spec.resolved_role()?,
+                            session_marker: Some(key.clone()),
+                            session_id: None,
+                            harness: Some("yggterm-daemon".to_string()),
+                            title: None,
+                            source: Some("ygg4-daemon-ensure-shell-session".to_string()),
+                            parent_token: spec.parent_token.clone(),
+                            pid: None,
+                            ownership: Some(
+                                crate::worker_identity::OwnershipAttestation::DaemonAttested {
+                                    at_ms: crate::worker_identity::now_millis(),
+                                    pid_start_ticks: None,
+                                    boot_id: None,
+                                },
+                            ),
+                            pinned: false,
+                            now_ms: crate::worker_identity::now_millis(),
+                        },
+                    )?;
+                    let worker_outcome = serde_json::json!({
+                        "launch_token": spec.launch_token,
+                        "session_key": key,
+                        "outcome": outcome,
+                    });
+                    self.persist()?;
+                    return Ok(ServerResponse::Ack {
+                        message: Some(serde_json::to_string(&worker_outcome)?),
+                    });
+                }
                 self.persist()?;
                 ServerResponse::Ack { message: Some(key) }
             }
@@ -31574,7 +31645,7 @@ fn expect_snapshot(response: ServerResponse) -> Result<(ServerUiSnapshot, Option
     }
 }
 
-fn expect_ack(response: ServerResponse) -> Result<Option<String>> {
+pub(crate) fn expect_ack(response: ServerResponse) -> Result<Option<String>> {
     match response {
         ServerResponse::Ack { message } => Ok(message),
         ServerResponse::Error { message } => bail!(message),
@@ -32303,7 +32374,7 @@ fn trim_process_heap_if_supported() {
 #[cfg(not(target_os = "linux"))]
 fn trim_process_heap_if_supported() {}
 
-fn send_request(endpoint: &ServerEndpoint, request: &ServerRequest) -> Result<ServerResponse> {
+pub(crate) fn send_request(endpoint: &ServerEndpoint, request: &ServerRequest) -> Result<ServerResponse> {
     // Stamp this PROCESS's declared identity (slice 4.3) so a shadow view client
     // carries its role on EVERY request without each call site remembering to.
     // Unset = anonymous = Active, and an anonymous envelope serializes

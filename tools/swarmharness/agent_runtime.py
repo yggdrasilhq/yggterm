@@ -31,7 +31,7 @@ import json
 import re
 import sys
 
-WORKER_IDENTITY_SCHEMA = "ygg4-worker-identity/1"
+WORKER_IDENTITY_SCHEMA = "ygg4-worker-identity/2"
 
 #: The stable role tokens, exactly as the Rust wire format and the CLI accept
 #: them (kebab). The underscore spellings are also accepted by the parser but
@@ -159,6 +159,59 @@ def build_retire_argv(
     return argv
 
 
+def shell_quote_command(command: str) -> str:
+    """POSIX single-quote a worker command for a `sh -c` composition.
+
+    Mirrors worker_identity::shell_quote_single in Rust: the daemon composes
+    `exec <shell> -c '<command>'`, so the CALLER does not pre-quote — this
+    helper exists for bridges that build display/audit lines, and its output
+    must match the daemon's byte for byte.
+    """
+    return "'" + command.replace("'", "'\\''") + "'"
+
+
+def build_spawn_argv(
+    launch_token: str,
+    role: str,
+    *,
+    parent_token: str | None = None,
+    cwd: str | None = None,
+    command: str | None = None,
+    headless: str = "yggterm-headless",
+) -> list[str]:
+    """The exact argv for a DAEMON-ATTESTED worker launch.
+
+    Spawn goes through the live daemon (`EnsureShellSession` carrying the
+    worker spec): the daemon derives the session id from the token, runs the
+    command in its own PTY, and writes the identity record itself. Idempotent
+    by token — a retried spawn re-ensures the SAME row, never a second one.
+    """
+    validate_launch_token(launch_token)
+    role = normalize_role(role)
+    argv = [
+        headless,
+        "server",
+        "workers",
+        "spawn",
+        "--launch-token",
+        launch_token,
+        "--role",
+        role,
+    ]
+    for flag, value in (("--parent-token", parent_token), ("--cwd", cwd), ("--command", command)):
+        if value:
+            argv += [flag, str(value)]
+    return argv
+
+
+def build_attach_argv(
+    launch_token: str, *, headless: str = "yggterm-headless"
+) -> list[str]:
+    """The exact argv for the GUI-absent reattach: same token, same PTY."""
+    validate_launch_token(launch_token)
+    return [headless, "server", "workers", "attach", "--launch-token", launch_token]
+
+
 def parse_register_outcome(stdout: str) -> dict:
     """Parse `register --json` output and assert the idempotency shape.
 
@@ -211,6 +264,21 @@ def validate_record(record: dict) -> dict:
             raise ValueError(f"{key} must be a non-negative integer, got {value!r}")
     if not isinstance(record.get("pinned", False), bool):
         raise ValueError("pinned must be a boolean")
+    # Ownership attestation (schema /2): present-or-absent, never a bare
+    # string. daemon-attested is execution evidence; caller-asserted is a
+    # statement — consumers must weigh them differently and retire --force
+    # may not certify a caller-asserted pid.
+    ownership = record.get("ownership")
+    if ownership is not None:
+        kind = ownership.get("kind") if isinstance(ownership, dict) else None
+        if kind not in ("daemon-attested", "caller-asserted"):
+            raise ValueError(
+                f"ownership kind {kind!r} must be daemon-attested or caller-asserted"
+            )
+        if kind == "daemon-attested" and "at_ms" not in ownership:
+            raise ValueError("daemon-attested ownership requires at_ms")
+        if kind == "caller-asserted" and "at_ms" not in ownership:
+            raise ValueError("caller-asserted ownership requires at_ms")
     return record
 
 
@@ -253,6 +321,24 @@ def selftest() -> int:
         check("bad token refused", False, "ValueError not raised")
     except ValueError:
         check("bad token refused", True)
+
+    # spawn/attach argv + quoting parity with the Rust composer
+    spawn = build_spawn_argv("wave-1", "worker", parent_token="orch-1", command="echo hi")
+    check(
+        "spawn argv",
+        spawn[:6] == ["yggterm-headless", "server", "workers", "spawn",
+                      "--launch-token", "wave-1"],
+        str(spawn),
+    )
+    check("spawn carries command", spawn[-2:] == ["--command", "echo hi"], str(spawn))
+    check(
+        "shell quoting parity",
+        shell_quote_command("it's") == "'" + chr(92) + "'" + "''" + "s'",
+        shell_quote_command("it's"),
+    )
+    attach = build_attach_argv("wave-1")
+    check("attach argv", attach == ["yggterm-headless", "server", "workers", "attach",
+                                    "--launch-token", "wave-1"], str(attach))
 
     check("ls argv", build_ls_argv()[-1] == "--json")
     check("ls role filter", build_ls_argv("group")[-2:] == ["--role", "group"])

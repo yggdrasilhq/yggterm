@@ -1416,6 +1416,12 @@ fn main() -> Result<()> {
         // ONE owner, both binaries — `yggterm_server::server_cli`.
         return yggterm_server::server_cli::run_server_order_cli(&store, &args);
     }
+    // `yggterm server workers ...` (ygg4 worker identity + launch plane) —
+    // dispatch parity with `yggterm-headless server workers`: ONE owner in
+    // `server_cli`, so both binaries spell the verbs identically.
+    if args.len() >= 2 && args[0] == "server" && args[1] == "workers" {
+        return yggterm_server::server_cli::run_server_workers_cli(&store, &args[2..]);
+    }
     if args.len() >= 2 && args[0] == "server" && args[1] == "startpage" {
         return yggterm_server::server_cli::run_server_startpage_ls_cli(&store, &args);
     }
