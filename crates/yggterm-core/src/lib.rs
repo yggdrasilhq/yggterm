@@ -1599,8 +1599,6 @@ fn serialize_settings_value(settings: &AppSettings) -> Value {
         "agent_cli_install_consent": settings.agent_cli_install_consent,
         "agent_cli_install_wanted": settings.agent_cli_install_wanted,
         "agent_cli_install_wanted_remote": settings.agent_cli_install_wanted_remote,
-        "managed_auth_mode": settings.managed_auth_mode,
-        "managed_auth_script": settings.managed_auth_script,
         "litellm_endpoint": settings.litellm_endpoint,
         "litellm_api_key": settings.litellm_api_key,
         "interface_llm_model": settings.interface_llm_model,
@@ -1636,7 +1634,32 @@ fn serialize_settings_value(settings: &AppSettings) -> Value {
         "web_surface_zoom_percent": settings.web_surface_zoom_percent,
         "web_surface_vertical_tabs": settings.web_surface_vertical_tabs,
         "web_surface_restore_tabs": settings.web_surface_restore_tabs,
-    })
+    });
+    append_managed_auth_settings_fields(&mut value, settings);
+    value
+}
+
+/// Append the managed-auth gate fields to a serialized settings object.
+///
+/// ⚠ Appended beside the big `json!` literal, NOT inside it: that literal was
+/// already at the macro recursion limit, and two more entries pushed
+/// `json_internal!` over the default (measured 2026-10-28: private CI subject
+/// d1030d66 failed four checks with "recursion limit reached" on yggterm-core).
+/// Object inserts add no macro depth. The omission-class falsifier
+/// (`settings_round_trip_the_managed_auth_gate_fields`) deletes THESE inserts,
+/// so a future cleanup must move the lock with the keys.
+fn append_managed_auth_settings_fields(value: &mut serde_json::Value, settings: &AppSettings) {
+    let Some(map) = value.as_object_mut() else {
+        return;
+    };
+    map.insert(
+        "managed_auth_mode".to_string(),
+        serde_json::Value::String(settings.managed_auth_mode.clone()),
+    );
+    map.insert(
+        "managed_auth_script".to_string(),
+        serde_json::Value::String(settings.managed_auth_script.clone()),
+    );
 }
 
 /// Single source of truth for "is an agent CLI actively working right now",
