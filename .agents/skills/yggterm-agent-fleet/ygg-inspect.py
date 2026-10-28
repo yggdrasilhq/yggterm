@@ -13,6 +13,31 @@ except (ImportError, ValueError, TypeError, KeyError, OSError) as exc:
     raise SystemExit(3)
 
 
+def _adapter():
+    """Resolve the inspection adapter beside the repo kernel or the dispersed
+    one; import failure is an honest unavailable, never an empty ledger."""
+    import importlib
+    here = Path(__file__).resolve()
+    candidates = [here.parents[3] / "tools", here.parent,
+                  Path.home() / "gh" / "yggterm" / "tools",
+                  Path(os.environ.get("YGG_KERNEL_DIR", "")) if os.environ.get("YGG_KERNEL_DIR") else None,
+                  Path.home() / ".yggterm" / "swarmkernel"]
+    for base in candidates:
+        if base is None:
+            continue
+        if (base / "swarmharness" / "introspection" / "adapters.py").exists():
+            if str(base) not in sys.path:
+                sys.path.insert(0, str(base))
+            module = importlib.import_module("swarmharness.introspection.adapters")
+            importlib.reload(module) if os.environ.get("YGG_INSPECT_FRESH") else None
+            return module
+        if (base / "introspection" / "adapters.py").exists():
+            if str(base) not in sys.path:
+                sys.path.insert(0, str(base))
+            return importlib.import_module("introspection.adapters")
+    raise ImportError("introspection adapters not found on any kernel path")
+
+
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     if argv and argv[0] == "--version":
@@ -92,6 +117,27 @@ complete -F _ygg_complete ygg''')
             print("ygg: compatibility tool unavailable: " + target, file=sys.stderr)
             return 3
         os.execv(str(executable), [str(executable), *fixed, *rest])
+    # Query/attach leaves resolve real bounded snapshots when the adapter
+    # resolves; otherwise the result is an honest unavailable (exit 3) that
+    # never pretends an empty fleet.
+    if node.handler in ("query", "open"):
+        try:
+            adapters = _adapter()
+        except Exception as exc:
+            request = {"command": list(path), "arguments": vars(args)}
+            snapshot_id = "unavailable-" + hashlib.sha256(json.dumps(request, sort_keys=True).encode()).hexdigest()[:16]
+            result = {"schema_version": 1, "snapshot_id": snapshot_id, "as_of": None,
+                      "config_hash": None,
+                      "coverage": [{"source": ".".join(path), "quality": "unavailable",
+                                    "reason": "adapter_unavailable: " + type(exc).__name__}],
+                      "items": [], "next_cursor": None,
+                      "findings": [{"code": "ADAPTER_UNAVAILABLE", "command": list(path)}]}
+            if getattr(args, "json", False):
+                print(json.dumps(result, indent=2))
+            else:
+                print("ygg " + " ".join(path) + ": source adapter unavailable; coverage UNKNOWN.")
+            return 3
+        return adapters.serve(path, vars(args))
     # This is an honest staged availability result, never a healthy empty
     # ledger. Source adapters are admitted separately from local help.
     request = {"command": list(path), "arguments": vars(args)}

@@ -61,12 +61,14 @@ def boundary(value, anchor, future=False):
     return found
 
 
-def coverage(source, host, kind, *, observed_at, received_at, ttl, quality="verified", revision=None, reason=None):
+def coverage(source, host, kind, *, observed_at, received_at, ttl, quality="verified",
+             revision=None, reason=None, collection_mode=None):
     if quality not in QUALITIES:
         quality, reason = "unknown", "unsupported_source_quality"
     return {"source": source, "host": host, "kind": kind,
             "observed_at": observed_at, "received_at": received_at,
-            "ttl_seconds": ttl, "quality": quality, "revision": revision, "reason": reason}
+            "ttl_seconds": ttl, "quality": quality, "revision": revision, "reason": reason,
+            "collection_mode": collection_mode}
 
 
 def assess(row, now):
@@ -104,7 +106,7 @@ def validate_frame(value):
                 or not all(isinstance(c.get(k), str) for k in ("source", "host", "kind"))):
             raise ValueError("invalid snapshot coverage record")
     allowed = {"dreams", "attempts", "services", "schedules", "plans", "events",
-               "heartbeat", "findings", "summary", "repairs"}
+               "heartbeat", "findings", "summary", "repairs", "workers"}
     if set(value["datasets"]) - allowed:
         raise ValueError("unenrolled snapshot dataset")
     if any(not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows)
@@ -135,6 +137,8 @@ def queue_records(tasks, metrics, run_metadata, source, host, now):
     run-file references rather than crediting a later file to an old attempt.
     """
     attempts, latest = {}, {}
+    metrics = [e for e in metrics if isinstance(e, dict)]
+    tasks = [t for t in tasks if isinstance(t, dict)]
     for event in metrics:
         raw_id = str(event.get("id", ""))
         if not raw_id:
