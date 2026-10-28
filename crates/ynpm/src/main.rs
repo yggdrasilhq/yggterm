@@ -48,6 +48,9 @@
 //! See docs/ynpm.md for the operator's view.
 #![allow(dead_code)]
 
+mod github_release;
+mod release_contract;
+
 use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -4084,6 +4087,7 @@ fn verb_install(paths: &Paths, args: &[String]) -> anyhow::Result<()> {
     }
     let mut destination = None;
     let mut specs = Vec::new();
+    let mut package_filter = None;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
@@ -4094,6 +4098,14 @@ fn verb_install(paths: &Paths, args: &[String]) -> anyhow::Result<()> {
                         .context("--dest wants a destination directory")?,
                 ));
             }
+            "--package" => {
+                index += 1;
+                package_filter = Some(
+                    args.get(index)
+                        .context("--package wants a release package id")?
+                        .clone(),
+                );
+            }
             value if value.starts_with("--") => bail!("unknown install option '{value}'"),
             value => specs.push(value.to_string()),
         }
@@ -4101,6 +4113,49 @@ fn verb_install(paths: &Paths, args: &[String]) -> anyhow::Result<()> {
     }
     if specs.is_empty() {
         bail!("install wants a package");
+    }
+    // A GitHub release source (https://github.com/owner/repo or the
+    // github: shorthand) routes to the release-manifest transaction; it
+    // must not be mixed with registry names in one invocation, because the
+    // two channels disagree on identity, pinning and failure semantics.
+    let github_specs: Vec<&String> = specs
+        .iter()
+        .filter(|spec| github_release::looks_like_github_release_source(spec))
+        .collect();
+    if !github_specs.is_empty() {
+        if github_specs.len() != specs.len() {
+            bail!(
+                "a github release source cannot be mixed with registry packages \
+                 in one install"
+            );
+        }
+        if package_filter.is_some() && github_specs.len() > 1 {
+            bail!("--package applies to exactly one github release source");
+        }
+        let mut failed = 0usize;
+        for spec in &github_specs {
+            let source = match github_release::parse_github_release_source(spec) {
+                Ok(source) => source,
+                Err(error) => {
+                    eprintln!("ynpm: ⛔ {spec}: {error:#}");
+                    failed += 1;
+                    continue;
+                }
+            };
+            if let Err(error) = github_release::install_github_release(
+                paths,
+                &source,
+                package_filter.as_deref(),
+                destination.as_deref(),
+            ) {
+                eprintln!("ynpm: ⛔ {spec}: {error:#}");
+                failed += 1;
+            }
+        }
+        if failed > 0 {
+            bail!("{failed} of {} release source(s) failed", github_specs.len());
+        }
+        return Ok(());
     }
     let mut failed = 0usize;
     for spec in &specs {
@@ -7304,6 +7359,8 @@ fn main() -> anyhow::Result<()> {
     );
     const USAGE: &str = "ynpm - the yggdrasilhq package manager\n\
          verbs: install [--dest DIR] <pkg>[@<ver>]... | install --dev <pkg> [--watch PKG] [--bin NAME=PATH]... |\n\
+         install [--package ID] https://github.com/owner/repo[@tag]     # release-manifest packages: desktop/seed porcelains (docs/ynpm-desktop-releases.md)\n\
+         seed-activate --archive PATH --manifest PATH [--seed-root DIR] [--expect-version V] [--package ID] [--json]    # one install transaction for seed generations\n\
          list | check | doctor | sync [--integrated] | sync-fleet --hosts H1,H2 [--integrated] | upgrade [--dry-run] | self-update [--json] | export <pkg> [--metadata] [--archive PATH] | import <pkg> <ver> --archive PATH --bins a,b | import-yggterm <ver> --archive PATH | rollback <pkg> | remove <pkg> | prod <pkg> |\n\
          purge-legacy                                        # remove old yggterm/npm copies when no live process uses them
          sweep [--dry-run] [--force] [--keep N] [--cache-cap-bytes N] [--grace-ms MS] [--scope scratch,generations,cache] [--no-alt-tmp] [--json]    # F9 retention: staging residue, old generations, cache budget (guards: live/linked/pinned/fresh always deferred)\n\
@@ -7392,6 +7449,7 @@ fn main() -> anyhow::Result<()> {
             "upgrade" => verb_upgrade(&paths, &args[1..]),
             "sync-fleet" => verb_sync_fleet(&paths, &args[1..]),
             "self-update" => verb_self_update(&paths, &args[1..]),
+            "seed-activate" => github_release::verb_seed_activate(&paths, &args[1..]),
             "import-yggterm" => verb_import_yggterm(&paths, &args[1..]),
             "activate-yggterm-dev" => {
                 if args.len() != 1 {
@@ -7476,7 +7534,7 @@ fn main() -> anyhow::Result<()> {
                 verb_rollback(&paths, name)
             }
             other => bail!(
-                "'{other}' is not an ynpm verb (install | list | check | doctor | sync | sync-fleet | self-update | export | import | import-yggterm | rollback | remove | prod | purge-legacy | dev)"
+                "'{other}' is not an ynpm verb (install | list | check | doctor | sync | sync-fleet | self-update | seed-activate | export | import | import-yggterm | rollback | remove | prod | purge-legacy | dev)"
             ),
         }
     })();

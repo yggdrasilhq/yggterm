@@ -53,6 +53,16 @@ the resulting generation with a symlink-then-rename. There is no shared
 `npm install -g` batch and no `--force`. A failed package cannot unlink its
 neighbours.
 
+`ynpm install https://github.com/<owner>/<repo>[@tag]` is a different
+channel from the checkout sources: it installs packages declared by the
+release's machine-readable `release-manifest.json` — the optional desktop
+GUI and seed generations, with mandatory per-artifact sha256, archive
+guards, and bin/version gates. Mobile artifacts become an official-store
+handoff and are never installed (never adb); it never touches the legacy
+four-product self-update. `ynpm seed-activate --archive A --manifest M` is
+the one install transaction installers call for seed generations. The
+contract door is `docs/ynpm-desktop-releases.md`.
+
 First-party `@ygghq/<name>` packages retain their platform-package contract
 when the main package declares the matching host companion in
 `optionalDependencies`: the main package and exact platform package must agree

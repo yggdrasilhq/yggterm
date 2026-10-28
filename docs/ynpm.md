@@ -357,6 +357,8 @@ github:owner/name              public Git checkout/dev source
 forgejo:https://host/o/name    private Forgejo Git checkout/dev source
 tarball:https://host/app.tgz   release archive containing package.json
 --dev /absolute/checkout       local development source
+https://github.com/o/r[@tag]   release-manifest package install (see the
+github:o/r[@tag]               desktop/porcelain releases door below)
 ```
 
 Private credentials belong to the user's git/curl credential helper or
@@ -364,6 +366,20 @@ environment, never in `package.json`, event payloads, or a source URL recorded
 in state. A tarball MAY carry a SHA-256 fragment or a matching checksum sidecar;
 an archive whose metadata or executable gate fails is refused before any
 published link changes.
+
+## Desktop and porcelain release packages
+
+The `https://github.com/<owner>/<repo>` install form is a different channel
+from the checkout source above: it installs packages declared by the
+release's machine-readable `release-manifest.json` (schema 1) — the
+optional desktop GUI, seed generations, web/mobile porcelain declarations —
+with mandatory per-artifact sha256, archive-safety guards, bin/version
+gates, staged atomic publication, and mobile as an official-store handoff
+(never adb). It does not clone a checkout and does not touch the legacy
+four-product self-update. The full contract, transaction semantics,
+platform capability matrix, seed-activation API and the four-product
+coupling audit live in [ynpm-desktop-releases.md](ynpm-desktop-releases.md);
+`ynpm seed-activate` is the installer-facing seed transaction.
 
 ## Event trace
 
