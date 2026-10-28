@@ -17,6 +17,7 @@ class Option:
     action: str = "store"
     choices: tuple = ()
     default: object = None
+    int_range: tuple = ()
 
 
 @dataclass(frozen=True)
@@ -42,6 +43,18 @@ class Command:
     component: str = ""
     operands: tuple = ()
     passthrough: bool = False
+    # Planned families are declared and taught locally; anything beyond
+    # local help is an explicit unsupported-role refusal, never silence.
+    role: str = ""
+    native: str = ""
+    require_one_of: tuple = ()
+    conflicts: tuple = ()
+    operand_choices: tuple = ()
+    required_options: tuple = ()
+
+
+class PlannedFamily(ValueError):
+    """A declared-but-unimplemented family: local help works, effects refuse."""
 
 
 def _load_tree():
@@ -55,11 +68,31 @@ def _load_tree():
     if document.get("schema_version") != 1:
         raise ValueError("unsupported command contract schema")
     option_sets = document["option_sets"]
+    components = document.get("components", {})
+    known_components = set(components)
+    wired = document.get("wired_adapters", {})
+    known_roles = {"", "planned"}
+    families = {path[0] for path in
+                (tuple(r["path"]) for r in document["commands"]) if path}
+    if any(name not in families for name in wired):
+        raise ValueError("wired adapter names an unknown family")
     definitions = {}
     for record in document["commands"]:
         path = tuple(record["path"])
         if path in definitions or any(not isinstance(x, str) for x in path):
             raise ValueError("invalid/duplicate command path")
+        if record.get("role", "") not in known_roles:
+            raise ValueError("unsupported command role: " + str(record.get("role")))
+        if "component" in record:
+            component = record["component"]
+            if component not in known_components:
+                raise ValueError("command names an undeclared component: " + str(path))
+            if record.get("handler") == "legacy":
+                target = record["legacy"][0].lstrip("@")
+                declared = components[component]
+                roster = {declared["runner"], *declared.get("aliases", [])}
+                if target not in roster:
+                    raise ValueError("command target is not owned by its component: " + str(path))
         definitions[path] = record
     tree = {}
     def options(records, stack=()):
@@ -101,10 +134,10 @@ def _load_tree():
         resolve(path)
     if () not in tree or any(p and p[:-1] not in tree for p in tree):
         raise ValueError("command contract has missing parent")
-    return tree, hashlib.sha256(raw).hexdigest()
+    return tree, hashlib.sha256(raw).hexdigest(), components, wired
 
 
-TREE, CONTRACT_HASH = _load_tree()
+TREE, CONTRACT_HASH, COMPONENTS, WIRED_ADAPTERS = _load_tree()
 
 
 def children(path):
@@ -118,6 +151,10 @@ def context(words):
             break
         path += (word,)
     return path
+
+
+def _dest(option):
+    return option.flags[0].lstrip("-").replace("-", "_")
 
 
 def parser_for(path):
@@ -180,24 +217,42 @@ def parse(words):
         raise ValueError("unknown command " + repr(word) + ("; try: " + ", ".join(near) if near else "; try ygg help"))
     node = TREE[path]
     rest = words[len(path):]
+    if node.role == "planned":
+        raise PlannedFamily("ygg " + " ".join(path) + ": planned family, not implemented in this generation; local help only (ygg " + " ".join(path) + " --help)")
     if node.handler == "group":
         raise ValueError("unknown next word/options for ygg " + " ".join(path) + "; choose: " + ", ".join(children(path)))
     if node.handler == "legacy" and not node.strict:
         return path, argparse.Namespace(), rest
     args = parser_for(path).parse_args(rest)
-    if path == ("dream", "open") and not (args.id or args.pick):
-        parser_for(path).error("provide an exact ID or --pick")
-    if path == ("dream", "open") and args.id and args.pick:
-        parser_for(path).error("choose either an exact ID or --pick, not both")
-    if hasattr(args, "limit"):
+    # Validation lives in the one JSON contract; no front end keeps its own.
+    for o in node.options:
+        if not o.int_range or not hasattr(args, _dest(o)):
+            continue
+        raw = getattr(args, _dest(o))
         try:
-            args.limit = int(args.limit)
-            if not 1 <= args.limit <= 1000:
+            value = int(raw)
+            lo, hi = o.int_range
+            if not lo <= value <= hi:
                 raise ValueError()
-        except ValueError:
-            parser_for(path).error("--limit must be an integer from 1 to 1000")
-    if path == ("completion",) and args.shell != "bash":
-        parser_for(path).error("supported shell: bash")
+        except (TypeError, ValueError):
+            parser_for(path).error(o.flags[0] + " must be an integer from %d to %d" % tuple(o.int_range))
+        setattr(args, _dest(o), value)
+    dests = vars(args)
+    if node.require_one_of:
+        for name in node.require_one_of:
+            if dests.get(name):
+                break
+        else:
+            parser_for(path).error("provide " + " or ".join("--" + n for n in node.require_one_of))
+    for group in node.conflicts:
+        if sum(1 for n in group if dests.get(n)) > 1:
+            parser_for(path).error("choose either " + " or ".join("--" + n for n in group) + ", not both")
+    if node.operand_choices and getattr(args, node.operand) not in (None,) + tuple(node.operand_choices):
+        parser_for(path).error("supported " + node.operand + ": " + ", ".join(node.operand_choices))
+    for name in node.required_options:
+        if not dests.get(name):
+            parser_for(path).error("--" + name.replace("_", "-") + " is required")
+    return path, args, rest
     return path, args, rest
 
 

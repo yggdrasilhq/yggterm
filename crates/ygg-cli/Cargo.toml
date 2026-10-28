@@ -1,0 +1,24 @@
+[package]
+name = "ygg-cli"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+publish = false
+
+# The native `ygg` porcelain frontend. One JSON command contract
+# (tools/swarmharness/introspection/commands.json) owns grammar, examples,
+# completion, component dispatch declarations and validation; this binary
+# never keeps a second command table. Local help/completion/payload are
+# self-contained: no daemon, network, auth or source adapter is touched on
+# any help route. Component dispatch preserves argv, signals and exit
+# status by exec(3)-ing the resolved owned runner directly; a resolved
+# runner that is this binary itself is refused instead of recursing.
+[[bin]]
+name = "ygg"
+path = "src/main.rs"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = "0.11.0"

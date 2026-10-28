@@ -7,7 +7,7 @@ from pathlib import Path
 import sys
 
 try:
-    from ygg_command_tree import TREE, CONTRACT_HASH, complete, context, help_text, parse, search_examples
+    from ygg_command_tree import TREE, CONTRACT_HASH, PlannedFamily, complete, context, help_text, parse, search_examples
 except (ImportError, ValueError, TypeError, KeyError, OSError) as exc:
     print("ygg: command catalog unavailable (" + type(exc).__name__ + "); install a matching generation", file=sys.stderr)
     raise SystemExit(3)
@@ -49,6 +49,10 @@ def main(argv=None):
         return 3
     try:
         path, args, rest = parse(argv)
+    except PlannedFamily as exc:
+        # A declared planned family refuses effects explicitly; local help stays.
+        print("ygg: " + str(exc), file=sys.stderr)
+        return 3
     except ValueError as exc:
         print("ygg: " + str(exc), file=sys.stderr)
         return 2
