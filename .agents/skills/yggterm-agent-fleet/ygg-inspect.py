@@ -6,7 +6,11 @@ import os
 from pathlib import Path
 import sys
 
-from ygg_command_tree import TREE, complete, context, help_text, parse, search_examples
+try:
+    from ygg_command_tree import TREE, CONTRACT_HASH, complete, context, help_text, parse, search_examples
+except (ImportError, ValueError, TypeError, KeyError, OSError) as exc:
+    print("ygg: command catalog unavailable (" + type(exc).__name__ + "); install a matching generation", file=sys.stderr)
+    raise SystemExit(3)
 
 
 def main(argv=None):
@@ -39,6 +43,10 @@ def main(argv=None):
     # the topic-board verbs. Its existing argparse validator remains owner.
     if argv[0] == "board" and len(argv) > 1 and argv[1].startswith("-"):
         argv.insert(1, "rows")
+    expected_contract = os.environ.get("YGG_COMMAND_CONTRACT_HASH")
+    if expected_contract and expected_contract != CONTRACT_HASH:
+        print("ygg: native/component command contracts differ; install a matching generation", file=sys.stderr)
+        return 3
     try:
         path, args, rest = parse(argv)
     except ValueError as exc:
@@ -69,7 +77,13 @@ complete -F _ygg_complete ygg''')
         if target == "@msgboard":
             os.execvp("msgboard", ["msgboard", *fixed, *rest])
         root = Path(os.environ.get("YGG_BIN_DIR", Path(__file__).resolve().parent))
-        executable = root / target
+        # Dispersal carries memory copies for bootstrap, but its owner-managed
+        # runner is authoritative. A newer owner update must not be bypassed
+        # by a stale copy of the same filename in the payload directory.
+        if target in ("ygg-memory", "ygg-memory.py"):
+            executable = Path(os.environ.get("YGG_MEMORY_BIN", Path.home() / ".local/bin" / target))
+        else:
+            executable = root / target
         if not executable.is_file():
             print("ygg: compatibility tool unavailable: " + target, file=sys.stderr)
             return 3
@@ -92,4 +106,8 @@ complete -F _ygg_complete ygg''')
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except OSError as exc:
+        print("ygg: owned component unavailable (" + type(exc).__name__ + ")", file=sys.stderr)
+        raise SystemExit(3)

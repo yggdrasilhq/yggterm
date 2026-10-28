@@ -1,5 +1,11 @@
 # Architecture Audit, 2026-05-16
 
+Historical scope: this audit describes terminal/session/GUI failure modes.
+The [4.0 system contract](yggterm-4-system.md) supersedes its GUI-primary
+product framing. Its domain-specific ownership, byte-preservation and
+observer rules remain binding; a GUI is not the system's lifecycle or
+coordination authority.
+
 This audit records why terminal, session, hot-update, and theme regressions kept
 returning even after telemetry, app-control probes, and smoke tests were added.
 The repeated failure was not lack of instrumentation. It was source-of-truth

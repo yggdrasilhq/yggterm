@@ -6,12 +6,18 @@
 
 ## Mission & Core Value Proposition
 
-Build **Yggdrasil Terminal**: a Rust-first, cross-platform, remote-first terminal workspace with a Dioxus desktop shell shaped like Zed, a daemon-owned PTY core, and an embedded xterm.js terminal surface.
+Build **yggterm**, the distributed swarm operating layer above conventional
+operating systems. `ygg` is the primary human/agent porcelain; the Dioxus
+desktop GUI is an optional client over the same daemon, identity, memory,
+coordination and evidence contracts. Start with the progressive
+[yggterm skill](.agents/skills/yggterm/SKILL.md), then load the relevant door.
+The [4.0 contract](docs/yggterm-4-system.md) is the target and release gate,
+not a claim that all planned capabilities or existing planes are healthy.
 
-### The product yggterm replaces
+### The GUI workflow yggterm replaces
 The user's pre-yggterm workflow: VSCode terminal panes → tmux inside them (for persistence) → ssh to N different machines → `codex resume` / `claude -r` on each. When VSCode dies, manually reattach to tmux, re-find sessions, re-orient across machines. **yggterm exists to make this workflow disappear.**
 
-### Core value proposition & handoff rule
+### GUI handoff rule within the system
 When the user clicks an agent session in the cwd tree, yggterm performs the equivalent of:
 ```bash
 ssh <machine> "cd <cwd> && codex resume <UUID>"      # or: claude -r <UUID>

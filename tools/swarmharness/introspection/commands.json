@@ -1,0 +1,1522 @@
+{
+  "schema_version": 1,
+  "option_sets": {
+    "json": [
+      {
+        "flags": [
+          "--json"
+        ],
+        "help": "Emit a versioned machine-readable result.",
+        "action": "store_true"
+      }
+    ],
+    "common": [
+      {
+        "$ref": "json"
+      },
+      {
+        "flags": [
+          "--host"
+        ],
+        "help": "Host name or all (configured enrollment only)."
+      },
+      {
+        "flags": [
+          "--since"
+        ],
+        "help": "Relative age, such as 7d, or an absolute timestamp."
+      },
+      {
+        "flags": [
+          "--until"
+        ],
+        "help": "Absolute timestamp or future duration, such as +7d."
+      },
+      {
+        "flags": [
+          "--limit"
+        ],
+        "help": "Maximum result rows.",
+        "default": "50"
+      },
+      {
+        "flags": [
+          "--cursor"
+        ],
+        "help": "Continue a page of the same snapshot."
+      },
+      {
+        "flags": [
+          "--snapshot"
+        ],
+        "help": "Read an immutable retained snapshot ID."
+      }
+    ],
+    "dream_filters": [
+      {
+        "flags": [
+          "--state"
+        ],
+        "help": "Match attempt states; repeats are OR.",
+        "action": "append",
+        "choices": [
+          "planned",
+          "scheduled",
+          "queued",
+          "running",
+          "failed",
+          "completed",
+          "cancelled",
+          "interrupted",
+          "unknown",
+          "retry_wait",
+          "cooldown_wait"
+        ]
+      },
+      {
+        "flags": [
+          "--review"
+        ],
+        "help": "Composer disposition.",
+        "choices": [
+          "unreviewed",
+          "investigating",
+          "repair-proposed",
+          "repair-running",
+          "awaiting-verification",
+          "verified",
+          "false-positive",
+          "deferred"
+        ]
+      }
+    ]
+  },
+  "commands": [
+    {
+      "path": [],
+      "summary": "Inspect and operate the swarm. Type a noun to learn the next word.",
+      "options": []
+    },
+    {
+      "path": [
+        "dream"
+      ],
+      "summary": "Inspect autonomous work, attempts and their evidence.",
+      "options": []
+    },
+    {
+      "path": [
+        "dream",
+        "ps"
+      ],
+      "summary": "Show active dream attempts.",
+      "handler": "query",
+      "options": [
+        {
+          "$ref": "common"
+        }
+      ]
+    },
+    {
+      "path": [
+        "dream",
+        "ls"
+      ],
+      "summary": "Browse planned, current and historical dreams.",
+      "handler": "query",
+      "options": [
+        {
+          "$ref": "common"
+        },
+        {
+          "$ref": "dream_filters"
+        },
+        {
+          "flags": [
+            "--all"
+          ],
+          "help": "Include retained attempt history.",
+          "action": "store_true"
+        }
+      ],
+      "examples": [
+        {
+          "title": "Find failed dreams not examined by the composer",
+          "command": "ygg dream ls --all --state failed --review unreviewed --since 7d",
+          "tags": "failures history composer"
+        }
+      ]
+    },
+    {
+      "path": [
+        "dream",
+        "inspect"
+      ],
+      "summary": "Explain a work item, its retries and repair history.",
+      "handler": "query",
+      "options": [
+        {
+          "$ref": "common"
+        },
+        {
+          "flags": [
+            "--attempts"
+          ],
+          "help": "Include every retained attempt.",
+          "action": "store_true"
+        },
+        {
+          "flags": [
+            "--repairs"
+          ],
+          "help": "Include linked composer notes and repair outcomes.",
+          "action": "store_true"
+        }
+      ],
+      "operand": "id",
+      "examples": [
+        {
+          "title": "Trace a failed work item through retries and repairs",
+          "command": "ygg dream inspect dream-42 --attempts --repairs",
+          "tags": "history evidence"
+        }
+      ]
+    },
+    {
+      "path": [
+        "dream",
+        "logs"
+      ],
+      "summary": "Read evidence for an exact dream attempt.",
+      "handler": "query",
+      "options": [
+        {
+          "$ref": "common"
+        },
+        {
+          "flags": [
+            "--attempt"
+          ],
+          "help": "Exact attempt ID."
+        }
+      ],
+      "operand": "id",
+      "examples": [
+        {
+          "title": "Read the failed attempt, not a later retry",
+          "command": "ygg dream logs dream-42 --attempt attempt-3",
+          "tags": "failure logs"
+        }
+      ]
+    },
+    {
+      "path": [
+        "dream",
+        "open"
+      ],
+      "summary": "Select and inspect a live session or read-only transcript.",
+      "effect": "attach",
+      "handler": "open",
+      "options": [
+        {
+          "$ref": "common"
+        },
+        {
+          "$ref": "dream_filters"
+        },
+        {
+          "flags": [
+            "--pick"
+          ],
+          "help": "Choose interactively; never resumes work.",
+          "action": "store_true"
+        },
+        {
+          "flags": [
+            "--attempt"
+          ],
+          "help": "Exact attempt ID."
+        }
+      ],
+      "operand": "id",
+      "optional_operand": true,
+      "examples": [
+        {
+          "title": "Select a failed attempt for human inspection",
+          "command": "ygg dream open --pick --state failed",
+          "tags": "picker session harness"
+        }
+      ]
+    },
+    {
+      "path": [
+        "dream",
+        "status"
+      ],
+      "summary": "Existing orchestrator status (compatibility).",
+      "handler": "legacy",
+      "options": [
+        {
+          "$ref": "json"
+        }
+      ],
+      "examples": [
+        {
+          "title": "Read the existing spawner ledger",
+          "command": "ygg dream status --json",
+          "tags": ""
+        }
+      ],
+      "legacy": [
+        "ygg-dream-orchestrator.py",
+        "status"
+      ]
+    },
+    {
+      "path": [
+        "dream",
+        "topup"
+      ],
+      "summary": "Stage work through existing permission and arming gates.",
+      "effect": "dispatch",
+      "handler": "legacy",
+      "options": [
+        {
+          "$ref": "json"
+        }
+      ],
+      "legacy": [
+        "ygg-dream-orchestrator.py",
+        "topup"
+      ]
+    },
+    {
+      "path": [
+        "dream",
+        "supervise"
+      ],
+      "summary": "Run the existing gated supervision pass.",
+      "effect": "change",
+      "handler": "legacy",
+      "options": [
+        {
+          "$ref": "json"
+        }
+      ],
+      "legacy": [
+        "ygg-dream-orchestrator.py",
+        "supervise"
+      ]
+    },
+    {
+      "path": [
+        "service"
+      ],
+      "summary": "Locate expected and observed swarm services and resources.",
+      "options": []
+    },
+    {
+      "path": [
+        "service",
+        "ps"
+      ],
+      "summary": "Compare expected services with observed instances.",
+      "handler": "query",
+      "options": [
+        {
+          "$ref": "common"
+        }
+      ],
+      "examples": [
+        {
+          "title": "Find where each service runs",
+          "command": "ygg service ps --host all",
+          "tags": "placement missing duplicate"
+        }
+      ]
+    },
+    {
+      "path": [
+        "service",
+        "inspect"
+      ],
+      "summary": "Inspect one service's identity and health.",
+      "handler": "query",
+      "options": [
+        {
+          "$ref": "common"
+        }
+      ],
+      "operand": "id",
+      "examples": [
+        {
+          "title": "Inspect a service on its owning host",
+          "command": "ygg service inspect service-12 --host worker-a",
+          "tags": ""
+        }
+      ]
+    },
+    {
+      "path": [
+        "service",
+        "top"
+      ],
+      "summary": "Show compute ownership without counting shared resources twice.",
+      "handler": "query",
+      "options": [
+        {
+          "$ref": "common"
+        },
+        {
+          "flags": [
+            "--by"
+          ],
+          "help": "Group resource ownership.",
+          "choices": [
+            "dream",
+            "service",
+            "host"
+          ],
+          "default": "dream"
+        }
+      ],
+      "examples": [
+        {
+          "title": "Compare dreamer compute",
+          "command": "ygg service top --by dream",
+          "tags": "cpu memory resources"
+        }
+      ]
+    },
+    {
+      "path": [
+        "service",
+        "logs"
+      ],
+      "summary": "Read bounded service diagnostics.",
+      "handler": "query",
+      "options": [
+        {
+          "$ref": "common"
+        }
+      ],
+      "operand": "id",
+      "examples": [
+        {
+          "title": "Read an hour of service failures",
+          "command": "ygg service logs service-12 --host worker-a --since 1h",
+          "tags": ""
+        }
+      ]
+    },
+    {
+      "path": [
+        "schedule"
+      ],
+      "summary": "Read periodic jobs and revisable conditional commitments.",
+      "options": []
+    },
+    {
+      "path": [
+        "schedule",
+        "ls"
+      ],
+      "summary": "List planned work with its conditions and next checks.",
+      "handler": "query",
+      "options": [
+        {
+          "$ref": "common"
+        },
+        {
+          "flags": [
+            "--due"
+          ],
+          "help": "Due boundary, such as before:month-end."
+        }
+      ],
+      "examples": [
+        {
+          "title": "Find work to evaluate before month end",
+          "command": "ygg schedule ls --due before:month-end",
+          "tags": "monthly conditional plans"
+        }
+      ]
+    },
+    {
+      "path": [
+        "schedule",
+        "inspect"
+      ],
+      "summary": "Read a commitment's source, conditions and authority.",
+      "handler": "query",
+      "options": [
+        {
+          "$ref": "common"
+        }
+      ],
+      "operand": "id",
+      "examples": [
+        {
+          "title": "Inspect the transcription priority conditions",
+          "command": "ygg schedule inspect month-end-transcription",
+          "tags": ""
+        }
+      ]
+    },
+    {
+      "path": [
+        "schedule",
+        "why"
+      ],
+      "summary": "Explain why planned work is due, held or awaiting evaluation.",
+      "handler": "query",
+      "options": [
+        {
+          "$ref": "common"
+        }
+      ],
+      "operand": "id",
+      "examples": [
+        {
+          "title": "Explain a deferred monthly sweep",
+          "command": "ygg schedule why month-end-transcription",
+          "tags": "blocked prerequisites"
+        }
+      ]
+    },
+    {
+      "path": [
+        "schedule",
+        "history"
+      ],
+      "summary": "Read previous decisions and reasons for changing them.",
+      "handler": "query",
+      "options": [
+        {
+          "$ref": "common"
+        }
+      ],
+      "operand": "id",
+      "examples": [
+        {
+          "title": "See how a future commitment changed",
+          "command": "ygg schedule history month-end-transcription",
+          "tags": "opinions revisions"
+        }
+      ]
+    },
+    {
+      "path": [
+        "swarm"
+      ],
+      "summary": "Scan heartbeat, capacity balance and operational evidence.",
+      "options": []
+    },
+    {
+      "path": [
+        "swarm",
+        "status"
+      ],
+      "summary": "Summarize state and observation coverage.",
+      "handler": "query",
+      "options": [
+        {
+          "$ref": "common"
+        }
+      ],
+      "examples": [
+        {
+          "title": "Start a system inspection",
+          "command": "ygg swarm status",
+          "tags": "overview health"
+        }
+      ]
+    },
+    {
+      "path": [
+        "swarm",
+        "heartbeat"
+      ],
+      "summary": "Separate service pulse, observer freshness and useful progress.",
+      "handler": "query",
+      "options": [
+        {
+          "$ref": "common"
+        },
+        {
+          "flags": [
+            "--layers"
+          ],
+          "help": "Show each progress layer.",
+          "action": "store_true"
+        }
+      ],
+      "examples": [
+        {
+          "title": "Find a live service doing no useful work",
+          "command": "ygg swarm heartbeat --layers",
+          "tags": "stalled pulse"
+        }
+      ]
+    },
+    {
+      "path": [
+        "swarm",
+        "pressure"
+      ],
+      "summary": "Explain usable funding, eligible work and execution bottlenecks.",
+      "handler": "query",
+      "options": [
+        {
+          "$ref": "common"
+        },
+        {
+          "flags": [
+            "--by"
+          ],
+          "help": "Group capacity by native funding or execution scope.",
+          "choices": [
+            "plan",
+            "host",
+            "plane"
+          ],
+          "default": "plan"
+        },
+        {
+          "flags": [
+            "--explain"
+          ],
+          "help": "Include constraints and unknown inputs.",
+          "action": "store_true"
+        }
+      ],
+      "examples": [
+        {
+          "title": "Explain unused quota and idle capacity",
+          "command": "ygg swarm pressure --by plan --explain",
+          "tags": "unused quota capacity idle funding balance"
+        }
+      ]
+    },
+    {
+      "path": [
+        "swarm",
+        "events"
+      ],
+      "summary": "Read retained operational events and repair dispositions.",
+      "handler": "query",
+      "options": [
+        {
+          "$ref": "common"
+        },
+        {
+          "flags": [
+            "--subsystem"
+          ],
+          "help": "Subsystem name.",
+          "action": "append"
+        },
+        {
+          "flags": [
+            "--severity"
+          ],
+          "help": "Minimum event severity.",
+          "choices": [
+            "debug",
+            "info",
+            "warning",
+            "error",
+            "critical"
+          ]
+        }
+      ],
+      "examples": [
+        {
+          "title": "Inspect yesterday's memory warnings",
+          "command": "ygg swarm events --subsystem memory --severity warning --since 1d",
+          "tags": "maintenance journal failures"
+        }
+      ]
+    },
+    {
+      "path": [
+        "swarm",
+        "check"
+      ],
+      "summary": "Falsify named health assertions; unknown evidence never passes.",
+      "handler": "query",
+      "options": [
+        {
+          "$ref": "common"
+        },
+        {
+          "flags": [
+            "--scope"
+          ],
+          "help": "Assertion family.",
+          "choices": [
+            "all",
+            "dispatch",
+            "services",
+            "funding",
+            "memory"
+          ],
+          "default": "all"
+        }
+      ],
+      "examples": [
+        {
+          "title": "Check whether dispatch is working",
+          "command": "ygg swarm check --scope dispatch",
+          "tags": "assertions falsify"
+        }
+      ]
+    },
+    {
+      "path": [
+        "help"
+      ],
+      "summary": "Read local command help and search complete examples.",
+      "options": []
+    },
+    {
+      "path": [
+        "help",
+        "examples"
+      ],
+      "summary": "Find a complete command by the task you want to perform.",
+      "handler": "examples",
+      "options": [
+        {
+          "$ref": "json"
+        },
+        {
+          "flags": [
+            "--search"
+          ],
+          "help": "Words in the example's task, tags or command."
+        }
+      ],
+      "examples": [
+        {
+          "title": "Find commands about spare funding",
+          "command": "ygg help examples --search \"unused quota\"",
+          "tags": ""
+        }
+      ]
+    },
+    {
+      "path": [
+        "completion"
+      ],
+      "summary": "Print shell completion setup (local; no fleet probes).",
+      "handler": "completion",
+      "options": [],
+      "operand": "shell",
+      "examples": [
+        {
+          "title": "Install Bash completion in the current shell",
+          "command": "ygg completion bash",
+          "tags": ""
+        }
+      ]
+    },
+    {
+      "path": [
+        "complete"
+      ],
+      "summary": "Return local next-word candidates for shell completion.",
+      "handler": "complete",
+      "options": []
+    },
+    {
+      "path": [
+        "version"
+      ],
+      "summary": "Print the command contract version.",
+      "handler": "version",
+      "options": []
+    },
+    {
+      "path": [
+        "agents"
+      ],
+      "summary": "Existing agent registry compatibility view.",
+      "options": []
+    },
+    {
+      "path": [
+        "agents",
+        "ps"
+      ],
+      "summary": "Read the existing agent registry; coverage is backend-defined.",
+      "handler": "legacy",
+      "options": [
+        {
+          "$ref": "json"
+        }
+      ],
+      "legacy": [
+        "ygg-fleet.py",
+        "agents",
+        "ps"
+      ]
+    },
+    {
+      "path": [
+        "fleet"
+      ],
+      "summary": "Existing fleet compatibility views.",
+      "options": []
+    },
+    {
+      "path": [
+        "fleet",
+        "pressure"
+      ],
+      "summary": "Read the existing fleet pressure view.",
+      "handler": "legacy",
+      "options": [
+        {
+          "$ref": "json"
+        }
+      ],
+      "legacy": [
+        "ygg-fleet.py",
+        "fleet",
+        "pressure"
+      ]
+    },
+    {
+      "path": [
+        "board"
+      ],
+      "summary": "Read topic boards, or access the existing row-board view.",
+      "options": []
+    },
+    {
+      "path": [
+        "board",
+        "scan"
+      ],
+      "summary": "Find unmaterialized feature dreams.",
+      "handler": "legacy",
+      "options": [
+        {
+          "$ref": "json"
+        }
+      ],
+      "legacy": [
+        "ygg-fleet.py",
+        "board",
+        "scan"
+      ]
+    },
+    {
+      "path": [
+        "memory"
+      ],
+      "summary": "Cross-harness semantic memory.",
+      "effect": "legacy",
+      "handler": "legacy",
+      "options": [],
+      "examples": [
+        {
+          "title": "Use the existing owned tool",
+          "command": "ygg memory status --harness codex --ns=-home-user-project --json",
+          "tags": ""
+        }
+      ],
+      "legacy": [
+        "ygg-memory"
+      ],
+      "strict": false
+    },
+    {
+      "path": [
+        "auth"
+      ],
+      "summary": "Existing local account-policy tools.",
+      "effect": "legacy",
+      "handler": "legacy",
+      "options": [],
+      "examples": [
+        {
+          "title": "Use the existing owned tool",
+          "command": "ygg auth status",
+          "tags": ""
+        }
+      ],
+      "legacy": [
+        "ygg-auth.py"
+      ],
+      "strict": false
+    },
+    {
+      "path": [
+        "ci"
+      ],
+      "summary": "Single integration build plane.",
+      "effect": "legacy",
+      "handler": "legacy",
+      "options": [],
+      "examples": [
+        {
+          "title": "Use the existing owned tool",
+          "command": "ygg ci status --json",
+          "tags": ""
+        }
+      ],
+      "legacy": [
+        "ygg-ci.py"
+      ],
+      "strict": false
+    },
+    {
+      "path": [
+        "init"
+      ],
+      "summary": "Deterministic onboarding.",
+      "effect": "legacy",
+      "handler": "legacy",
+      "options": [],
+      "examples": [
+        {
+          "title": "Use the existing owned tool",
+          "command": "ygg init --tier 0",
+          "tags": ""
+        }
+      ],
+      "legacy": [
+        "ygg-init.sh",
+        "init"
+      ],
+      "strict": false
+    },
+    {
+      "path": [
+        "doctor"
+      ],
+      "summary": "Existing deterministic node diagnostics.",
+      "effect": "legacy",
+      "handler": "legacy",
+      "options": [],
+      "examples": [
+        {
+          "title": "Use the existing owned tool",
+          "command": "ygg doctor",
+          "tags": ""
+        }
+      ],
+      "legacy": [
+        "ygg-init.sh",
+        "doctor"
+      ],
+      "strict": false
+    },
+    {
+      "path": [
+        "row"
+      ],
+      "summary": "Existing row compatibility tool.",
+      "effect": "legacy",
+      "handler": "legacy",
+      "options": [],
+      "legacy": [
+        "ygg_row.py"
+      ],
+      "strict": false
+    },
+    {
+      "path": [
+        "bridge"
+      ],
+      "summary": "Existing bridge compatibility tool.",
+      "effect": "legacy",
+      "handler": "legacy",
+      "options": [],
+      "legacy": [
+        "ygg_bridge.py"
+      ],
+      "strict": false
+    },
+    {
+      "path": [
+        "spawn"
+      ],
+      "summary": "Existing spawn compatibility tool.",
+      "effect": "legacy",
+      "handler": "legacy",
+      "options": [],
+      "legacy": [
+        "ygg-spawn.py"
+      ],
+      "strict": false
+    },
+    {
+      "path": [
+        "deliver"
+      ],
+      "summary": "Existing deliver compatibility tool.",
+      "effect": "legacy",
+      "handler": "legacy",
+      "options": [],
+      "legacy": [
+        "ygg-deliver.py"
+      ],
+      "strict": false
+    },
+    {
+      "path": [
+        "fold"
+      ],
+      "summary": "Existing fold compatibility tool.",
+      "effect": "legacy",
+      "handler": "legacy",
+      "options": [],
+      "legacy": [
+        "ygg-fold.py"
+      ],
+      "strict": false
+    },
+    {
+      "path": [
+        "land"
+      ],
+      "summary": "Existing land compatibility tool.",
+      "effect": "legacy",
+      "handler": "legacy",
+      "options": [],
+      "legacy": [
+        "ygg-land.py"
+      ],
+      "strict": false
+    },
+    {
+      "path": [
+        "claim"
+      ],
+      "summary": "Existing claim compatibility tool.",
+      "effect": "legacy",
+      "handler": "legacy",
+      "options": [],
+      "legacy": [
+        "ygg-claim.sh"
+      ],
+      "strict": false
+    },
+    {
+      "path": [
+        "panic"
+      ],
+      "summary": "Existing panic compatibility tool.",
+      "effect": "legacy",
+      "handler": "legacy",
+      "options": [],
+      "legacy": [
+        "ygg-panic.py"
+      ],
+      "strict": false
+    },
+    {
+      "path": [
+        "booter"
+      ],
+      "summary": "Existing booter compatibility tool.",
+      "effect": "legacy",
+      "handler": "legacy",
+      "options": [],
+      "legacy": [
+        "ygg-booter.py"
+      ],
+      "strict": false
+    },
+    {
+      "path": [
+        "monitor"
+      ],
+      "summary": "Existing monitor compatibility tool.",
+      "effect": "legacy",
+      "handler": "legacy",
+      "options": [],
+      "legacy": [
+        "ygg-monitor.py"
+      ],
+      "strict": false
+    },
+    {
+      "path": [
+        "babysit"
+      ],
+      "summary": "Existing babysit compatibility tool.",
+      "effect": "legacy",
+      "handler": "legacy",
+      "options": [],
+      "legacy": [
+        "ygg-babysit.py"
+      ],
+      "strict": false
+    },
+    {
+      "path": [
+        "board",
+        "rows"
+      ],
+      "summary": "Existing row-board view and row metadata operations.",
+      "effect": "legacy",
+      "handler": "legacy",
+      "options": [],
+      "legacy": [
+        "ygg-board.py"
+      ],
+      "strict": false
+    },
+    {
+      "path": [
+        "board",
+        "read"
+      ],
+      "summary": "Topic-board read through msgboard.",
+      "handler": "legacy",
+      "options": [],
+      "legacy": [
+        "@msgboard",
+        "read"
+      ],
+      "strict": false
+    },
+    {
+      "path": [
+        "board",
+        "list"
+      ],
+      "summary": "Topic-board list through msgboard.",
+      "handler": "legacy",
+      "options": [],
+      "legacy": [
+        "@msgboard",
+        "list"
+      ],
+      "strict": false
+    },
+    {
+      "path": [
+        "board",
+        "summary"
+      ],
+      "summary": "Topic-board summary through msgboard.",
+      "handler": "legacy",
+      "options": [],
+      "legacy": [
+        "@msgboard",
+        "summary"
+      ],
+      "strict": false
+    },
+    {
+      "path": [
+        "board",
+        "post"
+      ],
+      "summary": "Topic-board post through msgboard.",
+      "effect": "change",
+      "handler": "legacy",
+      "options": [],
+      "legacy": [
+        "@msgboard",
+        "post"
+      ],
+      "strict": false
+    },
+    {
+      "path": [
+        "board",
+        "answer"
+      ],
+      "summary": "Topic-board answer through msgboard.",
+      "effect": "change",
+      "handler": "legacy",
+      "options": [],
+      "legacy": [
+        "@msgboard",
+        "answer"
+      ],
+      "strict": false
+    },
+    {
+      "path": [
+        "board",
+        "graduate"
+      ],
+      "summary": "Topic-board graduate through msgboard.",
+      "effect": "change",
+      "handler": "legacy",
+      "options": [],
+      "legacy": [
+        "@msgboard",
+        "graduate"
+      ],
+      "strict": false
+    },
+    {
+      "path": [
+        "ygg-panic.py"
+      ],
+      "summary": "Direct owned-tool compatibility spelling.",
+      "effect": "legacy",
+      "handler": "legacy",
+      "options": [],
+      "legacy": [
+        "ygg-panic.py"
+      ],
+      "strict": false,
+      "hidden": true
+    },
+    {
+      "path": [
+        "ygg-fleet.py"
+      ],
+      "summary": "Compatibility fleet views.",
+      "options": [],
+      "hidden": true
+    },
+    {
+      "path": [
+        "ygg-init.sh"
+      ],
+      "summary": "Direct owned-tool compatibility spelling.",
+      "effect": "legacy",
+      "handler": "legacy",
+      "options": [],
+      "legacy": [
+        "ygg-init.sh"
+      ],
+      "strict": false,
+      "hidden": true
+    },
+    {
+      "path": [
+        "ygg_row.py"
+      ],
+      "summary": "Direct owned-tool compatibility spelling.",
+      "effect": "legacy",
+      "handler": "legacy",
+      "options": [],
+      "legacy": [
+        "ygg_row.py"
+      ],
+      "strict": false,
+      "hidden": true
+    },
+    {
+      "path": [
+        "ygg-spawn.py"
+      ],
+      "summary": "Direct owned-tool compatibility spelling.",
+      "effect": "legacy",
+      "handler": "legacy",
+      "options": [],
+      "legacy": [
+        "ygg-spawn.py"
+      ],
+      "strict": false,
+      "hidden": true
+    },
+    {
+      "path": [
+        "ygg-claim.sh"
+      ],
+      "summary": "Direct owned-tool compatibility spelling.",
+      "effect": "legacy",
+      "handler": "legacy",
+      "options": [],
+      "legacy": [
+        "ygg-claim.sh"
+      ],
+      "strict": false,
+      "hidden": true
+    },
+    {
+      "path": [
+        "ygg-memory"
+      ],
+      "summary": "Direct owned-tool compatibility spelling.",
+      "effect": "legacy",
+      "handler": "legacy",
+      "options": [],
+      "legacy": [
+        "ygg-memory"
+      ],
+      "strict": false,
+      "hidden": true
+    },
+    {
+      "path": [
+        "ygg-booter.py"
+      ],
+      "summary": "Direct owned-tool compatibility spelling.",
+      "effect": "legacy",
+      "handler": "legacy",
+      "options": [],
+      "legacy": [
+        "ygg-booter.py"
+      ],
+      "strict": false,
+      "hidden": true
+    },
+    {
+      "path": [
+        "ygg-fold.py"
+      ],
+      "summary": "Direct owned-tool compatibility spelling.",
+      "effect": "legacy",
+      "handler": "legacy",
+      "options": [],
+      "legacy": [
+        "ygg-fold.py"
+      ],
+      "strict": false,
+      "hidden": true
+    },
+    {
+      "path": [
+        "ygg-ci.py"
+      ],
+      "summary": "Direct owned-tool compatibility spelling.",
+      "effect": "legacy",
+      "handler": "legacy",
+      "options": [],
+      "legacy": [
+        "ygg-ci.py"
+      ],
+      "strict": false,
+      "hidden": true
+    },
+    {
+      "path": [
+        "ygg-land.py"
+      ],
+      "summary": "Direct owned-tool compatibility spelling.",
+      "effect": "legacy",
+      "handler": "legacy",
+      "options": [],
+      "legacy": [
+        "ygg-land.py"
+      ],
+      "strict": false,
+      "hidden": true
+    },
+    {
+      "path": [
+        "ygg-dream-orchestrator.py"
+      ],
+      "summary": "Compatibility spelling of ygg dream.",
+      "options": [],
+      "hidden": true
+    },
+    {
+      "path": [
+        "ygg-auth.py"
+      ],
+      "summary": "Direct owned-tool compatibility spelling.",
+      "effect": "legacy",
+      "handler": "legacy",
+      "options": [],
+      "legacy": [
+        "ygg-auth.py"
+      ],
+      "strict": false,
+      "hidden": true
+    },
+    {
+      "path": [
+        "ygg_bridge.py"
+      ],
+      "summary": "Direct owned-tool compatibility spelling.",
+      "effect": "legacy",
+      "handler": "legacy",
+      "options": [],
+      "legacy": [
+        "ygg_bridge.py"
+      ],
+      "strict": false,
+      "hidden": true
+    },
+    {
+      "path": [
+        "ygg-deliver.py"
+      ],
+      "summary": "Direct owned-tool compatibility spelling.",
+      "effect": "legacy",
+      "handler": "legacy",
+      "options": [],
+      "legacy": [
+        "ygg-deliver.py"
+      ],
+      "strict": false,
+      "hidden": true
+    },
+    {
+      "path": [
+        "ygg-board.py"
+      ],
+      "summary": "Direct owned-tool compatibility spelling.",
+      "effect": "legacy",
+      "handler": "legacy",
+      "options": [],
+      "legacy": [
+        "ygg-board.py"
+      ],
+      "strict": false,
+      "hidden": true
+    },
+    {
+      "path": [
+        "ygg-babysit.py"
+      ],
+      "summary": "Direct owned-tool compatibility spelling.",
+      "effect": "legacy",
+      "handler": "legacy",
+      "options": [],
+      "legacy": [
+        "ygg-babysit.py"
+      ],
+      "strict": false,
+      "hidden": true
+    },
+    {
+      "path": [
+        "ygg-monitor.py"
+      ],
+      "summary": "Direct owned-tool compatibility spelling.",
+      "effect": "legacy",
+      "handler": "legacy",
+      "options": [],
+      "legacy": [
+        "ygg-monitor.py"
+      ],
+      "strict": false,
+      "hidden": true
+    },
+    {
+      "path": [
+        "ygg-dream-orchestrator.py",
+        "status"
+      ],
+      "alias_of": [
+        "dream",
+        "status"
+      ],
+      "examples": []
+    },
+    {
+      "path": [
+        "ygg-dream-orchestrator.py",
+        "topup"
+      ],
+      "alias_of": [
+        "dream",
+        "topup"
+      ]
+    },
+    {
+      "path": [
+        "ygg-dream-orchestrator.py",
+        "supervise"
+      ],
+      "alias_of": [
+        "dream",
+        "supervise"
+      ]
+    },
+    {
+      "path": [
+        "ygg-fleet.py",
+        "agents"
+      ],
+      "alias_of": [
+        "agents",
+        "ps"
+      ],
+      "legacy": [
+        "ygg-fleet.py",
+        "agents"
+      ]
+    },
+    {
+      "path": [
+        "ygg-fleet.py",
+        "agents",
+        "ps"
+      ],
+      "alias_of": [
+        "agents",
+        "ps"
+      ]
+    },
+    {
+      "path": [
+        "ygg-fleet.py",
+        "fleet"
+      ],
+      "alias_of": [
+        "fleet",
+        "pressure"
+      ],
+      "legacy": [
+        "ygg-fleet.py",
+        "fleet"
+      ]
+    },
+    {
+      "path": [
+        "ygg-fleet.py",
+        "fleet",
+        "pressure"
+      ],
+      "alias_of": [
+        "fleet",
+        "pressure"
+      ]
+    },
+    {
+      "path": [
+        "ygg-fleet.py",
+        "board"
+      ],
+      "alias_of": [
+        "board",
+        "scan"
+      ],
+      "legacy": [
+        "ygg-fleet.py",
+        "board"
+      ]
+    },
+    {
+      "path": [
+        "ygg-fleet.py",
+        "board",
+        "scan"
+      ],
+      "alias_of": [
+        "board",
+        "scan"
+      ]
+    },
+    {
+      "path": [
+        "ygg-fleet.py",
+        "pressure"
+      ],
+      "alias_of": [
+        "fleet",
+        "pressure"
+      ],
+      "legacy": [
+        "ygg-fleet.py",
+        "pressure"
+      ]
+    }
+  ]
+}

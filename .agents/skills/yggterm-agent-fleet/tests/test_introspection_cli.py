@@ -39,7 +39,7 @@ class CommandContract(unittest.TestCase):
         self.calls = self.root / "calls.jsonl"
         self.env = dict(os.environ, YGG_BIN_DIR=str(self.bin), YGG_TEST_CALLS=str(self.calls),
                         PYTHONDONTWRITEBYTECODE="1", PATH=str(self.bin) + os.pathsep + os.environ["PATH"])
-        for name in ("ygg-inspect.py", "ygg_command_tree.py"):
+        for name in ("ygg-inspect.py", "ygg_command_tree.py", "commands.json"):
             shutil.copy2(SKILL / name, self.bin / name)
         shutil.copy2(Path(os.environ.get("YGG_TEST_ROUTER", str(SKILL / "ygg"))), self.bin / "ygg")
         for target in {n.legacy[0] for n in commands.TREE.values() if n.legacy} | {"msgboard", "ssh", "zcode-tui"}:
@@ -48,6 +48,7 @@ class CommandContract(unittest.TestCase):
             p = self.bin / target
             p.write_text(SHIM)
             p.chmod(0o755)
+        self.env["YGG_MEMORY_BIN"] = str(self.bin / "ygg-memory")
 
     def run_cli(self, *args):
         return subprocess.run(["bash", str(self.bin / "ygg"), *args], env=self.env,
@@ -102,6 +103,7 @@ class CommandContract(unittest.TestCase):
                  (("ygg-fleet.py", "agents", "ps", "--json"), "ygg-fleet.py", ["agents", "ps", "--json"]),
                  (("ygg-fleet.py", "agents", "--json"), "ygg-fleet.py", ["agents", "--json"]),
                  (("ci", "status", "--json"), "ygg-ci.py", ["status", "--json"]),
+                 (("memory", "status", "--json"), "ygg-memory", ["status", "--json"]),
                  (("row", "list", "--json"), "ygg_row.py", ["list", "--json"]),
                  (("ygg_row.py", "list"), "ygg_row.py", ["list"]),
                  (("claim", "--purpose", "synthetic task"), "ygg-claim.sh", ["--purpose", "synthetic task"]),

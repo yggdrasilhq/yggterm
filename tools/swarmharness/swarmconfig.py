@@ -47,6 +47,7 @@ HEX64 = re.compile(r"^[0-9a-f]{64}$")
 # envelope is excluded: parent/revision/change_id are re-stamped by accept).
 # Owner proposals may change anything.
 OWNER_ONLY_PREFIXES = (
+    "introspection",          # source/metadata enrollment is owner policy
     "fleet",
     "kernel",
     "maintenance",
@@ -268,6 +269,7 @@ _TOP_KEYS = {
     "maintenance": dict, "catalog": dict, "planes": dict, "roles": dict,
     "editor_scenarios": dict, "campaign_policies": dict, "supply": dict,
     "intent": dict, "sync": dict,
+    "introspection": dict,
 }
 
 _IDENTITY_KEYS = {"config_id": str, "authority_epoch": int, "revision": int,
@@ -654,7 +656,77 @@ def validate(cfg):
     if v == 3:
         _validate_pressure(f, cfg)
 
+    _validate_introspection(f, cfg)
+
     return f
+
+
+def _validate_introspection(f, cfg):
+    """Optional read-only enrollment; absence keeps every source disabled."""
+    if "introspection" not in cfg or not isinstance(cfg["introspection"], dict):
+        return
+    spec = cfg["introspection"]
+    _keys(f, "introspection", spec,
+          {"version", "enabled", "authority_ref", "host_aliases", "sources", "limits", "retention"},
+          {"version", "enabled", "sources"})
+    if type(spec.get("version")) is not int or spec["version"] != 1:
+        _fault(f, "inspection_schema", "introspection.version must be 1")
+    if type(spec.get("enabled")) is not bool:
+        _fault(f, "inspection_schema", "introspection.enabled must be boolean")
+    hosts = ((cfg.get("fleet") or {}).get("hosts") or [])
+    aliases = spec.get("host_aliases", {})
+    if not isinstance(aliases, dict) or any(not isinstance(k, str) or v not in hosts for k, v in aliases.items()):
+        _fault(f, "inspection_schema", "introspection.host_aliases must resolve to fleet hosts")
+    sources = spec.get("sources")
+    if not isinstance(sources, dict):
+        _fault(f, "inspection_schema", "introspection.sources must be a mapping")
+        return
+    kinds = {"queue", "attempt_history", "heartbeat", "services", "task_ledger",
+             "schedule", "composer", "reviews", "memory_lock"}
+    for sid, source in sources.items():
+        if not isinstance(sid, str) or not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_-]{0,79}", sid) or not isinstance(source, dict):
+            _fault(f, "inspection_schema", "invalid introspection source ID/record")
+            continue
+        path = "introspection.sources." + sid
+        _keys(f, path, source, {"kind", "host", "path", "enabled", "ttl_seconds", "privacy",
+                              "units", "queue_source_ref", "note"},
+              {"kind", "host", "enabled", "ttl_seconds", "privacy"})
+        if source.get("kind") not in kinds or source.get("host") not in hosts:
+            _fault(f, "inspection_schema", path + ": unknown kind or host")
+        if type(source.get("enabled")) is not bool:
+            _fault(f, "inspection_schema", path + ".enabled must be boolean")
+        ttl = source.get("ttl_seconds")
+        if type(ttl) is not int or not 1 <= ttl <= 86400:
+            _fault(f, "inspection_schema", path + ".ttl_seconds must be 1..86400")
+        if source.get("privacy") != "inspection-metadata-v1":
+            _fault(f, "inspection_schema", path + ": unsupported metadata privacy contract")
+        source_path = source.get("path")
+        if source.get("kind") != "services":
+            if not isinstance(source_path, str) or not source_path or any(c in source_path for c in "\x00\n\r"):
+                _fault(f, "inspection_schema", path + ".path required")
+            elif any(part.lower() in {".ssh", ".gnupg", "auth", "credentials", "vault", "vaults"}
+                     for part in Path(source_path).parts):
+                _fault(f, "inspection_schema", path + ": credential/vault paths are excluded")
+        if "units" in source and (not isinstance(source["units"], list) or any(
+                not isinstance(unit, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9@_.:-]*\.(?:service|timer)", unit)
+                for unit in source["units"])):
+            _fault(f, "inspection_schema", path + ": invalid service units")
+        if source.get("queue_source_ref") is not None and source["queue_source_ref"] not in sources:
+            _fault(f, "inspection_schema", path + ": unknown queue_source_ref")
+    for section, fields in {
+        "limits": {"read_timeout_seconds": (1, 30), "total_timeout_seconds": (1, 60),
+                   "max_records": (1, 10000), "max_bytes": (4096, 16777216)},
+        "retention": {"raw_days": (1, 365), "segment_bytes": (1048576, 67108864),
+                      "max_store_bytes": (8388608, 2147483648)},
+    }.items():
+        value = spec.get(section, {})
+        if not isinstance(value, dict):
+            _fault(f, "inspection_schema", "introspection." + section + " must be a mapping")
+            continue
+        _keys(f, "introspection." + section, value, set(fields))
+        for key, number in value.items():
+            if key in fields and (type(number) is not int or not fields[key][0] <= number <= fields[key][1]):
+                _fault(f, "inspection_schema", "introspection." + section + "." + key + " outside bounds")
 
 
 # ------------------------------------------------------------- pressure v3

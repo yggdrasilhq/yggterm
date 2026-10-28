@@ -1,441 +1,115 @@
-# yggterm
+# yggterm — the distributed swarm operating layer
 
-Install the latest build directly from GitHub Releases:
+yggterm provides durable agent execution, shared memory, coordination,
+observation and governed repair across conventional operating systems.
+Linux and the yggdrasil standard variant are the primary worker platforms.
 
-Linux and macOS:
+**`ygg` is the human and agent porcelain. The yggterm GUI is an optional
+client of the same system.** Work identity, process lifetime, hierarchy and
+health must remain inspectable when the desktop is absent or broken.
 
-```bash
+> **4.0.0 migration in progress.** The system/porcelain contract is being
+> implemented. Local progressive CLI help is available on enrolled nodes;
+> source adapters, the CLI-first release seed and platform qualification are
+> tracked separately. This page does not claim a 4.0 release, repaired GUI,
+> healthy execution plans or calibrated resource allocation.
+
+## Start at the CLI
+
+```sh
+ygg
+ygg dream
+ygg help examples --search "unused quota"
+ygg dream inspect --help
+ygg completion bash
+```
+
+Noun groups teach the next word with task examples. Help and completion are
+local and never invoke operational backends. An unavailable observation is
+reported as unknown, not as zero running work or a healthy empty system.
+
+The 4.0 command family includes packages/skills (`ygg ynpm`), shared memory,
+CI, daemon control, supervised harness execution, work hierarchy, relays,
+dream history, services, conditional schedules and layered system inspection.
+See [the system contract](docs/yggterm-4-system.md) for target interfaces and
+migration status, and [CLI inspection](docs/swarm-introspection.md) for the
+implemented command contract. A documented target is not a shipped capability.
+
+## Install the `ygg` seed
+
+The **4.0 installation contract** is a verified user-space CLI generation,
+with local help and explicit capability readiness. GUI installation and paid
+autonomy are separate operations. The installer/artifact cutover is not yet
+qualified; the existing scripts below still describe the 3.x compatibility
+channel until that work lands. They must not be used as proof of a CLI-only
+4.0 installation.
+
+Unix install entry:
+
+```sh
 curl -fsSL https://raw.githubusercontent.com/yggdrasilhq/yggterm/main/scripts/install.sh | sh
 ```
 
-Windows PowerShell:
+Windows PowerShell install entry:
 
 ```powershell
 irm https://raw.githubusercontent.com/yggdrasilhq/yggterm/main/scripts/install.ps1 | iex
 ```
 
-Yggterm installs into a managed user-space location, wires up desktop
-integration, and ships `ynpm`/`ynpx` beside the GUI. `ynpm` owns release
-updates, package generations, and fleet distribution.
-
-Run `ynpm self-update` to force a direct-install update, or
-`ynpm sync-fleet --hosts machine-a,machine-b --integrated` to distribute the
-verified generations to named yggterm hosts.
-
-Hot update is a session-preservation contract. When an updated client finds a running daemon that still owns live PTYs, the new daemon should come up without killing those runtimes; the old daemon remains a preserved terminal owner and the updated daemon routes terminal I/O through it until the session naturally ends or can be moved safely. If that fault-tolerant handoff cannot be proven, update completion is deferred. Losing the PTY session is a failed update, not a hot update.
-
-Direct installs also expose `yggterm-headless`, the panic-management CLI for terminal incidents. Use it from SSH when a session is hung, slow, missing after restore, drawing incorrectly, or connected to a stale daemon; it gathers a structured picture of daemon reachability, session presence, latency, and restart/update state without depending on the full desktop shell.
-
-Useful daemon-control scenarios:
-
-```bash
-yggterm-headless server monitor --scenario panic-report --expect-path "live::<session>" --jsonl-out ~/.yggterm/scratchpad/yggterm-incident.jsonl
-yggterm-headless server monitor --scenario panic-report --iterations 30 --interval-ms 1000 --jsonl-out ~/.yggterm/scratchpad/yggterm-watch.jsonl
-yggterm-headless server monitor --scenario server-list
-yggterm-headless server monitor --scenario hot-restart --all --timeout-ms 30000
-yggterm-headless server monitor --scenario wait-session --expect-path "live::<session>" --timeout-ms 30000
-yggterm-headless server monitor --scenario latency-check --all
-yggterm-headless server monitor --scenario managed-cli-refresh --foreground
-```
-
-Yggterm also ships an always-on event trace so sluggish sessions can be debugged after the fact or while the app is still running:
-
-```bash
-yggterm server app state --timeout-ms 5000
-yggterm server app rows --timeout-ms 5000
-yggterm server app focus --timeout-ms 5000
-yggterm server app open "remote-session://dev/<session-id>" --view terminal --timeout-ms 8000
-yggterm server app screenshot ~/.yggterm/scratchpad/yggterm-shot.png --timeout-ms 10000
-yggterm server app screenrecord ~/.yggterm/scratchpad/yggterm-shot.mov --duration-sec 12 --timeout-ms 25000
-yggterm server screenshot app ~/.yggterm/scratchpad/yggterm-shot.png
-yggterm-headless server trace tail 200
-yggterm-headless server trace follow 200 500
-yggterm-headless server trace bundle 200 --screenshot > yggterm-trace.json
-```
-
-`server app ...` is the SSH-reachable YggUI control plane. `state` returns the live shell/window snapshot, `rows` dumps the merged visible sidebar tree exactly as the running app sees it, `open` queues a specific visible row into preview or terminal mode, `focus` raises the running window, `screenshot` asks the app to capture itself, and `screenrecord` captures a timed recording of the live app window through the native app backend. On Linux, app screenshots come from the embedded WebKitGTK surface instead of `spectacle`, `import`, or DOM-to-canvas hacks. On macOS, app screenshots and recordings are routed through the native `screencapture` window path tied to the live NSWindow. `server screenshot app ...` remains as a compatibility alias, and `trace bundle --screenshot` now includes the live app-state snapshot before falling back to external desktop tools when there is no app response. The trace lives at `~/.yggterm/event-trace.jsonl` and is designed to stay on during dogfooding, with lightweight rotation once it gets large.
-
-## Demo And Release Evidence
-
-Yggterm is also the first consumer of a broader `yggui` product pipeline for AI-first desktop apps:
-
-- deterministic app-control macros
-- always-on UI and daemon traces
-- proof bundles with screenshots, recordings, and state dumps
-- curated changelog entries backed by those proof bundles
-- release pages and marketing material generated from the same evidence
-
-The in-repo structure for that work lives here:
-
-- [docs/demos/ARCHITECTURE.md](/home/user/gh/yggterm/docs/demos/ARCHITECTURE.md)
-- [docs/demos/FORMAT.md](/home/user/gh/yggterm/docs/demos/FORMAT.md)
-- [docs/demos/STYLE.md](/home/user/gh/yggterm/docs/demos/STYLE.md)
-- [artifacts/demos/unreleased/README.md](/home/user/gh/yggterm/artifacts/demos/unreleased/README.md)
-- [.agents/skills/yggui-changelog-demo/SKILL.md](/home/user/gh/yggterm/.agents/skills/yggui-changelog-demo/SKILL.md)
-
-The intent is to keep release notes, QA evidence, and demo capture as one pipeline rather than three disconnected chores. `yggterm` is the first proving ground; later `yggui` apps should be able to reuse the same manifest format, macros, proof bundle structure, and release-page generation flow.
-
-For apps built on `yggui`, keep one canonical SVG icon in-repo and regenerate the runtime PNG from it instead of hand-editing both assets. This repo uses:
-
-```bash
-./scripts/render-icon-assets.sh
-```
-
-That keeps the window icon, direct-install desktop assets, and packaged integrations on the same artwork.
-
-## What yggterm is
-
-Yggdrasil Terminal (`yggterm`) is a remote-first terminal workspace built in Rust.
-
-The short version is:
-
-**Zen Browser for AI terminal work, with server-owned session persistence.**
-
-The product target is not “an editor with a terminal panel.” The terminal is the center. Everything else exists to help you find, restore, explain, automate, and organize terminal work without losing momentum.
-
-The app mark is `Yggi`: a small Yggdrasil sprout growing from a warm prompt. The brand should feel like a trustworthy workspace with a little character, not a generic terminal emulator icon.
-
-This project comes from a very specific pain. Modern terminal work is not one shell doing one thing. It is many long-lived sessions, many machines, many half-finished threads of thought, AI transcripts, SSH reconnects, and a constant risk that a laptop sleep or crash will erase the mental desktop that told you what was happening. Yggterm is trying to turn that mess into a workspace you can trust.
-
-That means:
-
-- one desktop shell for sessions, terminals, papers, folders, separators, and metadata
-- a daemon-owned PTY runtime so terminals survive view switches cleanly
-- a virtual tree of work surfaces, not a raw filesystem browser
-- first-class support for agent sessions, generic terminals, SSH sessions, papers, and virtual folders
-- fast startup from local metadata under `~/.yggterm`
-
-## Why use it
-
-Yggterm is trying to solve a specific problem: terminal work is usually scattered across shell history, tmux panes, GNU Screen sessions, half-remembered commands, AI transcripts, scratch files, and SSH tabs. That fragmentation kills flow.
-
-The worst part is not just losing a process. It is losing the map in your head:
-
-- what is running
-- on which machine
-- for which project
-- why that session exists
-- what the last meaningful conclusion was
-
-That is the job.
-
-Yggterm is for people doing real multi-machine work, especially AI-heavy terminal work, who are tired of rebuilding that map by hand every time life interrupts them.
-
-Yggterm keeps those things nearby:
-
-- the live terminal
-- the recovered Codex session or other session preview
-- papers and future structured canvases
-- session metadata and restore state
-
-The left tree is not just a launcher. It is the workspace memory.
-
-The bigger bet is that terminal work deserves the same level of UX ambition browsers got when tabs became too important to manage casually. If Zen Browser and Arc helped people survive the chaos of 120 tabs, Yggterm should do the same for 120 terminal contexts.
-
-If that resonates, read the product thesis in [PRODUCT_THESIS.md](/home/user/gh/yggterm/PRODUCT_THESIS.md).
-
-## Core nouns
-
-Yggterm is converging on a small set of user-facing concepts:
-
-- `Session`: an agent-oriented context. Today that usually means Codex, with `Codex` and `Codex LiteLLM` treated as two modes of the same session model.
-- `Terminal`: a generic daemon-owned shell/process context. This is where plain shells, SSH terminals, and future low-friction automation live.
-- `Paper`: a canvas surface for thinking, planning, and organizing work near the terminal. Over time it can grow beyond plain text into richer surfaces like kanban, calendar, and spreadsheet-like modes.
-- `Folder`: a virtual organizational node in the tree, often tied to a cwd or project context.
-- `Separator`: a visual divider for compartmentalization in the tree.
-
-This vocabulary matters. Yggterm is not trying to become “documents plus recipes plus tabs.” It is trying to become a calm workspace where sessions, terminals, papers, and folders stay near each other and stay understandable.
-
-## Install and update model
-
-The direct install path above is the mainline channel right now.
-
-What it does:
-
-- detects your OS and architecture
-- downloads the latest matching GitHub Release artifact
-- installs it into a managed user-space root
-- creates desktop integration for direct installs
-- refreshes integration when assets change
-- `ynpm self-update` checks the direct release channel and installs the complete
-  `yggterm`/`yggterm-headless`/`ynpm`/`ynpx` generation atomically
-- startup delegates the update transaction to ynpm, then shows the notification
-  and performs the session-preserving restart
-- dev builds may be installed with `ynpm dev` and distributed to the fleet;
-  production takes over only when it is newer or has same-version release polish
-
-Package-managed installs behave differently on purpose:
-
-- `.deb`, Homebrew, Winget, Scoop, Flatpak, and Snap installs are detected
-- those installs switch to notify-only update mode
-- Yggterm tells the user to update with the matching package manager instead of mutating the install behind its back
-
-This split keeps the fast-moving direct channel frictionless while respecting native platform ownership when the app was installed by a package manager.
-
-On Linux, Yggterm now defaults to `NO_AT_BRIDGE=1` unless you explicitly opt back in with `YGGTERM_ENABLE_ACCESSIBILITY=1`. That workaround exists because some KDE/Wayland + WebKitGTK setups crash in `libatk-bridge` before the app window becomes visible.
-
-## Current product shape
-
-Today the active stack is:
-
-- Dioxus desktop shell for the app surface
-- xterm.js embedded in the main viewport for terminal mode
-- `yggterm-server` as the daemon-owned PTY/runtime layer
-- SQLite-backed local metadata for papers, folders, separators, and generated labels
-
-That means the current app already supports:
-
-- embedded terminal mode in the main canvas
-- rendered preview mode for stored sessions and documents
-- daemon-owned live sessions that survive switching between items
-- local shell sessions, SSH-backed sessions, and Codex-style agent sessions
-- an in-terminal Codex/Codex LiteLLM mode switch with server-side guardrails
-- lightweight papers stored in `~/.yggterm/workspace.db`
-- executable terminal recipes as an intermediate step toward richer terminal automation
-- generated session titles through a configured LiteLLM endpoint
-- direct install with ynpm-owned self-update and package-manager-aware mode
-- SSH-side Yggterm commands for remote session scanning, generated-copy persistence, and clipboard image staging
-
-## Separately Tracked Embeddable Surfaces
-
-Some Yggterm workspace surfaces are now intended to mature in their own repositories while still embedding into the Yggterm shell.
-
-The current expected family is:
-
-- `ztlkasten`: the roam/obsidian-replacement usage layer, which took over the
-  brain-organization role once sketched as `paper`
-- `cellulose`: an AI-first spreadsheet and analytical workspace (planned; the
-  name is reserved and the repo is not yet cut)
-- Excalidraw integration: likely maintained as a fork or patch stack over the Obsidian Excalidraw plugin rather than reimplemented from zero
-
-The intent is:
-
-- each surface can stand on its own as an app
-- Yggterm can still host them as first-class item types in the virtual workspace tree
-- shared `yggui` automation, observability, and changelog-demo systems can travel across all of them
-
-## Remote command surface
-
-For SSH machines, Yggterm now prefers a Yggterm-owned remote command surface over ad hoc remote helper scripts.
-
-That means the desktop app can ask a remote host to:
-
-- report its Yggterm remote protocol version
-- scan Codex sessions
-- persist generated `title` / `summary`
-- stage clipboard images into that machine's `~/.yggterm/clipboard/`
-
-When the SSH target does not already have a compatible `yggterm` binary on `PATH`, Yggterm bootstraps a matching binary into:
-
-```text
-~/.yggterm/bin/yggterm
-```
-
-and then reuses that binary for later remote commands on the same host. This is the current foundation for a fuller VS Code-style remote server model.
-
-## The workspace model
-
-`YGGTERM_HOME` defaults to `~/.yggterm`.
-
-The long-term model is metadata-first. The tree should describe work, not just folders on disk. A path in Yggterm is allowed to mean:
-
-- a Session
-- a Terminal
-- a Paper
-- a Folder
-- a Separator
-- an SSH target or machine context
-- a future automation surface
-
-Papers are first-class workspace items, not a bolted-on notes tab. They live in `~/.yggterm/workspace.db` and appear in the same tree as sessions and terminals.
-
-This is the direction:
-
-- terminals stay alive in the daemon while you switch views
-- preview and terminal are two lenses on the same workspace item
-- papers live beside the sessions and terminals they explain
-- generic terminals should gradually absorb low-friction automation behavior instead of making users “manage scripts”
-- local shells, agent sessions, and SSH terminals share one runtime model
-- fast local metadata keeps startup cheap even when the tree gets large
-
-## Tree workflow
-
-The sidebar is now an active workspace surface.
-
-Examples of what you can do:
-
-- use `+Session`, `+Terminal`, and `+Paper` as the primary quick-create actions
-- right-click a folder and create a new session there
-- right-click a folder and create a new terminal there
-- right-click a folder and create a nearby paper
-- right-click a folder and add another folder for compartmentalization
-- right-click a folder and add a separator for visual grouping
-- right-click a stored session and create a paper beside it
-- right-click a stored session and create an executable terminal recipe derived from it
-- regenerate generated titles for a session when needed
-
-The intent is simple: organizing the tree should naturally create the right place to work next.
-
-Virtual folders and separators are stored under `~/.yggterm/workspace.db`, so they load quickly and do not depend on walking a large on-disk workspace before the UI becomes useful.
-
-Live terminals are runtime attachments, not automatic workspace clutter. Creating a terminal from a folder starts it in that folder and shows it under `Live Sessions`; it becomes restart-restored after a normal app close only when you explicitly mark it `Keep Alive`. A normal final app close asks the daemon to close non-Keep-Alive live sessions gracefully and force-cleans them after one hour, while stored transcripts and workspace items remain unless you choose a hard delete action.
-
-The SSH connect rail is guided on purpose:
-
-- type `user@ip`, `user@host`, or a shortcut from your `~/.ssh/config` such as `dev`
-- optionally add a remote prefix if you want the session to start inside `machinectl`, `tmux`, or another remote wrapper
-- reconnecting to the same SSH target focuses the existing live session instead of spawning a duplicate
-
-Agent mode switching is handled inside the terminal header, not in global settings:
-
-- a live Codex session can be switched into Codex LiteLLM mode in place
-- Yggterm asks the daemon to stop and relaunch that same session cleanly
-- if the terminal still looks active, the switch is refused and the user gets a notification instead of a corrupted session
-
-## Papers and automation
-
-Yggterm already has a CLI path for lightweight paper content, so notes can be created or updated outside the UI while the richer paper surface keeps evolving.
-
-List documents:
-
-```bash
-yggterm doc list
-```
-
-Write a document from stdin:
-
-```bash
-printf 'check deploy order\ncapture rollback notes\n' | \
-  yggterm doc write /home/user/gh/yggterm/notes/release-plan "Release Plan"
-```
-
-Read a document back:
-
-```bash
-yggterm doc cat /home/user/gh/yggterm/notes/release-plan
-```
-
-The path is virtual. It controls where the item appears in the Yggterm tree; it is not a requirement to mirror files on disk.
-
-Inside the desktop shell:
-
-- papers open in preview mode for editing
-- the long-term direction for paper is a richer canvas surface, not just a note blob
-- paper-oriented tools should eventually live in a ribbon-like strip beneath the titlebar, closer to Office-style task organization than a markdown toolbar
-- the current executable “recipe” layer is an intermediate step toward a more natural terminal automation model
-- `Run Here` saves the current automation content and reuses the current document-backed terminal view
-- `Run In New Session` saves it and starts a fresh daemon-owned shell session from the saved cwd and commands
-
-That is the beginning of a bigger idea: a workspace can hold the terminal, the explanation, the planning surface, and the repeatable command flow together.
-
-## Daemon lifecycle
-
-The desktop app talks to a long-lived `yggterm server daemon`.
-
-That daemon owns:
-
-- PTYs
-- session restore state
-- live-session lifecycle
-- terminal attachment
-- graceful shutdown behavior
-
-This matters because terminals should not disappear just because the UI changed view or focused a different item.
-
-Current lifecycle behavior:
-
-- live PTYs remain available while you switch between preview and terminal
-- the UI asks the daemon to close non-Keep-Alive live sessions on normal final-client exit
-- Codex-flavored sessions receive `/quit`, with force cleanup scheduled after one hour
-- plain shells receive `exit`
-- the PTY manager escalates only if the graceful stop path fails
-
-For development, there is also a smoke command:
-
-```bash
-yggterm server smoke
-```
-
-That boots a temporary daemon home, starts a local shell session, and shuts it back down cleanly.
-
-You can stop the daemon explicitly too:
-
-```bash
-yggterm server shutdown
-```
-
-## Build from source
-
-Requirements:
-
-- Rust `1.94.0`
-- Node is not required for the release/install path
-- no Ghostty checkout is required for the default embedded terminal path
-
-Build:
-
-```bash
-cargo +1.94.0 build
-```
-
-Run:
-
-```bash
-cargo +1.94.0 run
-```
-
-## Release artifacts
-
-Release packaging is generated from this repository and written to `dist/`.
-
-Build the portable Linux release artifacts:
-
-```bash
-./scripts/package-release.sh linux-x86_64
-```
-
-Build only the Debian package:
-
-```bash
-./scripts/package-deb.sh
-```
-
-Current GitHub release matrix:
-
-- `linux-x86_64`
-- `linux-aarch64`
-- `macos-x86_64`
-- `macos-aarch64`
-- `windows-x86_64`
-- `windows-aarch64`
-- Debian `.deb`
-
-Each release artifact should also ship with a checksum.
-
-## Repository layout
-
-- `apps/yggterm`: CLI entrypoint and desktop launcher
-- `crates/yggterm-core`: settings, workspace store, title generation, install detection, and browser state
-- `crates/yggterm-server`: daemon, IPC, PTY runtime, and session orchestration
-- `crates/yggterm-shell`: the Dioxus shell and app interaction surface
-- `crates/yggterm-platform`: platform detection helpers
-- `crates/yggterm-ghostty-bridge`: optional legacy bridge code, not part of the default path
-- `scripts/`: installers, packaging, and release helpers
-- `debian/`: Debian package metadata
-
-Not here, deliberately: `yggui`, `yggui-contract` and `emd-renderer` live in
-[`yggdrasilhq/libyggterm`](https://github.com/yggdrasilhq/libyggterm) and are
-consumed as a git dependency pinned to one tag.
-
-## License
-
-- source code: **GPL-3.0-or-later**, full text in `LICENSE`
-- repository documentation (`*.md`): **CC BY-SA 4.0**, see `LICENSE-CC-BY-SA-4.0`
-- names and logos: neither licence covers them — see `TRADEMARKS.md`
-
-Copyright 2026 Avikalpa Kundu <avi@gour.top>.
-
-`LICENSE-APACHE` is still here, and it is not a second licence for yggterm. It is
-the licence text for the third-party code vendored under `vendor/` and
-`third_party/`, which keeps its own terms. `THIRD-PARTY-NOTICES.md` and
-`docs/DEPENDENCY-LICENCES.md` say what that is and what it obliges.
+The release gate requires fresh Unix and PowerShell installation, mandatory
+artifact checksums, rollback, verified installed bytes and no GUI prerequisite
+for CLI help. Platform/role limitations must be visible. A seed can be
+installed while a node is not ready to admit agent work.
+
+Existing 3.x installers, executable names and package-managed installations
+retain compatibility during the transition. Running sessions and user-owned
+configuration must survive migration. The
+[3.x GUI-first guide](https://github.com/yggdrasilhq/yggterm/blob/109b6608b6a924599b7c19e2f67cafeab991ede4/README.md)
+records the preceding install/client interface.
+
+## One system, multiple clients
+
+- **System:** host-resident daemons own execution and transport-independent
+  identities; shared memory and coordination records preserve continuity.
+- **CLI porcelain:** `ygg` exposes typed operations, progressive examples,
+  exact evidence, native resource units and partial/missing coverage.
+- **GUI porcelain:** rendering and interaction add graphical convenience over
+  those contracts. A GUI failure cannot certify or erase a worker's state.
+- **Research:** hypotheses and evidence precede harness changes; reviewed
+  implementation and affected-path results determine adoption.
+
+Workers belong to work groups. Orchestrators coordinate admitted scopes;
+sub-orchestrators have explicit parent/scope/handback contracts. A relay links
+a predecessor and fresh successor carrying the same work, rather than
+pretending context or process identity stayed unchanged. These concepts are
+independent of sidebar position, labels or whether a GUI is running.
+
+## Truthful operation
+
+A heartbeat proves a pulse. A queue result proves a queue transition.
+Neither proves a task was accepted, a GUI rendered correctly, or a repair
+worked. Inspection distinguishes observed execution, source age, required
+proof, independent review and owner acceptance. Repeated composer runs retain
+their evidence, failed hypotheses, dispositions and resource cost.
+
+The system's objective is better verified outcomes and lower failure
+recurrence within authority/budget constraints. More tokens or more busy
+workers alone do not establish improvement. Unknown evidence and existing
+failures remain visible throughout a release.
+
+## Progressive documentation
+
+- [yggterm skill](.agents/skills/yggterm/SKILL.md): the agent entry door; load
+  only the component guidance needed for the task.
+- [4.0 system architecture](docs/yggterm-4-system.md): authority, taxonomy,
+  daemon/CLI/GUI boundary, seed and qualification gates.
+- [CLI inspection](docs/swarm-introspection.md): grammar and implemented
+  availability; [verb shipment](docs/spec-ygg-verb-dispersal.md): ownership
+  and replica proof.
+- [Onboarding](.agents/skills/yggterm-onboarding/SKILL.md),
+  [shared memory](docs/spec-unified-fleet-memory.md), and
+  [packages](docs/ynpm.md).
+- [Daemon protocol](docs/protocol.md) and
+  [harness integration](docs/cli-integration.md).
+- [GUI design](DESIGN.md) and [GUI proof bundles](docs/demos/ARCHITECTURE.md).
+- [Product thesis](PRODUCT_THESIS.md) and [license](LICENSE).

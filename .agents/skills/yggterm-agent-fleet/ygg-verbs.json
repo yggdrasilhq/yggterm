@@ -93,6 +93,7 @@
     "ygg-inspect.py"
   ],
   "tier_data": [
-    "ygg_command_tree.py"
+    "ygg_command_tree.py",
+    "commands.json"
   ]
 }

@@ -797,6 +797,12 @@ def classification_manifest():
     return {
         "version": 1,
         "rules": [
+            {"path": "swarm/introspection/events/", "tier": "T2", "area": "introspection",
+             "writer_api": "inspection-observation-api", "replication_driver": "report-only",
+             "purpose": "bounded metadata observations, dispositions and proof references"},
+            {"path": "swarm/introspection/", "tier": "T3", "area": "introspection",
+             "writer_api": "inspection-query-cache", "replication_driver": "none",
+             "purpose": "derived immutable snapshots and local indexes; no network SQLite writer"},
             {"path": "swarm-config.yaml", "tier": "T1", "area": "config",
              "writer_api": "proposal-workspace", "replication_driver": "swarm-ledger-v1"},
             {"path": "swarm/config/releases/", "tier": "T3", "area": "config",
