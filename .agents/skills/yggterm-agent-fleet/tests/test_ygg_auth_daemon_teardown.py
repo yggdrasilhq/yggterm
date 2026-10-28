@@ -100,22 +100,39 @@ class Sandbox:
         with open(self.live_path()) as f:
             return json.load(f)
 
-    def spawn_fake(self, argv_tail, codex_home):
-        """A process the daemon detector can see: cmdline carries the tail
-        (e.g. `codex app-server`), environ carries CODEX_HOME=codex_home.
-        codex_home=None spawns with CODEX_HOME unset — the daemon then
-        resolves its home from its own HOME."""
+    def spawn_fake(self, subcommand_tail, codex_home, ignore_sigterm=False, home=None):
+        """A process the daemon detector can see: /proc cmdline is exactly
+        [codex-binary, *subcommand_tail] — argv[0] a codex-looking path,
+        argv[1] the subcommand (a script file NAMED as the subcommand runs
+        under executable=python, so no -c noise lands in the subcommand
+        slot). environ: HOME=<home|self.home>, CODEX_HOME=codex_home; None
+        means unset (the daemon then resolves its home from its own HOME).
+        ignore_sigterm spawns a SIGTERM-resistant daemon (exercises the
+        SIGKILL escalation)."""
         e = dict(os.environ)
-        e.update({"HOME": self.home})
+        e.update({"HOME": home or self.home})
         if codex_home is not None:
             e["CODEX_HOME"] = codex_home
         else:
             e.pop("CODEX_HOME", None)
-        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(300)", *argv_tail],
-                                env=e, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if ignore_sigterm:
+            body = "import signal, time\nsignal.signal(signal.SIGTERM, signal.SIG_IGN)\ntime.sleep(300)"
+        else:
+            body = "import time; time.sleep(300)"
+        with open(os.path.join(self.tmp, subcommand_tail[0]), "w") as f:
+            f.write(body + "\n")
+        codex_argv0 = os.path.join(self.tmp, "vendored", "bin", "codex")
+        proc = subprocess.Popen([codex_argv0, *subcommand_tail], executable=sys.executable,
+                                cwd=self.tmp, env=e, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         self.spawns.append(proc)
-        time.sleep(0.3)  # let it appear in /proc
-        return proc
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            try:
+                with open(f"/proc/{proc.pid}/environ", "rb"):
+                    return proc  # visible in /proc, env readable
+            except OSError:
+                time.sleep(0.05)
+        raise AssertionError(f"fake process {proc.pid} never became visible in /proc")
 
     def alive(self, proc):
         return proc.poll() is None
@@ -167,7 +184,7 @@ def two_profiles():
 @screen("switch tears down a daemon bound to the live home and names it")
 def s_daemon_reach():
     two_profiles()
-    daemon = S.spawn_fake(("codex", "app-server"), S.codex)
+    daemon = S.spawn_fake(("app-server",), S.codex)
     r = S.run("switch", "a@x.io", "--json")
     assert r.returncode == 0, f"switch exit {r.returncode}: {r.stderr}"
     assert S.read_live()["tokens"]["account_id"] == "acct-a", "live is not the target account"
@@ -186,7 +203,7 @@ def s_relocated_home_safe():
     other = os.path.join(S.tmp, "other-codex-home")
     os.makedirs(other)
     S.write_live(make_record("b@x.io", "acct-b"))
-    relocated = S.spawn_fake(("codex", "app-server"), other)
+    relocated = S.spawn_fake(("app-server",), other)
     r = S.run("switch", "a@x.io", "--json")
     assert r.returncode == 0, f"switch exit {r.returncode}: {r.stderr}"
     time.sleep(0.5)
@@ -198,7 +215,7 @@ def s_relocated_home_safe():
 @screen("a codex TUI process on the same home survives the switch")
 def s_tui_safe():
     S.write_live(make_record("b@x.io", "acct-b"))
-    tui = S.spawn_fake(("codex", "resume"), S.codex)
+    tui = S.spawn_fake(("resume",), S.codex)
     r = S.run("switch", "a@x.io", "--json")
     assert r.returncode == 0, f"switch exit {r.returncode}: {r.stderr}"
     time.sleep(0.5)
@@ -231,14 +248,7 @@ def s_default_home_is_the_daemons_own():
     os.makedirs(foreign_home)
     # CODEX_HOME unset + HOME=foreign-home: this daemon serves
     # foreign-home/.codex, never the sandbox codex dir the switch targets.
-    e = dict(os.environ)
-    e.update({"HOME": foreign_home})
-    e.pop("CODEX_HOME", None)
-    foreign_daemon = subprocess.Popen(
-        [sys.executable, "-c", "import time; time.sleep(300)", "codex", "app-server"],
-        env=e, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    S.spawns.append(foreign_daemon)
-    time.sleep(0.3)
+    foreign_daemon = S.spawn_fake(("app-server",), None, home=foreign_home)
     r = S.run("switch", "a@x.io", "--json")
     assert r.returncode == 0, f"switch exit {r.returncode}: {r.stderr}"
     time.sleep(0.5)
@@ -246,6 +256,73 @@ def s_default_home_is_the_daemons_own():
         f"switch killed a daemon whose CODEX_HOME was merely unset (stderr: {r.stderr!r})"
     out = json.loads(r.stdout)
     assert foreign_daemon.pid not in out.get("daemons_stopped", []), "default-home daemon reported as stopped"
+
+
+@screen("a TUI whose PROMPT TEXT says app-server survives the switch")
+def s_prompt_text_safe():
+    """Substring matching once matched `codex resume 'Please explain
+    app-server'` — the owner's live session with an unlucky prompt. The
+    daemon family must match as exact ARGV TOKENS after a codex argv[0]."""
+    S.write_live(make_record("b@x.io", "acct-b"))
+    tui = S.spawn_fake(("resume", "Please explain app-server"), S.codex)
+    r = S.run("switch", "a@x.io", "--json")
+    assert r.returncode == 0, f"switch exit {r.returncode}: {r.stderr}"
+    time.sleep(0.5)
+    assert S.alive(tui), "switch killed a TUI whose prompt text mentioned app-server"
+    out = json.loads(r.stdout)
+    assert tui.pid not in out.get("daemons_stopped", []), "prompt-text TUI reported as a stopped daemon"
+
+
+@screen("a SIGTERM-resistant daemon still dies via SIGKILL and is named")
+def s_sigkill_escalation():
+    S.write_live(make_record("b@x.io", "acct-b"))
+    stubborn = S.spawn_fake(("app-server",), S.codex, ignore_sigterm=True)
+    r = S.run("switch", "a@x.io", "--json")
+    assert r.returncode == 0, f"switch exit {r.returncode}: {r.stderr}"
+    deadline = time.time() + 8
+    while S.alive(stubborn) and time.time() < deadline:
+        time.sleep(0.1)
+    assert not S.alive(stubborn), "SIGTERM-resistant daemon survived the SIGKILL escalation"
+    out = json.loads(r.stdout)
+    assert stubborn.pid in out.get("daemons_stopped", []), "escalated kill not reported as stopped"
+
+
+@screen("a stale flush during the post-swap sweep is detected and repaired")
+def s_post_sweep_repair():
+    """White-box (importlib): inject a sweep that flushes the OLD record
+    after the swap — exactly what a dying daemon can do. switch() must
+    re-verify post-sweep and repair from the in-store record instead of
+    reporting success over a stale file."""
+    import importlib.util
+    two_profiles()
+    stale = make_record("b@x.io", "acct-b")
+    e = S.env()
+    for key in ("HOME", "YGG_AUTH_HOME", "CODEX_HOME", "YGG_AUTH_NO_PREFRESH"):
+        os.environ[key] = e[key]  # STORE_ROOT resolves at module import time
+    try:
+        spec = importlib.util.spec_from_file_location("yggauth_wb", os.path.abspath(S.script))
+        m = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(m)
+
+        real_stop = m.stop_codex_daemons
+        def fake_stop(home, grace_seconds=3.0):
+            calls = getattr(fake_stop, "calls", 0) + 1
+            fake_stop.calls = calls
+            if calls >= 2:  # the post-swap sweep: a dying daemon flushes stale tokens
+                with open(S.live_path(), "w") as f:
+                    json.dump(stale, f)
+                return [999999]
+            return []
+        m.stop_codex_daemons = fake_stop
+        result = m.switch("codex", "a@x.io", lock_held=True)
+        assert result["switched_to"] == "a_x.io"
+        assert S.read_live()["tokens"]["account_id"] == "acct-a", \
+            "switch reported success over a stale file — post-sweep repair missing"
+        assert 999999 in result["daemons_stopped"]
+    finally:
+        m.stop_codex_daemons = real_stop
+        for key in ("HOME", "YGG_AUTH_HOME", "CODEX_HOME", "YGG_AUTH_NO_PREFRESH"):
+            os.environ.pop(key, None)
 
 
 def main():
@@ -261,7 +338,10 @@ def main():
         s_daemon_reach()
         s_relocated_home_safe()
         s_tui_safe()
+        s_prompt_text_safe()
+        s_sigkill_escalation()
         s_default_home_is_the_daemons_own()
+        s_post_sweep_repair()
         s_no_daemon_noop()
     finally:
         S.cleanup()

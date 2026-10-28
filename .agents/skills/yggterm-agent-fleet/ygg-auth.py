@@ -577,6 +577,16 @@ def _proc_env(pid):
     return env
 
 
+def _pid_starttime(pid):
+    """The /proc stat starttime field, or None when the pid is gone/reused —
+    the identity pin that keeps a recycled pid from reading as a survivor."""
+    try:
+        with open(f"/proc/{pid}/stat", "r") as fh:
+            return fh.read().rsplit(")", 1)[1].split()[19]
+    except (OSError, IndexError):
+        return None
+
+
 def _pid_gone(pid):
     try:
         with open(f"/proc/{pid}/stat", "r") as fh:
@@ -592,17 +602,35 @@ def codex_daemon_pids(home):
     TUI delegates auth to it; the daemon reads auth.json ONCE at startup, so
     a swapped file never reaches a running daemon (measured on dev,
     2026-10-28: switch reported success while the TUI kept the old account).
-    Matching is by the process's OWN environment, never by name alone: a
-    process counts when the home codex would resolve FOR IT equals `home` —
-    CODEX_HOME when set, else $HOME/.codex from that process's HOME (never
-    this process's expanduser: a sandboxed switch has a different HOME, and
-    equating the two once matched — and killed — an unrelated live daemon,
-    caught by the teardown screens) — AND its cmdline is the daemon family
-    (`app-server` or `codex-code-mode-host`). TUI processes (`codex resume
-    …`) never match, so a switch cannot kill the owner's live sessions.
+
+    Matching is structural, by the process's OWN environment — never by
+    substring:
+      • the home codex would resolve FOR IT must equal `home`: CODEX_HOME
+        when set, else $HOME/.codex from that process's HOME (never this
+        process's expanduser: a sandboxed switch has a different HOME, and
+        equating the two once matched — and killed — an unrelated live
+        daemon, caught by the teardown screens); a process with neither
+        CODEX_HOME nor HOME is left alone;
+      • argv[0] must BE a codex binary and argv[1] the daemon SUBCOMMAND:
+        basename `codex` + argv[1] `app-server`, or a `codex-code-mode-host`
+        binary — the ynpm node wrapper, other tools, and any resume PROMPT
+        (even the single word "app-server" at a later position) never
+        qualify, because a prompt can never sit in the subcommand slot.
+
+    TUI processes (`codex resume …`) therefore never match, and zombies are
+    skipped: a reaped-late daemon still exposes cmdline/environ but can
+    serve no auth. Without /proc (non-Linux), warns and returns [] — the
+    caller proceeds, telling the user to restart codex by hand.
     """
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        print("⚠️  no /proc here — cannot check for running codex daemons; "
+              "if codex is running, restart it to pick up the new auth", file=sys.stderr)
+        return []
+    target = os.path.realpath(home)
     pids = []
-    for entry in os.listdir("/proc"):
+    for entry in entries:
         if not entry.isdigit():
             continue
         pid = int(entry)
@@ -612,44 +640,75 @@ def codex_daemon_pids(home):
         if env is None:
             continue
         if _pid_gone(pid):
-            continue  # a zombie still exposes cmdline/environ but can serve no auth
-        env_home = env.get("CODEX_HOME") or os.path.join(env.get("HOME") or os.path.expanduser("~"), ".codex")
-        if env_home != home:
+            continue
+        env_home = env.get("CODEX_HOME")
+        if not env_home:
+            daemon_home_env = env.get("HOME")
+            if not daemon_home_env:
+                continue  # cannot resolve the daemon's own home — leave it alone
+            env_home = os.path.join(daemon_home_env, ".codex")
+        if os.path.realpath(env_home) != target:
             continue
         try:
             with open(f"/proc/{pid}/cmdline", "rb") as fh:
-                argv = fh.read().decode("utf-8", "replace")
+                argv = [tok.decode("utf-8", "replace") for tok in fh.read().split(b"\0") if tok]
         except OSError:
             continue
-        if "codex" not in argv:
+        if not argv:
             continue
-        if "app-server" in argv or "code-mode-host" in argv:
-            pids.append(pid)
+        exe = os.path.basename(argv[0])
+        # subcommand shape: `codex app-server …` or a codex-code-mode-host
+        # binary. argv[1] is the SUBCOMMAND slot — a resume PROMPT (even the
+        # single word "app-server") can never sit there, so prompt text can
+        # never summon the kill list onto the owner's live session.
+        is_family = exe.startswith("codex-code-mode-host") or (
+            exe == "codex" and len(argv) > 1 and argv[1] == "app-server")
+        if not is_family:
+            continue
+        pids.append(pid)
     return sorted(pids)
 
 
 def stop_codex_daemons(home, grace_seconds=3.0):
     """Pull the codex app-server family for `home` down: SIGTERM, wait for
-    exit, SIGKILL stragglers. Returns the pids that were running at call
-    time (empty when the home had no daemon)."""
+    exit, SIGKILL stragglers, wait again. Returns only the pids CONFIRMED
+    stopped (death checked against the pre-kill starttime, so a recycled
+    pid never reads as a survivor); a pid that outlives SIGKILL is reported
+    and omitted — never counted as stopped."""
     pids = codex_daemon_pids(home)
     if not pids:
         return []
+    starts = {pid: _pid_starttime(pid) for pid in pids}
+
+    def dead(pid):
+        if _pid_gone(pid):
+            return True  # zombie: the parent has not reaped it yet, but it can serve no auth
+        now = _pid_starttime(pid)
+        return now is None or now != starts.get(pid)
+
     for pid in pids:
         try:
             os.kill(pid, signal.SIGTERM)
         except (ProcessLookupError, PermissionError):
             pass
     deadline = time.time() + grace_seconds
-    while time.time() < deadline and not all(_pid_gone(pid) for pid in pids):
+    while time.time() < deadline and not all(dead(pid) for pid in pids):
         time.sleep(0.1)
     for pid in pids:
-        if not _pid_gone(pid):
+        if not dead(pid):
             try:
                 os.kill(pid, signal.SIGKILL)
             except (ProcessLookupError, PermissionError):
                 pass
-    return pids
+    deadline = time.time() + 1.0
+    while time.time() < deadline and not all(dead(pid) for pid in pids):
+        time.sleep(0.1)
+    stopped = [pid for pid in pids if dead(pid)]
+    for pid in pids:
+        if pid not in stopped:
+            print(f"⚠️  codex app-server pid {pid} did not stop — proceeding; restart it manually",
+                  file=sys.stderr)
+    return stopped
 
 
 def switch(harness, slug, lock_held=False):
@@ -714,6 +773,17 @@ def switch(harness, slug, lock_held=False):
             print(f"⬇  stopped respawned codex app-server daemon(s) {respawned} — spawned during "
                   f"the swap window, may have read the previous auth", file=sys.stderr)
             daemons_stopped += respawned
+        # a dying daemon can flush its OLD tokens after the swap — re-verify
+        # the live file post-sweep and repair from the same in-store record
+        for _ in range(3):
+            swapped = identity_of(live_record(harness, required=True), harness)
+            if swapped["slug"] == slug:
+                break
+            print("⚠️  the live auth file drifted during daemon teardown — re-writing "
+                  f"{slug}", file=sys.stderr)
+            atomic_write_json(live_path, target_record)
+        else:
+            raise AuthError(5, f"the live auth file kept drifting during daemon teardown ({live_path})")
     return {"switched_to": slug, "identity": swapped, "captured_before_leaving": captured,
             "daemons_stopped": daemons_stopped}
 
@@ -854,6 +924,15 @@ def cmd_switch(args):
             6, f"{slug}'s deterministic home is {home!r} — this host is {HOSTNAME!r}. "
                f"Run the switch there, reassign with `assign {slug} {HOSTNAME}`, or override with --force (owner).")
     with fleet_lock():
+        daemons_stopped_pre = []
+        if harness == "codex":
+            # the refresh and the swap must both happen with no daemon alive
+            # to race them or flush stale tokens over them; switch() re-runs
+            # this as a cheap no-op for the rotate/fetch-activate paths
+            daemons_stopped_pre = stop_codex_daemons(os.path.dirname(HARNESSES[harness]["auth_file"](harness)))
+            if daemons_stopped_pre:
+                print(f"⬇  stopped codex app-server daemon(s) {daemons_stopped_pre} — they cache auth "
+                      f"at startup and would keep serving the previous account", file=sys.stderr)
         # deterministic hygiene: refresh the OUTGOING grant before capturing it,
         # so the stored copy holds the newest token, never a consumed one.
         # Single-writer guard: only refresh when THIS host owns the live lineage.
@@ -872,6 +951,9 @@ def cmd_switch(args):
             except Exception as exc:
                 print(f"⚠️  pre-switch refresh skipped: {str(exc)[:120]}", file=sys.stderr)
         result = switch(harness, args.slug, lock_held=True)
+        if daemons_stopped_pre:
+            result["daemons_stopped"] = daemons_stopped_pre + [
+                pid for pid in result.get("daemons_stopped", []) if pid not in daemons_stopped_pre]
     return result
 
 
@@ -1038,6 +1120,17 @@ def device_login(harness, name=None, notify=True):
                                            current_ident)
         atomic_write_json(os.path.join(store_dir(harness), f"{slug}.json"), record)
         atomic_write_json(live_path, record)
+        if harness == "codex":
+            respawned = stop_codex_daemons(os.path.dirname(live_path))
+            if respawned:
+                print(f"⬇  stopped respawned codex app-server daemon(s) {respawned} after login",
+                      file=sys.stderr)
+            final = identity_of(live_record(harness, required=True), harness)
+            if final["slug"] and final["slug"] != slug:
+                # a dying daemon flushed stale tokens over the fresh login
+                print("⚠️  the live auth file drifted during login teardown — re-writing "
+                      f"{slug}", file=sys.stderr)
+                atomic_write_json(live_path, record)
     return {"logged_in": slug, "identity": ident, "captured_before_leaving": captured}
 
 
