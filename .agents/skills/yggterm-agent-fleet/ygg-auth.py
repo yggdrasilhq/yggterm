@@ -81,6 +81,18 @@ VERBS:
                                    ⛔ single-writer, now ENFORCED from provenance:
                                    refreshing a lineage owned by another host
                                    refuses without --force
+  exec    [--harness H] [--preflight-only] [--measure] [--json]
+          [--typed-failure CODE --event-id ID --observed-active-hash HASH]
+          -- <native argv...>
+                                   prove the bound grant, then replace this
+                                   process with the native argv (signals, args
+                                   and the exit code are the native CLI's own;
+                                   no restart, no replay). --preflight-only is
+                                   a bounded read that prints the activation
+                                   receipt and spawns nothing. An expired but
+                                   refreshable grant takes ONE canonical
+                                   refresh; a typed adapter-observed failure
+                                   takes ONE policy-authorized fallback.
   fleet   [--hosts a,b,c] [--save]
                                    accounts × hosts matrix over ssh — who is live
                                    on what, per host (dream ACK-68ce18afa6)
@@ -212,6 +224,14 @@ class AuthError(Exception):
         super().__init__(message)
         self.code = code
         self.details = details or {}
+
+
+# Provider identity for receipts — public names only, never account data.
+PROVIDERS = {"codex": "openai", "claude": "anthropic", "zcode": "zai", "autoclaw": "zai"}
+
+
+def provider_of(harness):
+    return PROVIDERS.get(harness, "unknown")
 
 
 def require_harness(harness):
@@ -656,7 +676,8 @@ def capabilities(harness):
     require_harness(harness)
     return {"capture": True, "switch": True, "rotate": True, "fallback": True,
             "oauth_refresh": harness == "codex", "quota_measurement": harness == "codex",
-            "login": harness == "codex", "native_health_verification": False,
+            "login": harness == "codex", "native_exec": True,
+            "native_health_verification": False,
             "host_keyring_migration": False}
 
 
@@ -968,6 +989,193 @@ def cmd_fallback(args):
         events[args.event_id]["result"] = result
         atomic_write_json(event_path, events)
         return result
+
+
+def bound_slug_by_digest(harness, record):
+    """The vault slug whose stored record is byte-identical to `record`, or None.
+
+    Unlike active_slug this never falls back to identity heuristics: a binding
+    is PROVEN only by digest equality (the same standard the fallback verb
+    demands before it will activate anything)."""
+    digest = record_hash(record)
+    for p in stored_profiles(harness):
+        if p.get("unreadable"):
+            continue
+        try:
+            if record_hash(read_json(p["path"])) == digest:
+                return p["slug"]
+        except (OSError, ValueError):
+            continue
+    return None
+
+
+def meter_snapshot(harness, record, measure=False):
+    """Identity-safe quota meter for the exec receipt. Measuring is explicit
+    (--measure): it is the preflight's ONLY optional network touch and exists
+    only for adapters with quota_measurement. Everything else stays unknown —
+    an unknown meter is never reported as free."""
+    if not measure:
+        return {"measured": False, "state": "unknown"}
+    if not capabilities(harness)["quota_measurement"]:
+        return {"measured": False, "state": "unsupported"}
+    snap = usage_snapshot(record)
+    if not snap.get("ok"):
+        return {"measured": False, "state": "unknown",
+                "error_class": "http" if snap.get("http_status") else "unavailable"}
+
+    def win(w):
+        if not isinstance(w, dict):
+            return None
+        return {"used_percent": w.get("used_percent"),
+                "reset_in_minutes": w.get("reset_in_minutes")}
+
+    return {"measured": True, "state": "measured", "plan_type": snap.get("plan_type"),
+            "limit_reached": snap.get("limit_reached"), "allowed": snap.get("allowed"),
+            "primary": win(snap.get("primary")), "secondary": win(snap.get("secondary"))}
+
+
+def _exec_gate(harness, allow_refresh):
+    """Prove the bound grant before any native spawn. Returns
+    (gate, record, decided_hash, action).
+
+    Fail-closed: unusable records, unprovable vault bindings, recorded auth
+    failures and foreign lineages block the launch — expiry alone is NOT proof
+    of a dead grant, but an expired grant must still be renewed before a
+    process may use it: exactly ONE canonical refresh, single-writer lineage
+    enforced, when allow_refresh. No other network happens here."""
+    record = live_record(harness, required=True)
+    if not usable_record(record, harness):
+        raise AuthError(5, "live auth record is unusable; the grant cannot be proven",
+                        {"reason": "grant_unproven"})
+    slug = bound_slug_by_digest(harness, record)
+    ident = identity_of(record, harness)
+    gate = {"active_binding": slug, "record_hash": record_hash(record),
+            "expired": bool(ident.get("expired")), "refreshable": False,
+            "health_state": "unknown"}
+    if slug is None:
+        raise AuthError(5, "live record matches no vault profile — capture it first "
+                           "(`capture`); an unproven grant cannot launch",
+                        {"reason": "grant_unproven", **gate})
+    health = profile_health(harness, slug, record)
+    gate["health_state"] = health["state"]
+    if health["state"] in ("reauthorization_required", "failed"):
+        raise AuthError(5, f"profile {slug} carries a recorded auth failure "
+                           f"({health.get('reason')}); reauthorization or a "
+                           "policy-authorized fallback must come first",
+                        {"reason": "auth_health_failed", **gate})
+    if not gate["expired"]:
+        return gate, record, gate["record_hash"], None
+    tokens = record.get("tokens") if isinstance(record.get("tokens"), dict) else record
+    refreshable = bool(tokens.get("refresh_token")) and capabilities(harness)["oauth_refresh"]
+    gate["refreshable"] = refreshable
+    writer = get_writer(harness, slug)
+    if writer not in (None, "unknown", HOSTNAME):
+        # Lineage law before any refresh path: a foreign writer's grant is
+        # HELD here — never copied, never refreshed on this host.
+        raise AuthError(5, f"{slug}'s lineage is owned by {writer}; refresh there — "
+                           "this host holds the grant, it does not copy foreign secrets",
+                        {"reason": "foreign_writer_held", **gate})
+    if not allow_refresh:
+        raise AuthError(5, "access grant is expired; preflight is a read-only receipt",
+                        {"reason": "refresh_required" if refreshable else "reauthorization_required",
+                         **gate})
+    if not refreshable:
+        raise AuthError(5, "access grant is expired and this adapter has no refresher",
+                        {"reason": "reauthorization_required", **gate})
+    # ONE bounded refresh through the canonical adapter. refresh_profile
+    # records refresh_invalid on a typed rejection; there is no retry loop.
+    fresh = refresh_profile(harness, slug, record)
+    atomic_write_json(HARNESSES[harness]["auth_file"](harness), fresh)
+    atomic_write_json(os.path.join(store_dir(harness), slug + ".json"), fresh)
+    stamp_provenance(harness, slug, record=fresh, source="exec-preflight-refresh",
+                     writer_updated_at=time.time())
+    record = live_record(harness, required=True)
+    gate.update(record_hash=record_hash(record), expired=False, refreshed_once=True,
+                health_state="unknown")
+    return gate, record, gate["record_hash"], "refresh_once"
+
+
+def cmd_exec(args):
+    """Prove the bound grant, then (unless --preflight-only) replace this
+    process with the native argv: the child inherits the activated native
+    cache, its own signals, args and exit code. No restart and no replay —
+    a nonzero child exit is observed, never retried; a new launch needs a new
+    parent decision (with a fresh typed event when policy authorizes one)."""
+    harness = require_harness(args.harness)
+    native_argv = list(args.native_argv or [])
+    if native_argv and native_argv[0] == "--":
+        # argparse's REMAINDER keeps the `--`; a native argv never starts with it
+        native_argv = native_argv[1:]
+    if not args.preflight_only and not native_argv:
+        raise AuthError(6, "exec needs native argv after `--` (or --preflight-only)")
+    if bool(args.typed_failure) != bool(args.event_id) or \
+            (args.typed_failure and not args.observed_active_hash):
+        raise AuthError(6, "--typed-failure needs --event-id and --observed-active-hash together")
+    fallback_result = None
+    if args.typed_failure:
+        # ONE policy-authorized fallback for the adapter's typed pre-turn
+        # failure. The canonical verb enforces the policy gate, event dedup,
+        # the observed-hash CAS and never replays the failed request.
+        fallback_result = cmd_fallback(argparse.Namespace(
+            harness=harness, error_code=args.typed_failure, event_id=args.event_id,
+            expected_active_hash=args.observed_active_hash, json=False))
+    with fleet_lock():
+        gate, record, decided_hash, action = _exec_gate(harness,
+                                                        allow_refresh=not args.preflight_only)
+        meter = meter_snapshot(harness, record, measure=args.measure)
+    # Bounded post-lock re-check: a concurrent native rewrite between the
+    # decision and the spawn means the verified binding is gone — refuse
+    # rather than launch against unverified auth. (An in-flight in-place
+    # refresh by the harness itself remains the capture-on-leave norm.)
+    current = live_record(harness, required=True)
+    if record_hash(current) != decided_hash:
+        raise AuthError(5, "native auth changed between verification and launch; refusing to spawn",
+                        {"reason": "concurrent_change", "decided_hash": decided_hash,
+                         "observed_hash": record_hash(current)})
+    policy = rotation_policy(harness)
+    receipt = {
+        "schema_version": SCHEMA_VERSION,
+        "verb": "exec",
+        "outcome": "ready",
+        "harness": harness,
+        "provider": provider_of(harness),
+        "host": HOSTNAME,
+        "active_binding": gate["active_binding"],
+        "grant_binding": {"proven": True, "record_hash": gate["record_hash"],
+                          "expired": gate["expired"], "refreshable": gate["refreshable"],
+                          "health_state": gate["health_state"]},
+        "activation": {"performed": action == "refresh_once",
+                       "kind": action or "none_required",
+                       "fallback": bool(fallback_result)},
+        "policy": {"mode": policy["mode"], "automatic_fallback": policy["automatic_fallback"],
+                   "source_authority": policy["source_authority"]},
+        "meter": meter,
+        "native_health": "unknown",
+        "actual_effect": "unknown",
+        "session_action": "child_native_auth_proof_required",
+        "native_exec": {"spawned": not args.preflight_only, "argv_len": len(native_argv)},
+    }
+    if fallback_result:
+        receipt["fallback_event_id"] = args.event_id
+        receipt["fallback_switched_to"] = fallback_result.get("switched_to")
+    if args.preflight_only:
+        return receipt
+    if args.json:
+        sys.stderr.write(json.dumps(receipt) + "\n")
+        sys.stderr.flush()
+    return _exec_spawn(native_argv, receipt)
+
+
+def _exec_spawn(native_argv, receipt=None):
+    """Replace this process with the native argv — same pid, so the parent's
+    signal target, argv and exit code are the native CLI's own. The receipt
+    rides along only for offline seams; os.execvp never returns here."""
+    try:
+        os.execvp(native_argv[0], native_argv)
+    except OSError as exc:
+        raise AuthError(6, f"native process could not start: {native_argv[0]!r} "
+                           f"({exc.strerror or type(exc).__name__})",
+                        {"reason": "native_exec_failed"})
 
 
 def cmd_harnesses(args):
@@ -1854,6 +2062,23 @@ def main(argv=None):
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_fallback)
 
+    p = sub.add_parser("exec", parents=[sub_parent],
+                       help="preflight the bound grant, then launch the native argv under it")
+    p.add_argument("--preflight-only", action="store_true",
+                   help="bounded read: print the activation receipt, spawn nothing, mutate nothing")
+    p.add_argument("--measure", action="store_true",
+                   help="opt-in quota measurement for the receipt (codex only; one usage read)")
+    p.add_argument("--typed-failure", choices=TYPED_FAILURES, default=None,
+                   help="adapter-observed typed pre-turn failure; triggers ONE policy-authorized fallback")
+    p.add_argument("--event-id", default=None,
+                   help="bounded event id for --typed-failure (dedup/no-replay)")
+    p.add_argument("--observed-active-hash", default=None,
+                   help="the active record digest the adapter observed failing (CAS)")
+    p.add_argument("native_argv", nargs=argparse.REMAINDER,
+                   help="native argv after `--` (kept verbatim: spaces, quotes, flags)")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_exec)
+
     p = sub.add_parser("login", parents=[sub_parent], help="device-code OAuth into a NEW account (codex)")
     p.add_argument("--name", help="override the profile slug")
     p.add_argument("--no-notify", action="store_true",
@@ -2038,6 +2263,12 @@ def main(argv=None):
         elif args.verb == "adopt":
             idt = out["identity"]
             print(f"🛰  adopted {idt['email']} ({idt['plan']}) as {out['adopted']} from {out['from']} — writer is litellm; re-adopt to re-sync")
+        elif args.verb == "exec" and args.preflight_only:
+            print(f"✅ preflight ready: {out['harness']} bound to {out['active_binding']} "
+                  f"({out['provider']}), record {out['grant_binding']['record_hash']}; "
+                  f"meter {out['meter']['state']}; native_health unknown until the child proves its auth")
+        elif args.verb == "exec":
+            pass  # the process was replaced by the native argv; nothing of ours may print
         elif args.verb == "litellm-switch":
             health = "healthy" if out["healthy"] else "⚠ health check did not clear — check the container"
             print(f"🛰  litellm now runs {out['litellm_switched']} ({health}); lineage lives in litellm — re-adopt after its refreshes")
