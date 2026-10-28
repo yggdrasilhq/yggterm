@@ -26,7 +26,11 @@ fn sha256_hex(path: &Path) -> Result<String, String> {
     let bytes = std::fs::read(path).map_err(|e| format!("reading {}: {e}", path.display()))?;
     let mut hasher = Sha256::new();
     hasher.update(&bytes);
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
 }
 
 /// One generation-name component of the pointer is attacker-influenced

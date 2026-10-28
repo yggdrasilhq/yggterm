@@ -185,10 +185,17 @@ fn unzip_listing(archive: &Path) -> Result<Vec<ArchiveEntry>> {
             )
         })?;
     if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        // An end-of-central-directory-only archive IS a complete empty zip;
+        // Info-ZIP answers it with exit 1 and "zipfile is empty" instead of
+        // listing zero rows. That is an empty listing, not a broken archive.
+        if stderr.contains("zipfile is empty") {
+            return Ok(Vec::new());
+        }
         bail!(
             "unzip -l {} failed: {}",
             archive.display(),
-            String::from_utf8_lossy(&output.stderr).trim()
+            stderr.trim()
         );
     }
     let text = String::from_utf8_lossy(&output.stdout);
@@ -1184,10 +1191,17 @@ pub fn verb_seed_activate(paths: &Paths, args: &[String]) -> Result<()> {
     let generation_dir = seed_root
         .join("generations")
         .join(format!("{}-{}", manifest.release.version, digest12));
-    // Idempotent: the same version+digest already active is a no-op.
+    // Idempotent: the same version+digest already active is a no-op — but
+    // only while the generation it names is actually complete. A pointer
+    // over an emptied directory is a crashed activation and is replaced
+    // wholesale by the staging path below, never honored.
     if let Ok(link) = std::fs::read_link(seed_root.join("current")) {
         if link.file_name().and_then(|name| name.to_str())
             == Some(&format!("{}-{}", manifest.release.version, digest12))
+            && artifact
+                .bins
+                .iter()
+                .all(|bin| generation_dir.join("bin").join(bin).is_file())
         {
             report_seed_activation(
                 paths,
@@ -1275,8 +1289,30 @@ pub fn verb_seed_activate(paths: &Paths, args: &[String]) -> Result<()> {
     let _ = std::fs::remove_dir_all(&scratch);
     // The flip is the last write: a staged-symlink rename swaps current
     // atomically, and any earlier failure left the previous generation in
-    // charge.
-    publish_link(&generation_dir, &seed_root.join("current"))?;
+    // charge. The pointer is a RELATIVE link (`generations/<name>`): a seed
+    // root that moves between mounts stays valid, and every reader joins it
+    // under the seed root.
+    let relative_generation = std::path::Path::new("generations")
+        .join(format!("{}-{}", manifest.release.version, digest12));
+    let current_link = seed_root.join("current");
+    #[cfg(unix)]
+    {
+        let staged = seed_root.join(format!(".current.ynpm-publish-{}", std::process::id()));
+        let _ = std::fs::remove_file(&staged);
+        std::os::unix::fs::symlink(&relative_generation, &staged)
+            .with_context(|| format!("staging {}", staged.display()))?;
+        std::fs::rename(&staged, &current_link)
+            .with_context(|| format!("publishing {}", current_link.display()))?;
+    }
+    #[cfg(not(unix))]
+    {
+        // Windows activation refuses earlier (no qualified junction flip);
+        // this arm keeps the non-unix pointer contract explicit.
+        bail!(
+            "seed activation on this platform has no qualified generation \
+             pointer flip; refusing before any bytes move"
+        );
+    }
     // Native ynpm is the ONLY writer of the versioned launch pointer
     // (`<seed-root>/active.json`, schema 1): the front launchers read this
     // pointer plus the exact bin digests, so it is published whole. The
@@ -1742,7 +1778,10 @@ mod tests {
             archives: &archives,
         };
         let error = install_from_release_manifest(&sandbox.paths(), &explicit).unwrap_err();
-        assert!(error.to_string().contains("explicit tag"));
+        assert!(
+            format!("{error:#}").contains("explicit tag"),
+            "downgrade refusal lost its context: {error:#}"
+        );
         // An explicit tag is operator intent and succeeds.
         explicit.explicit_tag = true;
         install_from_release_manifest(&sandbox.paths(), &explicit).unwrap();
@@ -2127,9 +2166,12 @@ mod tests {
             .display()
             .to_string()
             .starts_with("generations/4.0.0-"));
-        assert!(current.join("bin/ygg").is_file());
-        assert!(current.join("bin/ynpm").is_file());
-        assert!(current.join("bin/ynpx").is_file());
+        // The relative pointer resolves under the seed root; the generation
+        // it names must carry every declared bin.
+        let resolved = seed_root.join(&current);
+        assert!(resolved.join("bin/ygg").is_file());
+        assert!(resolved.join("bin/ynpm").is_file());
+        assert!(resolved.join("bin/ynpx").is_file());
         // Idempotent re-run reports already-active and keeps the link.
         verb_seed_activate(&sandbox.paths(), &args).unwrap();
         let current2 = std::fs::read_link(seed_root.join("current")).unwrap();
