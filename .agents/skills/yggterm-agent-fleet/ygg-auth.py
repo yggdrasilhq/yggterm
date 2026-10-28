@@ -23,9 +23,10 @@ SHAPE:
   therefore lossless in both directions.
 
   Agents rotate themselves: on a usage-limit wall, `ygg-auth.py rotate`
-  moves the harness to the next fresh profile — no human in the loop. login
-  (device-code flow) is the one verb that touches the network and needs the
-  owner's browser.
+  moves the active cache to the next eligible local profile. Existing runs
+  may need restart/resume. `fallback` accepts only typed consumer errors under
+  an explicit host-local policy; it never replays a request. Login requires
+  the owner's browser; usage and refresh also touch provider endpoints.
 
 LAWS THIS TOOL LIVES UNDER:
   - Harness Isolation Law (SKILL.md §5): private harness stores are private.
@@ -37,7 +38,10 @@ LAWS THIS TOOL LIVES UNDER:
     expiry. Errors never echo file contents.
 
 VERBS:
-  status  [--harness H] [--json]   live identity + every stored profile
+  policy status [--harness H] [--json] validated host-local policy
+  fallback --error-code CODE --event-id ID --expected-active-hash HASH
+                                   one policy-authorized local activation
+  status  [--harness H|all] [--json] live binding + stored profile inventory
   list    [--harness H] [--json]   stored profiles only
   capture [--harness H] [--name S] snapshot the live record into the store
   switch  <slug> [--harness H] [--json]  capture-on-leave, then atomic swap
@@ -118,6 +122,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import math
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -203,9 +208,10 @@ HARNESSES = {
 
 
 class AuthError(Exception):
-    def __init__(self, code, message):
+    def __init__(self, code, message, details=None):
         super().__init__(message)
         self.code = code
+        self.details = details or {}
 
 
 def require_harness(harness):
@@ -233,6 +239,12 @@ def identity_of(record, harness="codex"):
     """Claims only — this dict is what every verb is allowed to print."""
     if harness in ("zcode", "autoclaw"):
         return _plan_identity(record, harness)
+    if harness == "claude":
+        oauth = record.get("claudeAiOauth") or {}
+        exp = oauth.get("expiresAt")
+        return {"slug": None, "email": "unknown", "plan": "unknown", "account_id": "none",
+                "expires_at": exp / 1000 if isinstance(exp, (int, float)) else None,
+                "expired": isinstance(exp, (int, float)) and exp < time.time() * 1000}
     tokens = record.get("tokens") if isinstance(record.get("tokens"), dict) else record
     id_token = tokens.get("id_token") or ""
     access_token = tokens.get("access_token") or ""
@@ -349,6 +361,7 @@ def mark_cooldown(harness, slug, minutes):
         return None
     until = time.time() + minutes * 60
     data = load_cooldowns(harness)
+    until = max(until, data.get(slug, 0))
     data[slug] = until
     save_cooldowns(harness, data)
     return until
@@ -519,7 +532,7 @@ def capture(harness, name=None, lock_held=False):
     ident = identity_of(record, harness)
     if not ident["slug"] and not name:
         raise AuthError(3, "live record carries no usable identity; pass --name to store it anyway")
-    slug = name or ident["slug"]
+    slug = slug_for(name or ident["slug"])
     path = os.path.join(store_dir(harness), f"{slug}.json")
     if not lock_held:
         with fleet_lock():
@@ -532,6 +545,24 @@ def _capture_locked(harness, record, slug, path, ident):
     stamp_provenance(harness, slug, record=record, writer=HOSTNAME, source="capture",
                      writer_updated_at=time.time())
     return {**ident, "slug": slug, "path": path}
+
+
+def usable_record(record, harness):
+    if not isinstance(record, dict):
+        return False
+    if harness == "codex":
+        tokens = record.get("tokens") if isinstance(record.get("tokens"), dict) else record
+        return bool(tokens.get("access_token") or record.get("OPENAI_API_KEY"))
+    if harness == "claude":
+        return isinstance(record.get("claudeAiOauth"), dict) and bool(record["claudeAiOauth"].get("accessToken"))
+    if harness == "autoclaw":
+        return isinstance(record.get("auth"), dict) and bool(record["auth"].get("accessToken"))
+    try:
+        rules = record["config"]["providerConfigRules"]["providerRules"]
+        return any(rule["config"].get("access", {}).get("type") == "api-key"
+                   and bool(rule["config"]["access"].get("apiKey")) for rule in rules)
+    except (KeyError, TypeError, AttributeError):
+        return False
 
 
 def stored_profiles(harness):
@@ -548,9 +579,19 @@ def stored_profiles(harness):
         try:
             record = read_json(path)
         except (OSError, ValueError):
+            profiles.append({"slug": fname[:-5], "path": path, "filename": fname,
+                             "expired": False, "unreadable": True})
             continue
-        ident = identity_of(record, harness)
-        ident.update({"path": path, "filename": fname})
+        if not isinstance(record, dict):
+            profiles.append({"slug": fname[:-5], "path": path, "filename": fname,
+                             "expired": False, "unreadable": True})
+            continue
+        try:
+            ident = identity_of(record, harness)
+        except (TypeError, ValueError, AttributeError):
+            ident = {"expired": False}
+        ident.update({"slug": fname[:-5], "path": path, "filename": fname,
+                      "invalid_record": not usable_record(record, harness)})
         profiles.append(ident)
     return profiles
 
@@ -560,7 +601,7 @@ def _live_fingerprint(path):
     return (st.st_mtime_ns, st.st_size)
 
 
-def switch(harness, slug, lock_held=False):
+def switch(harness, slug, lock_held=False, expected_active_hash=None):
     """capture-on-leave, then byte-faithful atomic swap to the named profile.
 
     The live file is re-read if the harness rewrote it mid-swap: OAuth refresh
@@ -584,11 +625,13 @@ def switch(harness, slug, lock_held=False):
         for _ in range(3):
             before = _live_fingerprint(live_path)
             current = live_record(harness, required=True)
+            if expected_active_hash is not None and record_hash(current) != expected_active_hash:
+                raise AuthError(5, "active auth changed during fallback; refusing replacement")
             current_ident = identity_of(current, harness)
-            if current_ident["slug"] and current_ident["slug"] != slug:
-                captured = _capture_locked(harness, current, current_ident["slug"],
-                                           os.path.join(store_dir(harness), f"{current_ident['slug']}.json"),
-                                           current_ident)
+            outgoing = active_slug(harness, current) or ("unbound-" + record_hash(current)[:12])
+            if record_hash(current) != record_hash(target_record):
+                captured = _capture_locked(harness, current, outgoing,
+                                           os.path.join(store_dir(harness), outgoing + ".json"), current_ident)
             if _live_fingerprint(live_path) != before:
                 continue  # the harness rewrote mid-read; its tokens would be lost — redo
             atomic_write_json(live_path, target_record)
@@ -600,115 +643,214 @@ def switch(harness, slug, lock_held=False):
         atomic_write_json(live_path, target_record)
 
     swapped = identity_of(live_record(harness, required=True), harness)
-    if swapped["slug"] and swapped["slug"] != slug:
-        raise AuthError(5, f"post-switch verification failed: live file reports {swapped['slug']!r}")
+    if record_hash(live_record(harness, required=True)) != record_hash(target_record):
+        raise AuthError(5, "post-switch verification failed: active record differs from target")
     return {"switched_to": slug, "identity": swapped, "captured_before_leaving": captured}
 
 
+SCHEMA_VERSION = 1
+TYPED_FAILURES = ("auth_invalid", "token_expired", "rate_limited")
+
+
+def capabilities(harness):
+    require_harness(harness)
+    return {"capture": True, "switch": True, "rotate": True, "fallback": True,
+            "oauth_refresh": harness == "codex", "quota_measurement": harness == "codex",
+            "login": harness == "codex", "native_health_verification": False,
+            "host_keyring_migration": False}
+
+
+def rotation_policy(harness):
+    path = os.path.join(store_dir(harness), ".policy.json")
+    if not os.path.exists(path):
+        return {"version": 1, "mode": "assignment", "automatic_fallback": False,
+                "source_authority": "legacy-default"}
+    try:
+        doc = read_json(path)
+        keys = {"version", "mode", "host", "profiles", "source_authority", "automatic_fallback"}
+        valid = (isinstance(doc, dict) and set(doc) == keys and type(doc["version"]) is int
+                 and doc["version"] == 1 and doc["mode"] in ("assignment", "local-pool")
+                 and doc["host"] == HOSTNAME and isinstance(doc["profiles"], list)
+                 and bool(doc["profiles"]) and all(isinstance(x, str) and x and slug_for(x) == x for x in doc["profiles"])
+                 and isinstance(doc["source_authority"], str) and bool(doc["source_authority"].strip())
+                 and type(doc["automatic_fallback"]) is bool)
+    except (OSError, ValueError, TypeError, KeyError):
+        valid = False
+    if not valid:
+        raise AuthError(6, "invalid rotation policy; refusing selection", {"reason": "invalid_policy"})
+    return doc
+
+
+def cmd_policy(args):
+    harness = require_harness(args.harness)
+    return {"schema_version": SCHEMA_VERSION, "harness": harness, "policy": rotation_policy(harness)}
+
+
+def health_path(harness):
+    return os.path.join(store_dir(harness), ".health.json")
+
+
+def read_metadata(path):
+    if not os.path.exists(path):
+        return {}
+    try:
+        doc = read_json(path)
+        if not isinstance(doc, dict):
+            raise ValueError()
+        return doc
+    except (OSError, ValueError):
+        raise AuthError(5, "auth metadata unreadable; refusing operation", {"reason": "invalid_metadata"})
+
+
+def profile_health(harness, slug, record):
+    path = health_path(harness)
+    data = read_metadata(path)
+    entry = data.get(slug, {})
+    if not isinstance(entry, dict) or (entry and entry.get("state") not in ("reauthorization_required", "failed")):
+        raise AuthError(5, "invalid auth health metadata", {"reason": "invalid_metadata"})
+    if entry.get("record_hash") != record_hash(record):
+        return {"state": "unknown", "reason": None}
+    return entry
+
+
+def record_failure(harness, slug, reason):
+    # Never retain server response bodies: they may echo credentials.
+    if reason not in (*TYPED_FAILURES, "refresh_invalid"):
+        raise AuthError(6, "unsupported failure reason")
+    path = health_path(harness)
+    data = read_metadata(path)
+    record = read_json(os.path.join(store_dir(harness), slug + ".json"))
+    prior = data.get(slug, {})
+    event = {"reason": reason, "at": time.time(), "record_hash": record_hash(record)}
+    data[slug] = {**event, "state": "reauthorization_required" if reason in ("auth_invalid", "refresh_invalid") else "failed",
+                  "history": prior.get("history", []) + [event]}
+    atomic_write_json(path, data)
+
+
+def active_slug(harness, record=None):
+    record = live_record(harness) if record is None else record
+    if record is None:
+        return None
+    digest = record_hash(record)
+    for p in stored_profiles(harness):
+        if not p.get("unreadable") and record_hash(read_json(p["path"])) == digest:
+            return p["slug"]
+    return identity_of(record, harness)["slug"]
+
+
 def rotate_score(p, measure=True):
-    """(tier, headroom, slug): tier 0 measured-ok, 1 measured-limited,
-    2 unmeasurable (expired access), 3 measurement failed. Headroom is the
-    primary window's free percent — higher is better. Module-level so tests
-    can drive it with a stubbed usage_snapshot."""
+    """Ascending key: measured available, unknown, measured exhausted.
+
+    Negative headroom puts MORE remaining capacity first; only existing
+    windows participate. Missing/invalid meters remain unknown.
+    """
     if not measure:
-        return (0, 0, p["slug"])
+        return (2, 0, p["slug"])
     try:
         snap = usage_snapshot(read_json(p["path"]))
     except (OSError, ValueError):
-        snap = {"ok": False, "error": "unreadable"}
+        snap = {"ok": False}
+    if snap.get("http_status") in (401, 403):
+        return (4, 0, p["slug"])
     if snap.get("ok"):
-        def free(w):
-            used = (w or {}).get("used_percent")
-            return 100 - (used if isinstance(used, (int, float)) else 100)
-        pri, sec = snap.get("primary"), snap.get("secondary")
-        # the binding constraint is the TIGHTER window: a full weekly bank
-        # walls the account even when its 5h window is untouched (and vice
-        # versa). ⛔ ONLY over the windows that EXIST: a missing secondary
-        # (single-window snapshots) used to read as 0% free and wall the
-        # account below every two-window peer regardless of real usage —
-        # the [11.238] rotation red (acct-full outranked acct-good because
-        # good's headroom min'd against free(None)=0).
-        windows = [w for w in (pri, sec) if w]
-        headroom = min((free(w) for w in windows), default=0)
-        tier = 1 if (snap.get("limit_reached") or headroom <= 0) else 0
-        return (tier, headroom, p["slug"])
-    if p["expired"]:
-        return (2, 0, p["slug"])  # dead access: measurable only after activation
-    return (3, 0, p["slug"])
+        windows = [w for w in (snap.get("primary"), snap.get("secondary")) if w is not None]
+        used = [w.get("used_percent") if isinstance(w, dict) else None for w in windows]
+        valid = bool(used) and all(type(x) in (int, float) and math.isfinite(x) and 0 <= x <= 100 for x in used)
+        if snap.get("limit_reached") or snap.get("allowed") is False:
+            return (3, 0, p["slug"])
+        if valid:
+            headroom = min(100 - x for x in used)
+            return (0 if headroom > 0 else 3, -headroom, p["slug"])
+    return (2, 0, p["slug"])
+
+
+def selection_inventory(harness):
+    policy = rotation_policy(harness)
+    current = active_slug(harness)
+    counts = dict(stored=0, current=0, policy_filtered=0, expired=0, cooling=0,
+                  reauthorization_required=0, failed=0, unreadable=0, invalid_record=0, eligible=0)
+    candidates, reasons = [], {}
+    for p in stored_profiles(harness):
+        counts["stored"] += 1
+        slug = p["slug"]
+        if slug == current:
+            reason = "current"
+        elif ((policy["mode"] == "local-pool" and slug not in policy["profiles"])
+              or (policy["mode"] == "assignment" and assignment_of(slug) not in (None, HOSTNAME))):
+            reason = "policy_filtered"
+        elif p.get("unreadable"):
+            reason = "unreadable"
+        elif p.get("invalid_record"):
+            reason = "invalid_record"
+        else:
+            health = profile_health(harness, slug, read_json(p["path"]))
+            if health["state"] in ("reauthorization_required", "failed"):
+                reason = health["state"]
+            elif p["expired"]:
+                reason = "expired"
+            elif cooling_until(harness, slug):
+                reason = "cooling"
+            else:
+                reason = "eligible"
+                candidates.append(p)
+        counts[reason] += 1
+        reasons[slug] = reason
+    return candidates, {"counts": counts, "reasons": reasons, "policy": policy}
 
 
 def pick_rotate_target(harness, measure=True):
-    """Next profile to rotate to (dream ACK-37c41cbde1): when measurement is
-    on, candidates rank by MEASURED headroom from the usage endpoint — an
-    account at 2% beats one at 100% regardless of slug order. Falls back to
-    the clock heuristic (slug order + cooldowns) when the API is unreachable
-    or --fast was passed."""
-    profiles = stored_profiles(harness)
-    if not profiles:
-        raise AuthError(2, f"no stored profiles for {harness} — nothing to rotate to; run `capture` or `login`")
-    current = identity_of(live_record(harness)) if os.path.exists(HARNESSES[harness]["auth_file"](harness)) else None
-    current_slug = current["slug"] if current else None
-    others = [p for p in profiles if p["slug"] and p["slug"] != current_slug
-              and assignment_of(p["slug"]) in (None, HOSTNAME)]
-    if not others:
-        raise AuthError(2, f"the only profile is the live one ({current_slug}); capture or login another account first")
-
-    def cooldown_left(p):
-        until = cooling_until(harness, p["slug"])
-        return (until - time.time()) if until else 0.0
-
-    def warn(message):
-        print(f"⚠️  {message}", file=sys.stderr)
-
-    measured = {}
-    if measure:
-        for p in others:
-            measured[p["slug"]] = rotate_score(p, measure=True)
-        if all(t == 3 for t, _, _ in measured.values()):
-            warn("usage endpoint unreachable for every candidate — falling back to slug order")
-            measure = False
-
-    fresh = [p for p in others if not p["expired"] and cooldown_left(p) <= 0]
-    if fresh:
-        if measure:
-            pick = min(fresh, key=lambda p: measured.get(p["slug"], (0, 0, p["slug"])))
-        else:
-            pick = min(fresh, key=lambda p: p["slug"])
-        return pick, True
-    if all(cooldown_left(p) > 0 for p in others) and all(not p["expired"] for p in others):
-        warn("every other profile is rate-limit cooling; rotating to the one closest to its cooldown end")
-    elif not any(not p["expired"] for p in others):
-        warn("every other profile is expired; rotating to the least-stale one anyway")
-    else:
-        warn("no fully fresh profile; rotating to the best available")
-    pool = [p for p in others if not p["expired"]] or others
-    if measure:
-        return min(pool, key=lambda p: (cooldown_left(p), measured.get(p["slug"], (0, 0, p["slug"])))), False
-    return min(pool, key=lambda p: (cooldown_left(p), p["slug"])), False
-
+    candidates, report = selection_inventory(harness)
+    if not candidates:
+        raise AuthError(2, "no eligible local profile; inspect selection counts and reasons", report)
+    measure = measure and capabilities(harness)["quota_measurement"]
+    ranked = [(rotate_score(p, measure), p) for p in candidates]
+    for score, p in ranked:
+        if score[0] == 4:
+            record_failure(harness, p["slug"], "auth_invalid")
+            report["reasons"][p["slug"]] = "reauthorization_required"
+            report["counts"]["reauthorization_required"] += 1
+        elif score[0] == 3:
+            report["reasons"][p["slug"]] = "quota_exhausted"
+    usable = [(score, p) for score, p in ranked if score[0] not in (3, 4)]
+    if not usable:
+        report["counts"]["quota_exhausted"] = sum(score[0] == 3 for score, _ in ranked)
+        report["counts"]["eligible"] = 0
+        raise AuthError(2, "no eligible profile after quota/auth measurement", report)
+    return min(usable, key=lambda item: item[0])[1], True
 
 
 def require_token_harness(harness, verb):
-    """Plan harnesses (zcode-tui 2.0.0) have no OAuth refresh/redemption of
-    their own here: their credentials refresh inside the official apps and
-    replicate via capture/fetch. These verbs stay codex/claude-only."""
-    if harness in ("zcode", "autoclaw"):
-        raise AuthError(6, f"`{verb}` does not apply to plan harnesses — {harness} auth "
-                           f"refreshes inside its own app and replicates with "
-                           f"capture / fetch --activate / fleet / doctor")
+    if harness != "codex":
+        raise AuthError(6, f"{verb} unsupported for {harness}; local capture/switch/rotate remain available",
+                        {"reason": "unsupported_operation", "capabilities": capabilities(harness)})
+
 
 def cmd_status(args):
+    if args.harness == "all":
+        return {"schema_version": SCHEMA_VERSION, "harnesses": {
+            h: cmd_status(argparse.Namespace(harness=h)) for h in HARNESSES},
+            "coverage": "registered adapters only"}
     harness = require_harness(args.harness)
     ident = identity_of(live_record(harness), harness) if os.path.exists(HARNESSES[harness]["auth_file"](harness)) else None
     profiles = stored_profiles(harness)
     prov = load_provenance(harness)
+    binding = active_slug(harness)
     for p in profiles:
-        p["live"] = bool(ident and p["slug"] and p["slug"] == ident["slug"])
+        p["live"] = p["slug"] == binding
+        p["stored_freshness"] = "unreadable" if p.get("unreadable") else ("expired" if p["expired"] else ("clock_fresh" if p.get("expires_at") else "unknown"))
+        p["auth_health"] = ({"state": "unknown", "reason": "unreadable"} if p.get("unreadable")
+                            else profile_health(harness, p["slug"], read_json(p["path"])))
+        p["quota"] = {"state": "unknown", "measured": False}
         cooling = cooling_until(harness, p["slug"]) if p["slug"] else None
         p["cooling_until"] = cooling
         p["cooldown_minutes_left"] = round((cooling - time.time()) / 60) if cooling else 0
         p["provenance"] = prov.get(p["slug"] or "")
+    _, selection = selection_inventory(harness)
     out = {
+        "schema_version": SCHEMA_VERSION,
+        "active_binding": binding, "native_health": "unknown",
+        "active_record_hash": record_hash(live_record(harness)) if ident else None,
+        "capabilities": capabilities(harness), "selection": selection,
         "harness": harness,
         "host": HOSTNAME,
         "auth_file": HARNESSES[harness]["auth_file"](harness),
@@ -744,7 +886,7 @@ def cmd_switch(args):
         # deterministic hygiene: refresh the OUTGOING grant before capturing it,
         # so the stored copy holds the newest token, never a consumed one.
         # Single-writer guard: only refresh when THIS host owns the live lineage.
-        if os.environ.get("YGG_AUTH_NO_PREFRESH") != "1":
+        if harness == "codex" and os.environ.get("YGG_AUTH_NO_PREFRESH") != "1":
             try:
                 live_rec = live_record(harness, required=True)
                 ident = identity_of(live_rec)
@@ -756,26 +898,76 @@ def cmd_switch(args):
                     fresh = refresh_grant(live_rec)
                     atomic_write_json(HARNESSES[harness]["auth_file"](harness), fresh)
             except Exception as exc:
-                print(f"⚠️  pre-switch refresh skipped: {str(exc)[:120]}", file=sys.stderr)
+                print(f"⚠️  pre-switch refresh skipped ({type(exc).__name__})", file=sys.stderr)
         result = switch(harness, args.slug, lock_held=True)
     return result
 
 
 def cmd_rotate(args):
-    require_token_harness(require_harness(args.harness), "rotate")
 
     harness = require_harness(args.harness)
     with fleet_lock():
         target, _ = pick_rotate_target(harness, measure=not args.fast)
-        vacated = identity_of(live_record(harness)) if os.path.exists(HARNESSES[harness]["auth_file"](harness)) else None
+        vacated_slug = active_slug(harness)
+        vacated = {"slug": vacated_slug} if vacated_slug else None
         result = switch(harness, target["slug"], lock_held=True)
         cooldown = None
         if (vacated and vacated["slug"] and vacated["slug"] != target["slug"]
                 and args.cooldown_minutes > 0):
             cooldown = {"slug": vacated["slug"],
                         "until": mark_cooldown(harness, vacated["slug"], args.cooldown_minutes)}
-    result["vacated_to_cooldown"] = cooldown
+    result.update(schema_version=SCHEMA_VERSION, outcome="activated", actual_effect="unknown",
+                  native_health="unknown", session_action="resume_or_restart_required",
+                  replay_authorized=False, vacated_to_cooldown=cooldown)
     return result
+
+
+def cmd_fallback(args):
+    """One typed consumer event, one local activation, no request replay."""
+    harness = require_harness(args.harness)
+    if args.error_code not in TYPED_FAILURES or not args.event_id or len(args.event_id) > 128:
+        raise AuthError(6, "fallback requires a typed error and bounded event id")
+    with fleet_lock():
+        policy = rotation_policy(harness)
+        if not policy["automatic_fallback"]:
+            raise AuthError(6, "automatic fallback disabled by policy", {"reason": "policy_disabled"})
+        event_path = os.path.join(store_dir(harness), ".fallback-events.json")
+        events = read_metadata(event_path)
+        request = {"error_code": args.error_code, "expected_active_hash": args.expected_active_hash}
+        if args.event_id in events:
+            event = events[args.event_id]
+            if not isinstance(event, dict) or "request" not in event:
+                raise AuthError(5, "invalid fallback event metadata", {"reason": "invalid_metadata"})
+            if event["request"] != request:
+                raise AuthError(6, "event id reused with a different request")
+            if "result" not in event:
+                raise AuthError(5, "fallback event already attempted; inspect status before retry",
+                                {"reason": "event_incomplete", "replay_authorized": False})
+            return event["result"]
+        record = live_record(harness, required=True)
+        if record_hash(record) != args.expected_active_hash:
+            raise AuthError(5, "active auth changed since consumer error; refusing fallback")
+        slug = active_slug(harness, record)
+        if not slug:
+            raise AuthError(6, "active profile has no vault binding; capture with an explicit name first")
+        # Persist intent BEFORE any auth mutation. Crash/retry cannot switch twice.
+        events[args.event_id] = {"request": request, "at": time.time()}
+        atomic_write_json(event_path, events)
+        captured = capture(harness, name=slug, lock_held=True)
+        if record_hash(read_json(captured["path"])) != args.expected_active_hash:
+            raise AuthError(5, "active auth changed during fallback capture; refusing activation")
+        if args.error_code == "rate_limited":
+            mark_cooldown(harness, slug, DEFAULT_COOLDOWN_MINUTES)
+        else:
+            record_failure(harness, captured["slug"], args.error_code)
+        target, _ = pick_rotate_target(harness, measure=False)
+        result = switch(harness, target["slug"], lock_held=True, expected_active_hash=args.expected_active_hash)
+        result.update(schema_version=SCHEMA_VERSION, outcome="activated", event_id=args.event_id,
+                      actual_effect="unknown", native_health="unknown", replay_authorized=False,
+                      session_action="resume_or_restart_required")
+        events[args.event_id]["result"] = result
+        atomic_write_json(event_path, events)
+        return result
 
 
 def cmd_harnesses(args):
@@ -785,8 +977,10 @@ def cmd_harnesses(args):
             "auth_file": spec["auth_file"](name),
             "login": spec["login"],
             "live_note": spec["live_note"],
+            "capabilities": capabilities(name),
         }
-    return {"harnesses": out, "store": STORE_ROOT}
+    return {"schema_version": SCHEMA_VERSION, "harnesses": out, "store": STORE_ROOT,
+            "coverage": "registered adapters only; other harnesses unsupported"}
 
 
 def now_rfc3339_nanos():
@@ -1073,10 +1267,9 @@ def usage_snapshot(record):
         with urllib.request.urlopen(req, timeout=15) as resp:
             payload = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", "replace")[:150]
-        return {"ok": False, "error": f"HTTP {exc.code}: {detail}"}
+        return {"ok": False, "error": f"HTTP {exc.code}", "http_status": exc.code}
     except (urllib.error.URLError, OSError, ValueError) as exc:
-        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+        return {"ok": False, "error": type(exc).__name__}
 
     rl = payload.get("rate_limit") or {}
 
@@ -1097,12 +1290,13 @@ def usage_snapshot(record):
     return {"ok": True,
             "email": payload.get("email"),
             "plan_type": payload.get("plan_type"),
-            "limit_reached": bool(rl.get("limit_reached")),
-            "allowed": bool(rl.get("allowed")),
+            "limit_reached": rl.get("limit_reached") if type(rl.get("limit_reached")) is bool else None,
+            "allowed": rl.get("allowed") if type(rl.get("allowed")) is bool else None,
             "primary": pw,
             "secondary": sw,
             "banked": banked,
-            "banked_weekly_left": round(max(0, 100 - ((sw or {}).get("used_percent") or 0))),
+            "banked_weekly_left": (round(max(0, 100 - sw["used_percent"]))
+                                   if sw and type(sw.get("used_percent")) in (int, float) else None),
             "reset_credits": payload.get("rate_limit_reset_credits")}
 
 
@@ -1243,10 +1437,10 @@ def refresh_grant(record):
         with urllib.request.urlopen(req, timeout=15) as resp:
             got = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", "replace")[:150]
-        raise AuthError(5, f"refresh grant rejected: HTTP {exc.code} {detail}")
+        reason = "refresh_invalid" if exc.code in (400, 401, 403) else "refresh_unavailable"
+        raise AuthError(5, f"refresh grant rejected: HTTP {exc.code}", {"reason": reason, "http_status": exc.code})
     except (urllib.error.URLError, OSError, ValueError) as exc:
-        raise AuthError(5, f"refresh grant failed: {exc}")
+        raise AuthError(5, "refresh grant unavailable", {"reason": "refresh_unavailable"})
     if not got.get("access_token"):
         raise AuthError(5, "refresh response missing access_token")
     new = json.loads(json.dumps(record))  # deep copy, verbatim shape preserved
@@ -1522,6 +1716,16 @@ def cmd_give(args):
     return {"gave": slug, "harness": harness, "to": args.host, "dest": dest}
 
 
+def refresh_profile(harness, slug, record):
+    try:
+        fresh = refresh_grant(record)
+    except AuthError as exc:
+        if exc.details.get("reason") == "refresh_invalid" and slug:
+            record_failure(harness, slug, "refresh_invalid")
+        raise
+    return fresh
+
+
 def cmd_refresh(args):
 
     require_token_harness(require_harness(args.harness), "refresh")
@@ -1542,7 +1746,7 @@ def cmd_refresh(args):
                        f"SKILL.md §3f) — refresh there, or re-fetch from {writer}; "
                        f"--force overrides")
             record = read_json(store_file)
-            fresh = refresh_grant(record)
+            fresh = refresh_profile(harness, slug, record)
             atomic_write_json(store_file, fresh)
             stamp_provenance(harness, slug, record=fresh, source="refresh",
                              writer_updated_at=time.time())
@@ -1553,7 +1757,13 @@ def cmd_refresh(args):
                 out["persisted"] = "store+live"
             return out
         record = live_record(harness, required=True)
-        fresh = refresh_grant(record)
+        slug = active_slug(harness, record)
+        writer = get_writer(harness, slug) if slug else None
+        if writer not in (None, "unknown", HOSTNAME) and not args.force:
+            raise AuthError(5, "live lineage owned by another writer; refresh there")
+        if slug:
+            capture(harness, name=slug, lock_held=True)
+        fresh = refresh_profile(harness, slug, record)
         ident = identity_of(fresh)
         out = {"refreshed": ident["slug"] or "live", "persisted": "live"}
         atomic_write_json(live_path, fresh)
@@ -1584,7 +1794,7 @@ def render_table(status):
             if p["expired"]:
                 marks.append("EXPIRED")
             suffix = ("  " + " ".join(marks)) if marks else ""
-            lines.append(f"  {p['slug']:<40} {p['plan']:<10}{suffix}")
+            lines.append(f"  {p['slug']:<40} {p.get('plan', 'unknown'):<10}{suffix}")
     else:
         lines.append("profiles: (none stored — `capture` the current account or `login` a new one)")
     return "\n".join(lines)
@@ -1631,6 +1841,18 @@ def main(argv=None):
                    help=f"put the vacated account on cooldown (default {DEFAULT_COOLDOWN_MINUTES}; 0 disables)")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_rotate)
+
+    p = sub.add_parser("policy", parents=[sub_parent], help="inspect validated local rotation policy")
+    p.add_argument("action", choices=["status"])
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_policy)
+
+    p = sub.add_parser("fallback", parents=[sub_parent], help="bounded typed-error activation for managed consumers")
+    p.add_argument("--error-code", choices=TYPED_FAILURES, required=True)
+    p.add_argument("--event-id", required=True)
+    p.add_argument("--expected-active-hash", required=True)
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_fallback)
 
     p = sub.add_parser("login", parents=[sub_parent], help="device-code OAuth into a NEW account (codex)")
     p.add_argument("--name", help="override the profile slug")
@@ -1725,13 +1947,17 @@ def main(argv=None):
     try:
         out = args.func(args)
     except AuthError as exc:
-        print(f"⛔ {exc}", file=sys.stderr)
+        if args.json:
+            print(json.dumps({"schema_version": SCHEMA_VERSION, "outcome": "error", "harness": args.harness,
+                              "error": {"code": exc.code, "message": str(exc), **exc.details}}))
+        else:
+            print(f"⛔ {exc}", file=sys.stderr)
         return exc.code
     if args.json:
         print(json.dumps(out, indent=2))
     else:
         if args.verb == "status":
-            print(render_table(out))
+            print(json.dumps(out, indent=2) if args.harness == "all" else render_table(out))
         elif args.verb == "switch":
             idt = out["identity"]
             print(f"✅ switched to {idt['email']} ({idt['plan']})")
