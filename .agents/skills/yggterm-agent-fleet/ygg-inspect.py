@@ -18,10 +18,12 @@ def _adapter():
     one; import failure is an honest unavailable, never an empty ledger."""
     import importlib
     here = Path(__file__).resolve()
-    candidates = [here.parents[3] / "tools", here.parent,
-                  Path.home() / "gh" / "yggterm" / "tools",
-                  Path(os.environ.get("YGG_KERNEL_DIR", "")) if os.environ.get("YGG_KERNEL_DIR") else None,
-                  Path.home() / ".yggterm" / "swarmkernel"]
+    explicit = os.environ.get("YGG_KERNEL_DIR")
+    # An explicitly selected generation is authoritative. A missing/broken
+    # kernel cannot silently fall back to an unrelated source checkout.
+    candidates = [Path(explicit)] if explicit else [
+        here.parents[3] / "tools", here.parent,
+        Path.home() / ".yggterm" / "swarmkernel"]
     for base in candidates:
         if base is None:
             continue

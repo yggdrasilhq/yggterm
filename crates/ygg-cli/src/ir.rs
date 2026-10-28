@@ -616,10 +616,9 @@ mod tests {
 
     #[test]
     fn wired_adapter_must_name_a_family() {
-        let broken = EMBEDDED_IR.replace(
-            "\"wired_adapters\": {}",
-            "\"wired_adapters\": {\"not-a-family\": {\"adapter\": \"example\"}}",
-        );
+        let mut document: serde_json::Value = serde_json::from_str(EMBEDDED_IR).expect("IR");
+        document["wired_adapters"]["not-a-family"] = serde_json::json!({"adapter": "example"});
+        let broken = serde_json::to_string(&document).expect("serialize");
         assert!(matches!(
             parse_and_validate(&broken),
             Err(LoadError::Refused(message)) if message.contains("unknown family")

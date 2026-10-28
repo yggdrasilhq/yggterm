@@ -887,15 +887,20 @@
       "path": [
         "auth"
       ],
-      "summary": "Existing local account-policy tools.",
+      "summary": "Inspect local auth vaults, eligibility and account rotation. Choose a next word.",
       "effect": "legacy",
       "handler": "legacy",
       "options": [],
       "examples": [
         {
-          "title": "Use the existing owned tool",
-          "command": "ygg auth status",
-          "tags": ""
+          "title": "Inspect supported harness vaults",
+          "command": "ygg auth status --harness all --json",
+          "tags": "auth accounts vault"
+        },
+        {
+          "title": "Rotate an eligible Codex profile",
+          "command": "ygg auth rotate --harness codex --fast --json",
+          "tags": "auth rotate rate limit"
         }
       ],
       "legacy": [
@@ -1786,6 +1791,237 @@
       "summary": "Optional graphical client operations; the GUI is another porcelain, never an owner (planned).",
       "role": "planned",
       "options": []
+    },
+    {
+      "path": [
+        "auth",
+        "status"
+      ],
+      "summary": "Show active bindings, stored profile health and eligibility.",
+      "handler": "legacy",
+      "component": "auth",
+      "legacy": [
+        "ygg-auth.py",
+        "status"
+      ],
+      "strict": false,
+      "examples": [
+        {
+          "title": "See vault state across supported harnesses",
+          "command": "ygg auth status --harness all --json",
+          "tags": "auth vault account profile rotation"
+        }
+      ]
+    },
+    {
+      "path": [
+        "auth",
+        "list"
+      ],
+      "summary": "List retained profiles for one harness.",
+      "handler": "legacy",
+      "component": "auth",
+      "legacy": [
+        "ygg-auth.py",
+        "list"
+      ],
+      "strict": false,
+      "examples": [
+        {
+          "title": "List accounts before selecting a profile",
+          "command": "ygg auth list --harness codex --json",
+          "tags": "auth vault account profile rotation"
+        }
+      ]
+    },
+    {
+      "path": [
+        "auth",
+        "rotate"
+      ],
+      "summary": "Select an eligible local profile and preserve the outgoing grant.",
+      "handler": "legacy",
+      "component": "auth",
+      "legacy": [
+        "ygg-auth.py",
+        "rotate"
+      ],
+      "strict": false,
+      "examples": [
+        {
+          "title": "Rotate without a quota measurement request",
+          "command": "ygg auth rotate --harness codex --fast --json",
+          "tags": "auth vault account profile rotation"
+        }
+      ]
+    },
+    {
+      "path": [
+        "auth",
+        "policy"
+      ],
+      "summary": "Inspect the validated account pool and automatic fallback policy.",
+      "handler": "legacy",
+      "component": "auth",
+      "legacy": [
+        "ygg-auth.py",
+        "policy"
+      ],
+      "strict": false,
+      "examples": [
+        {
+          "title": "Explain the policy behind account selection",
+          "command": "ygg auth policy status --harness codex --json",
+          "tags": "auth vault account profile rotation"
+        }
+      ]
+    },
+    {
+      "path": [
+        "auth",
+        "fallback"
+      ],
+      "summary": "Reconcile a typed auth failure under an enabled fallback policy.",
+      "handler": "legacy",
+      "component": "auth",
+      "legacy": [
+        "ygg-auth.py",
+        "fallback"
+      ],
+      "strict": false,
+      "examples": [
+        {
+          "title": "Learn the failure event and active-binding requirements",
+          "command": "ygg auth fallback --help",
+          "tags": "auth vault account profile rotation"
+        }
+      ]
+    },
+    {
+      "path": [
+        "auth",
+        "harnesses"
+      ],
+      "summary": "Show supported auth adapters and their capabilities.",
+      "handler": "legacy",
+      "component": "auth",
+      "legacy": [
+        "ygg-auth.py",
+        "harnesses"
+      ],
+      "strict": false,
+      "examples": [
+        {
+          "title": "Distinguish switching from native refresh support",
+          "command": "ygg auth harnesses --json",
+          "tags": "auth vault account profile rotation"
+        }
+      ]
+    },
+    {
+      "path": [
+        "auth",
+        "switch"
+      ],
+      "summary": "Activate a selected local profile using its owned validation.",
+      "handler": "legacy",
+      "component": "auth",
+      "legacy": [
+        "ygg-auth.py",
+        "switch"
+      ],
+      "strict": false,
+      "examples": [
+        {
+          "title": "Learn how to select a profile",
+          "command": "ygg auth switch --help",
+          "tags": "auth vault account profile rotation"
+        }
+      ]
+    },
+    {
+      "path": [
+        "auth",
+        "doctor"
+      ],
+      "summary": "Check auth freshness and lineage without exposing credentials.",
+      "handler": "legacy",
+      "component": "auth",
+      "legacy": [
+        "ygg-auth.py",
+        "doctor"
+      ],
+      "strict": false,
+      "examples": [
+        {
+          "title": "Check profile lineage and native cache state",
+          "command": "ygg auth doctor --json",
+          "tags": "auth vault account profile rotation"
+        }
+      ]
+    },
+    {
+      "path": [
+        "auth",
+        "usage"
+      ],
+      "summary": "Read native plan usage through the supported auth adapter.",
+      "handler": "legacy",
+      "component": "auth",
+      "legacy": [
+        "ygg-auth.py",
+        "usage"
+      ],
+      "strict": false,
+      "examples": [
+        {
+          "title": "Learn the supported native usage reader",
+          "command": "ygg auth usage --help",
+          "tags": "auth vault account profile rotation"
+        }
+      ]
+    },
+    {
+      "path": [
+        "auth",
+        "refresh"
+      ],
+      "summary": "Refresh only the grant types supported by their adapter.",
+      "handler": "legacy",
+      "component": "auth",
+      "legacy": [
+        "ygg-auth.py",
+        "refresh"
+      ],
+      "strict": false,
+      "examples": [
+        {
+          "title": "Check refresh support before requesting it",
+          "command": "ygg auth refresh --help",
+          "tags": "auth vault account profile rotation"
+        }
+      ]
+    },
+    {
+      "path": [
+        "auth",
+        "login"
+      ],
+      "summary": "Begin the supported native sign-in flow.",
+      "handler": "legacy",
+      "component": "auth",
+      "legacy": [
+        "ygg-auth.py",
+        "login"
+      ],
+      "strict": false,
+      "examples": [
+        {
+          "title": "Learn the host-local sign-in procedure",
+          "command": "ygg auth login --help",
+          "tags": "auth vault account profile rotation"
+        }
+      ]
     }
   ],
   "contract": "ygg4-cli",
@@ -1794,7 +2030,20 @@
       1
     ]
   },
-  "wired_adapters": {},
+  "wired_adapters": {
+    "dream": {
+      "adapter": "ygg-inspect.py"
+    },
+    "service": {
+      "adapter": "ygg-inspect.py"
+    },
+    "schedule": {
+      "adapter": "ygg-inspect.py"
+    },
+    "swarm": {
+      "adapter": "ygg-inspect.py"
+    }
+  },
   "components": {
     "inspection": {
       "runner": "internal",

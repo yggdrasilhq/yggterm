@@ -302,10 +302,23 @@ pub fn validate_remote_host(host: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// OpenSSH joins command arguments into a remote shell command. Quote each
+/// operand for that POSIX shell, even though the local process uses argv.
+fn remote_command(args: &[String]) -> String {
+    let mut command = String::from("exec ygg");
+    for arg in args {
+        command.push_str(" '");
+        command.push_str(&arg.replace('\'', "'\\''"));
+        command.push('\'');
+    }
+    command
+}
+
 /// The remote-operator door: run the remote node's installed `ygg` over
 /// ssh. Local help stays local; the remote side resolves its own
 /// generation. Requires only an ssh client — no local Python, GUI or
-/// source checkout — which is the fresh-Windows path.
+/// source checkout. The remote endpoint must use a POSIX command shell;
+/// local Windows clients can inspect Linux worker nodes through this door.
 pub fn plan_remote(rest: &[String]) -> Result<Dispatch, String> {
     let Some(host) = rest.first() else {
         return Err(
@@ -323,8 +336,7 @@ pub fn plan_remote(rest: &[String]) -> Result<Dispatch, String> {
                 .into(),
         );
     };
-    let mut argv: Vec<String> = vec!["--".into(), host.clone(), "ygg".into()];
-    argv.extend(remote_argv);
+    let argv: Vec<String> = vec!["--".into(), host.clone(), remote_command(&remote_argv)];
     Ok(Dispatch::Exec {
         program: ssh,
         interpreter: None,
@@ -588,11 +600,32 @@ mod tests {
             } => {
                 assert!(program.ends_with("ssh"), "{program:?}");
                 assert_eq!(interpreter, None);
-                assert_eq!(argv, vec!["--", "build-host", "ygg", "dream", "ls"]);
+                assert_eq!(argv, vec!["--", "build-host", "exec ygg 'dream' 'ls'"]);
                 assert!(env.is_empty());
                 assert_eq!(component, "remote-operator");
             }
             other => panic!("expected exec, got {other:?}"),
         }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn remote_shell_receives_literal_operands() {
+        // A local argv boundary does not survive OpenSSH's command join.
+        // Exercise the actual POSIX shell parse against metacharacters.
+        let values: Vec<String> = ["", "two words", "it's literal", "$(exit 29)",
+                                  "; exit 31", "*", "line\nbreak"]
+            .into_iter().map(String::from).collect();
+        let command = remote_command(&values);
+        let probe = format!(
+            "ygg() {{ for arg do printf '%s\\000' \"$arg\"; done; }}; {}",
+            command.replacen("exec ygg", "ygg", 1)
+        );
+        let output = Command::new("sh").args(["-c", &probe]).output().expect("POSIX test shell");
+        assert!(output.status.success());
+        let expected: Vec<u8> = values.iter()
+            .flat_map(|v| v.as_bytes().iter().copied().chain(std::iter::once(0)))
+            .collect();
+        assert_eq!(output.stdout, expected);
     }
 }

@@ -219,3 +219,13 @@ README, seed installers, the release workflow, the ynpm implementation,
 source adapters for inspection, and the dispersal manifest itself. Requests
 against those: native binary in the dispersal shipment; CI builds the new
 workspace member; parent owns seed packaging and platform matrix.
+
+## Integration availability
+
+The native inspection families delegate to the matching `ygg-inspect.py`
+component with the selected command hash and kernel generation. Missing
+Python or component bytes refuse the operation explicitly; local help,
+examples, completion, payload inspection and remote operator routing remain
+native. SSH remote operations use one quoted POSIX command so spaces and
+shell metacharacters remain literal operands. This requires a POSIX shell
+on the remote node; it does not claim support for every SSH server shell.

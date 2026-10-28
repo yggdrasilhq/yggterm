@@ -75,8 +75,9 @@ class ContractSurface(unittest.TestCase):
         self.assertEqual(commands.TREE[("payload", "verify")].native, "payload_verify")
         self.assertEqual(commands.TREE[("payload", "install")].native, "payload_install")
 
-    def test_no_generation_claims_a_wired_adapter_yet(self):
-        self.assertEqual(commands.WIRED_ADAPTERS, {})
+    def test_operational_inspection_uses_the_declared_generation_adapter(self):
+        for family in ("dream", "service", "schedule", "swarm"):
+            self.assertEqual(commands.WIRED_ADAPTERS[family]["adapter"], "ygg-inspect.py")
 
 
 class DeclarativeValidation(unittest.TestCase):

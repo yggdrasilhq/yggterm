@@ -118,12 +118,31 @@ class CommandContract(unittest.TestCase):
                 records = [json.loads(l) for l in self.calls.read_text().splitlines()]
                 self.assertEqual(records, [{"tool": tool, "args": expected}])
 
-    def test_unwired_sources_are_unknown_not_a_healthy_empty_ledger(self):
+    def test_missing_kernel_is_unknown_not_a_healthy_empty_ledger(self):
         r = self.run_cli("dream", "ls", "--json")
         self.assertEqual(r.returncode, 3, r.stderr)
         result = json.loads(r.stdout)
         self.assertEqual(result["coverage"][0]["quality"], "unavailable")
-        self.assertEqual(result["findings"][0]["code"], "ADAPTER_NOT_IMPLEMENTED")
+        self.assertEqual(result["findings"][0]["code"], "ADAPTER_UNAVAILABLE")
+        self.assertFalse(self.calls.exists())
+
+    def test_explicit_broken_kernel_cannot_use_a_different_local_kernel(self):
+        package = self.bin / "introspection"
+        package.mkdir()
+        (package / "adapters.py").write_text(
+            "import os\nfrom pathlib import Path\n"
+            "def serve(path, args):\n"
+            " Path(os.environ['YGG_TEST_CALLS']).write_text('wrong kernel used')\n"
+            " print('{}')\n return 0\n"
+        )
+        control = self.run_cli("dream", "ls", "--json")
+        self.assertEqual(control.returncode, 0, control.stderr)
+        self.assertTrue(self.calls.exists())
+        self.calls.unlink()
+        self.env["YGG_KERNEL_DIR"] = str(self.root / "missing-selected-generation")
+        result = self.run_cli("dream", "ls", "--json")
+        self.assertEqual(result.returncode, 3, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["coverage"][0]["quality"], "unavailable")
         self.assertFalse(self.calls.exists())
 
     def test_packaged_kernel_alias_is_standalone_regular_file(self):
