@@ -14163,6 +14163,43 @@ impl YggtermServer {
         Ok(key)
     }
 
+    /// The worker-launch twin of [`Self::ensure_shell_runtime_session`] (ygg4
+    /// lifecycle lane): same daemon-owned resumable PTY, but the row's
+    /// launch command COMPOSES the worker command (`exec <shell> -c
+    /// '<quoted>'`), so the daemon's own PTY spawn executes the worker's
+    /// command line directly and its exit state flows through the PTY —
+    /// structured argv, shell-quoted once, at the authority. The command is
+    /// composed only on FIRST creation: an idempotent re-ensure of an
+    /// existing row must never rewrite a running row's launch command.
+    pub fn ensure_shell_runtime_session_with_command(
+        &mut self,
+        session_id: &str,
+        cwd: Option<&str>,
+        command: Option<&str>,
+    ) -> anyhow::Result<String> {
+        let command = command.map(str::trim).filter(|value| !value.is_empty());
+        let existed_before = self
+            .sessions
+            .contains_key(&local_live_runtime_key(session_id));
+        let key = self.ensure_shell_runtime_session(session_id, cwd)?;
+        if let (false, Some(command)) = (existed_before, command) {
+            let shell = std::env::var("SHELL")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| "/bin/bash".to_string());
+            let launch_command = shell_worker_launch_command(&shell, command);
+            if let Some(session) = self.sessions.get_mut(&key) {
+                session.launch_command = launch_command.clone();
+                upsert_session_metadata(
+                    &mut session.metadata,
+                    "Worker Command",
+                    command.to_string(),
+                );
+            }
+        }
+        Ok(key)
+    }
+
     pub fn restore_live_session(&mut self, live: PersistedLiveSession) {
         // FIRST-CLASS SESSIONS (guihost 2026-07-08): mirror the persist filter —
         // every recoverable persisted session restores. keep_alive is a
@@ -39129,6 +39166,27 @@ fn local_interactive_shell_launch_command(shell_program: &str) -> String {
         return windows_local_interactive_shell_launch_command(shell_program);
     }
     format!("exec {} -i", shell_single_quote(shell_program))
+}
+
+/// The worker launch composition: the daemon-owned PTY's shell runs the
+/// worker command directly (`exec <shell> -c '<command>'`), one single-quote
+/// shell quoting at the authority — no client-side pre-quoting can double it.
+/// Windows shells do not speak `exec`/`-c`; the arm states that limit
+/// instead of composing a command that would parse differently there.
+fn shell_worker_launch_command(shell_program: &str, command: &str) -> String {
+    if cfg!(windows) {
+        return format!("cmd /c {}", windows_shell_quote(command));
+    }
+    format!(
+        "exec {} -c {}",
+        shell_single_quote(shell_program),
+        shell_single_quote(command)
+    )
+}
+
+/// Double-quote Windows quoting for a cmd.exe argument: double the quotes.
+fn windows_shell_quote(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\"\""))
 }
 
 /// Split the canonical `app:<name>:<verb>` token every launcher menu speaks.

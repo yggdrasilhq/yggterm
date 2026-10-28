@@ -1176,12 +1176,146 @@ fn workers_usage() -> anyhow::Result<()> {
          sub-orchestrator|context-successor> [--session-marker <row-path>] [--session-id <native-id>] \
          [--harness <name>] [--title <text>] [--source <text>] [--parent-token <token>] [--pid <n>] \
          [--pinned] [--json]\n  \
+         server workers spawn --launch-token <token> --role <role> [--parent-token <token>] \
+         [--cwd <dir>] [--command <shell command>] [--json]  # daemon-attested launch through the \
+         daemon's own PTY; idempotent by token, never a second row\n  \
+         server workers attach --launch-token <token> [--json]  # resolve the token to its daemon \
+         row and re-ensure the SAME PTY (GUI-absent reattach)\n  \
          server workers ls [--role <role>] [--json]\n  \
          server workers show --launch-token <token> [--json]\n  \
          server workers annotate --launch-token <token> [--pid <n>] [--session-id <native-id>] \
          [--harness <name>] [--title <text>] [--pinned <true|false>] [--json]\n  \
          server workers retire --launch-token <token> --reason <text> [--force] [--json]"
     );
+    Ok(())
+}
+
+/// A worker spawn goes through the LIVE DAEMON — that is the whole point: the
+/// daemon ensures the row in its own session table and writes the identity
+/// record with daemon-attested ownership. The answer's Ack message carries a
+/// small JSON payload ({launch_token, session_key, outcome}) composed by the
+/// daemon; a daemon old enough to not know `worker` specs answers with the
+/// plain session key, which is reported as an explicit unacknowledged shape
+/// rather than guessed into a record.
+fn workers_spawn_via_daemon(
+    store: &SessionStore,
+    token: &str,
+    role: crate::worker_identity::WorkerRole,
+    parent_token: Option<String>,
+    cwd: Option<String>,
+    command: Option<String>,
+    json: bool,
+) -> anyhow::Result<()> {
+    ensure_local_server_ready_for_cli(store)?;
+    let endpoint = cli_server_endpoint(store.home_dir());
+    let session_id = crate::worker_identity::worker_session_id(token)?;
+    let response = crate::send_request(
+        &endpoint,
+        &crate::ServerRequest::EnsureShellSession {
+            session_id,
+            cwd,
+            initial_cols: None,
+            initial_rows: None,
+            worker: Some(crate::worker_identity::WorkerLaunchSpec {
+                launch_token: token.to_string(),
+                role: role.as_str().to_string(),
+                parent_token,
+                command,
+            }),
+        },
+    )?;
+    let message = crate::expect_ack(response)?.with_context(|| {
+        format!("daemon acknowledged worker spawn for {token:?} without a payload")
+    })?;
+    match serde_json::from_str::<serde_json::Value>(&message) {
+        Ok(value) if value.get("session_key").is_some() => {
+            if json {
+                println!("{}", serde_json::to_string_pretty(&value)?);
+            } else {
+                let outcome = value
+                    .pointer("/outcome/outcome")
+                    .and_then(|tag| tag.as_str())
+                    .unwrap_or("unknown");
+                println!(
+                    "worker {:?} role={} key={} outcome={}",
+                    token,
+                    role.as_str(),
+                    value["session_key"].as_str().unwrap_or("(unknown)"),
+                    outcome
+                );
+            }
+            Ok(())
+        }
+        _ => {
+            // An old daemon understood only the ensure half: the ROW exists,
+            // but no identity record was written by it. Say exactly that.
+            anyhow::bail!(
+                "daemon accepted the shell ensure but not the worker spec (older daemon); \
+                 row message: {message}; identity record NOT daemon-attested"
+            );
+        }
+    }
+}
+
+/// Resolve a launch token to its daemon row and re-ensure the SAME session:
+/// the idempotent key means a GUI-absent, SSH-dropped caller reconnects the
+/// original PTY — never a second launch. The record must be daemon-attested:
+/// attaching to a row nobody's daemon owns is not a reattach.
+fn workers_attach_via_daemon(store: &SessionStore, token: &str, json: bool) -> anyhow::Result<()> {
+    let home = store.home_dir().to_path_buf();
+    let record = crate::worker_identity::load_record(&home, token)?.ok_or_else(|| {
+        anyhow::anyhow!("no worker identity registered under launch token {token:?}")
+    })?;
+    if !matches!(
+        record.ownership,
+        Some(crate::worker_identity::OwnershipAttestation::DaemonAttested { .. })
+    ) {
+        let shape = match record.ownership {
+            Some(crate::worker_identity::OwnershipAttestation::CallerAsserted { .. }) => {
+                "caller-asserted"
+            }
+            _ => "unattested",
+        };
+        anyhow::bail!(
+            "worker {token:?} is not daemon-attested (ownership = {shape}); there is no daemon row to reattach"
+        );
+    }
+    let marker = record
+        .session_marker
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("worker {token:?} has no daemon session marker recorded"))?;
+    ensure_local_server_ready_for_cli(store)?;
+    let endpoint = cli_server_endpoint(store.home_dir());
+    // Re-ensure by the daemon-derived id: same token, same id, same PTY.
+    let session_id = crate::worker_identity::worker_session_id(token)?;
+    let response = crate::send_request(
+        &endpoint,
+        &crate::ServerRequest::EnsureShellSession {
+            session_id,
+            cwd: None,
+            initial_cols: None,
+            initial_rows: None,
+            worker: None,
+        },
+    )?;
+    let key = crate::expect_ack(response)?
+        .with_context(|| format!("daemon acknowledged attach for {token:?} without a key"))?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "launch_token": record.launch_token,
+                "record_marker": marker,
+                "session_key": key,
+            }))?
+        );
+    } else {
+        println!(
+            "worker {:?} reattached to row {key} (record marker {marker}); run `server attach {key}` \
+             for the interactive PTY door",
+            record.launch_token
+        );
+    }
     Ok(())
 }
 
@@ -1212,6 +1346,13 @@ pub fn run_server_workers_cli(store: &SessionStore, args: &[String]) -> anyhow::
                 source: workers_flag_value(args, "--source"),
                 parent_token: workers_flag_value(args, "--parent-token"),
                 pid,
+                // An offline CLI pid is a STATEMENT, never evidence: the
+                // register verb can only produce caller-asserted ownership.
+                // The daemon's ensure path is the only daemon-attested
+                // creator (`workers spawn`).
+                ownership: pid.map(|_| crate::worker_identity::OwnershipAttestation::CallerAsserted {
+                    at_ms: crate::worker_identity::now_millis(),
+                }),
                 pinned: args.iter().any(|arg| arg == "--pinned"),
                 now_ms: crate::worker_identity::now_millis(),
             };
@@ -1240,6 +1381,29 @@ pub fn run_server_workers_cli(store: &SessionStore, args: &[String]) -> anyhow::
                 );
             }
             Ok(())
+        }
+        "spawn" => {
+            let token = workers_flag_value(args, "--launch-token")
+                .ok_or_else(|| anyhow::anyhow!("spawn needs --launch-token <token>"))?;
+            let role_raw = workers_flag_value(args, "--role")
+                .ok_or_else(|| anyhow::anyhow!("spawn needs --role <worker|group|orchestrator|sub-orchestrator|context-successor>"))?;
+            let role = crate::worker_identity::WorkerRole::parse(&role_raw).ok_or_else(|| {
+                anyhow::anyhow!("unknown role {role_raw:?}")
+            })?;
+            workers_spawn_via_daemon(
+                store,
+                &token,
+                role,
+                workers_flag_value(args, "--parent-token"),
+                workers_flag_value(args, "--cwd"),
+                workers_flag_value(args, "--command"),
+                json,
+            )
+        }
+        "attach" => {
+            let token = workers_flag_value(args, "--launch-token")
+                .ok_or_else(|| anyhow::anyhow!("attach needs --launch-token <token>"))?;
+            workers_attach_via_daemon(store, &token, json)
         }
         "ls" => {
             let mut records = crate::worker_identity::list_records(&home)?;
@@ -1331,7 +1495,11 @@ pub fn run_server_workers_cli(store: &SessionStore, args: &[String]) -> anyhow::
                 &home,
                 &token,
                 &reason,
-                &crate::worker_identity::pid_is_live,
+                // Typed liveness at the CLI too: Unknown (non-Linux,
+                // unreadable /proc) vetoes like Alive.
+                &|pid, start_ticks, boot_id| {
+                    crate::worker_identity::pid_liveness(pid, start_ticks, boot_id)
+                },
                 args.iter().any(|arg| arg == "--force"),
                 crate::worker_identity::now_millis(),
             )?;
