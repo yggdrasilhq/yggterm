@@ -181,13 +181,14 @@ def _chain_sessions(rows):
     return out
 
 
-def _binding_failure(rows, claim, snaps):
+def _binding_failure(rows, claim):
     """Trusted-review association: the chain must be BOUND to this exact
     work — the audit row's native session identity must appear in the chain,
-    and the chain's approved subject digest must equal the claimed repair's
-    subject digest. A valid COMPLETE receipt of ANOTHER work never verifies
-    this repair just because an audit row carries its review_id; missing
-    proof of any binding stays unverified with the exact reason."""
+    and the claimed subject digest must equal the subject the chain's editor
+    verdict actually authenticated (its snapshot_digest). Staging a snapshot
+    is not approving it; a valid COMPLETE receipt of ANOTHER work never
+    verifies this repair just because an audit row carries its review_id;
+    missing proof of any binding stays unverified with the exact reason."""
     claimed_session = claim.get("session_id")
     if not claimed_session:
         return ("audit row records no native session identity; review "
@@ -200,8 +201,14 @@ def _binding_failure(rows, claim, snaps):
         return ("review chain is bound to session(s) %s, not the audit row's "
                 "session %s" % (", ".join(sorted(sessions))[:80],
                                 str(claimed_session)[:40]))
-    approved = [s.get("subject_digest") for s in snaps
-                if isinstance(s.get("subject_digest"), str)]
+    # The approved subject is the one the editor verdict actually authenticated
+    # (its snapshot_digest) — the chain's LAST verdict, the one a COMPLETE
+    # resolution closes over. Any staged snapshot is NOT approval: a chain
+    # that staged subject A then B and received a verdict for B must never
+    # verify a claim for the unapproved A just because A appears in history.
+    verdicts = [r for r in rows if r.get("kind") == "editor_verdict"]
+    approved = {v.get("snapshot_digest") for v in verdicts
+                if isinstance(v.get("snapshot_digest"), str)}
     claimed_subject = claim.get("subject_digest")
     if not claimed_subject:
         return ("audit row carries no subject digest; the exact "
@@ -242,8 +249,7 @@ def _receipt_state(review_id, review_dir=None, key_path=None, claim=None):
         # Association is checked before provenance: a receipt that cannot be
         # bound to THIS work is rejected for the binding reason even before
         # the control key is consulted.
-        binding = _binding_failure(rows, claim,
-                                   [r for r in rows if r.get("kind") == "snapshot_staged"])
+        binding = _binding_failure(rows, claim)
         if binding:
             return "unverified", binding
     try:
@@ -748,7 +754,7 @@ def _capture_configured(spec, now, root, host):
         if kind in ("queue", "attempt_history"):
             if have_queue:
                 coverage.append(_coverage(src, kind, "ok", now, ttl,
-                                          source_observed_at=now, collection_mode=mode))
+                                          source_observed_at=now, host=enrolled_host(s), collection_mode=mode))
                 continue
             have_queue = True
             q, qstate, qdetail = collectors.collect_queue(now, limits)
@@ -762,7 +768,7 @@ def _capture_configured(spec, now, root, host):
             coverage.append(_coverage(src, kind, qstate, now, ttl,
                                       source_observed_at=now if qstate == "ok" else None,
                                       reason=None if qstate == "ok" else str(qdetail)[:120],
-                                      collection_mode=mode))
+                                      host=enrolled_host(s), collection_mode=mode))
         elif kind == "heartbeat":
             hb, hbst, hbdetail = collectors.collect_heartbeat(now)
             for plane in hb["planes"]:
@@ -776,7 +782,7 @@ def _capture_configured(spec, now, root, host):
             coverage.append(_coverage(src, kind, hbst, now, ttl,
                                       source_observed_at=hb.get("as_of"),
                                       reason=str(hbdetail)[:120] if hbst != "ok" else None,
-                                      collection_mode=mode))
+                                      host=enrolled_host(s), collection_mode=mode))
         elif kind == "services":
             rows, sst, sdetail = collectors.collect_services(s.get("units"), now, limits)
             for r in rows:
@@ -791,14 +797,14 @@ def _capture_configured(spec, now, root, host):
             datasets["services"].extend(rows)
             coverage.append(_coverage(src, kind, sst, now, ttl,
                                       source_observed_at=now if sst == "ok" else None,
-                                      reason=reason, collection_mode=mode))
+                                      reason=reason, host=enrolled_host(s), collection_mode=mode))
         elif kind == "schedule":
             rows, schst, schdetail = collectors.collect_timers(s.get("units") or [], now, limits)
             datasets["schedules"].extend(rows)
             coverage.append(_coverage(src, kind, schst, now, ttl,
                                       source_observed_at=now if schst == "ok" else None,
                                       reason=str(schdetail)[:120] if schst != "ok" else None,
-                                      collection_mode=mode))
+                                      host=enrolled_host(s), collection_mode=mode))
         elif kind == "task_ledger":
             row = collectors.parse_tasks_ledger(s.get("path"))
             if row:
@@ -806,9 +812,9 @@ def _capture_configured(spec, now, root, host):
                                               **row})
                 coverage.append(_coverage(src, kind, "ok", now, ttl,
                                           source_observed_at=row.get("observed_at"),
-                                          collection_mode=mode))
+                                          host=enrolled_host(s), collection_mode=mode))
             else:
-                coverage.append(_coverage(src, kind, "absent", now, ttl, collection_mode=mode))
+                coverage.append(_coverage(src, kind, "absent", now, ttl, host=enrolled_host(s), collection_mode=mode))
         elif kind == "composer":
             rows_c, cst, cdet = collectors.collect_composer(now, limits, s.get("path"))
             datasets["composer"].extend(rows_c)
@@ -818,7 +824,7 @@ def _capture_configured(spec, now, root, host):
                                            if r.get("row_type") == "observation"),
                                           default=0) or None,
                                       reason=str(cdet)[:140] if cst != "ok" else None,
-                                      collection_mode=mode))
+                                      host=enrolled_host(s), collection_mode=mode))
         elif kind == "reviews":
             rows_r, rst, rdt = collectors.collect_reviews(now, limits, s.get("path"))
             datasets["reviews"].extend(rows_r)
@@ -828,7 +834,7 @@ def _capture_configured(spec, now, root, host):
                                           default=0) or None,
                                       reason=(str(rst) + ": " + str(rdt)[:120])
                                              if rst != "ok" else None,
-                                      collection_mode=mode))
+                                      host=enrolled_host(s), collection_mode=mode))
         elif kind == "memory_lock":
             rows_m, mst, mdt = collectors.collect_memory_lock(now, limits, s.get("path"))
             datasets["events"].extend({
@@ -843,7 +849,7 @@ def _capture_configured(spec, now, root, host):
                                           ((r.get("source_observed_at") or 0) for r in rows_m),
                                           default=0) or None,
                                       reason=str(mdt)[:140] if mst != "ok" else None,
-                                      collection_mode=mode))
+                                      host=enrolled_host(s), collection_mode=mode))
         elif kind == "workers":
             rows_w, wst, wdetail = collectors.collect_workers(now, s.get("path"))
             datasets["workers"].extend(rows_w)
@@ -866,7 +872,7 @@ def _capture_configured(spec, now, root, host):
             coverage.append(_coverage(src, kind, "unobserved", now, ttl,
                                       reason="collector not implemented for kind %s "
                                              "(recorded open, not healthy-empty)" % kind,
-                                      collection_mode=mode))
+                                      host=enrolled_host(s), collection_mode=mode))
 
     # Workers and pressure exist here ONLY when enrolled: a configured capture
     # with zero enrolled sources (or a disabled heartbeat) reads neither —

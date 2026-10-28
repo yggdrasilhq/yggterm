@@ -1079,6 +1079,80 @@ class ObservationFixFalsifiers(unittest.TestCase):
         self.assertEqual(state, "unverified")
         self.assertIn("subject digest", why)
 
+    # --- F2c: a served enrolled source records its ENROLLED host, never the
+    # coverage default — host filtering must retrieve what enrollment bound
+    def test_enrolled_explicit_host_is_recorded_on_served_source(self):
+        ledger = self.fix / "tasks.md"
+        ledger.write_text("## T-1 fixture\nstatus: open\n")
+        os.utime(ledger, (NOW - 10, NOW - 10))
+        sub = {"version": 1, "enabled": True, "sources": {
+            "ledger": {"kind": "task_ledger", "host": self.local,
+                       "enabled": True, "ttl_seconds": 60,
+                       "path": str(ledger)}}}
+        with self.h1, self.h2:
+            with mock.patch("swarmharness.swarmconfig.load", return_value=self._cfg(sub)):
+                frame = adapters.capture(now=NOW, root=self.root)
+        row = {c["source"]: c for c in frame["coverage"]}[
+            "task_ledger:ledger:" + self.local]
+        self.assertEqual(row["host"], self.local)
+        self.assertEqual(row["quality"], "verified")
+
+    # --- binding: staging is not approving. A chain that staged subject A
+    # then B with a verdict for B must never verify a claim for A.
+    def _two_snapshot_chain(self, rid, session, subjects, approved_index):
+        from swarmharness import session_review as sr
+        key_path = self.fix / ("control-" + rid + ".key")
+        key_path.write_bytes(b"fixture-control-key\n")
+        chained = []
+        prev = GENESIS
+
+        def append(body):
+            nonlocal prev
+            row = dict(body, seq=len(chained), prev_hash=prev)
+            row["record_hash"] = sr._sha(sr._canonical(row))
+            chained.append(row)
+            prev = row["record_hash"]
+
+        append({"kind": "review_opened", "review_id": rid, "session": session,
+                "worker": "fixture-worker", "tier": "full",
+                "at": "2026-10-28T00:00:00Z"})
+        for i, subject in enumerate(subjects):
+            append({"kind": "snapshot_staged", "subject_digest": subject,
+                    "round": i + 1, "completion_claim": {"text": "fixture"},
+                    "at": "2026-10-28T00:0%d:00Z" % (i + 1)})
+        editor = {"name": "fixture-editor"}
+        payload = {"overall": "COMPLETE", "findings": []}
+        approved = chained[approved_index]
+        receipt = sr.editor_receipt(rid, chained[0], approved, editor, payload,
+                                    key=key_path.read_bytes().strip(),
+                                    review_head=prev)
+        append({"kind": "editor_verdict", "snapshot_digest": approved["subject_digest"],
+                "editor": dict(editor, invocation_receipt=receipt),
+                "overall": "COMPLETE", "signed_payload": payload,
+                "verification_head": prev, "approval_scope": "full",
+                "findings": [], "at": "2026-10-28T00:09:00Z"})
+        append({"kind": "resolution", "outcome": "COMPLETE",
+                "at": "2026-10-28T00:10:00Z"})
+        path = self.fix / "reviews" / (rid + ".jsonl")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("\n".join(json.dumps(r, sort_keys=True)
+                                  for r in chained) + "\n")
+        return key_path
+
+    def test_binding_requires_the_verdicts_approved_subject(self):
+        subjects = ["a" * 64, "b" * 64]
+        key_path = self._two_snapshot_chain("rev-approve-b", "sess-fix-1",
+                                            subjects, approved_index=2)
+        state, why = adapters._receipt_state(
+            "rev-approve-b", self.fix / "reviews", key_path=key_path,
+            claim={"session_id": "sess-fix-1", "subject_digest": subjects[0]})
+        self.assertEqual(state, "unverified", "the staged-but-unapproved A verified")
+        self.assertIn("approved subject digest", why)
+        state, why = adapters._receipt_state(
+            "rev-approve-b", self.fix / "reviews", key_path=key_path,
+            claim={"session_id": "sess-fix-1", "subject_digest": subjects[1]})
+        self.assertEqual(state, "editor-verified", why)
+
     def test_repairs_never_verify_from_unrelated_complete_review(self):
         key_path = self._bound_chain("rev-unrel", "sess-x", "d" * 64)
         d = self.fix / "dreamer"
