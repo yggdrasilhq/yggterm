@@ -1144,3 +1144,216 @@ mod screen_verb_tests {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// `server workers` — the ygg4 worker identity plane (lane DAEMON).
+//
+// A pure home-directory verb: it reads and writes
+// `<home>/runtime/workers/*.json` and talks to NOTHING — the same "host fact"
+// shape `relay-boundary` and the census arms have, so it could be served by
+// either binary. Today only the headless binary dispatches it, because the
+// headless door IS the GUI-independent one; adding the GUI binary's dispatch
+// is a one-line follow-up for whoever owns `apps/yggterm/src/main.rs`.
+// See `crate::worker_identity` for the contract this verb serves.
+
+/// `--flag value` or `--flag=value`, the ONE argv rule for this verb.
+fn workers_flag_value(args: &[String], flag: &str) -> Option<String> {
+    for (index, arg) in args.iter().enumerate() {
+        if let Some(inline) = arg.strip_prefix(&format!("{flag}=")) {
+            return Some(inline.to_string());
+        }
+        if arg == flag {
+            return args.get(index + 1).cloned();
+        }
+    }
+    None
+}
+
+fn workers_usage() -> anyhow::Result<()> {
+    println!(
+        "usage:\n  \
+         server workers register --launch-token <token> --role <worker|group|orchestrator|\
+         sub-orchestrator|context-successor> [--session-marker <row-path>] [--session-id <native-id>] \
+         [--harness <name>] [--title <text>] [--source <text>] [--parent-token <token>] [--pid <n>] \
+         [--pinned] [--json]\n  \
+         server workers ls [--role <role>] [--json]\n  \
+         server workers show --launch-token <token> [--json]\n  \
+         server workers annotate --launch-token <token> [--pid <n>] [--session-id <native-id>] \
+         [--harness <name>] [--title <text>] [--pinned <true|false>] [--json]\n  \
+         server workers retire --launch-token <token> --reason <text> [--force] [--json]"
+    );
+    Ok(())
+}
+
+pub fn run_server_workers_cli(store: &SessionStore, args: &[String]) -> anyhow::Result<()> {
+    let json = args.iter().any(|arg| arg == "--json");
+    let home = store.home_dir().to_path_buf();
+    let verb = args.first().map(String::as_str).unwrap_or("");
+    match verb {
+        "register" => {
+            let token = workers_flag_value(args, "--launch-token")
+                .ok_or_else(|| anyhow::anyhow!("register needs --launch-token <token>"))?;
+            let role_raw = workers_flag_value(args, "--role")
+                .ok_or_else(|| anyhow::anyhow!("register needs --role <worker|group|orchestrator|sub-orchestrator|context-successor>"))?;
+            let role = crate::worker_identity::WorkerRole::parse(&role_raw).ok_or_else(|| {
+                anyhow::anyhow!("unknown role {role_raw:?}; expected worker, group, orchestrator, sub-orchestrator or context-successor")
+            })?;
+            let pid = workers_flag_value(args, "--pid")
+                .map(|raw| raw.parse::<u32>())
+                .transpose()
+                .map_err(|_| anyhow::anyhow!("--pid expects a number"))?;
+            let request = crate::worker_identity::RegisterRequest {
+                launch_token: token,
+                role,
+                session_marker: workers_flag_value(args, "--session-marker"),
+                session_id: workers_flag_value(args, "--session-id"),
+                harness: workers_flag_value(args, "--harness"),
+                title: workers_flag_value(args, "--title"),
+                source: workers_flag_value(args, "--source"),
+                parent_token: workers_flag_value(args, "--parent-token"),
+                pid,
+                pinned: args.iter().any(|arg| arg == "--pinned"),
+                now_ms: crate::worker_identity::now_millis(),
+            };
+            let outcome = crate::worker_identity::register(&home, request)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&outcome)?);
+            } else {
+                let created =
+                    matches!(&outcome, crate::worker_identity::RegisterOutcome::Created { .. });
+                let record = match &outcome {
+                    crate::worker_identity::RegisterOutcome::Created { record } => record,
+                    crate::worker_identity::RegisterOutcome::Existing { record } => record,
+                };
+                let shape = if created {
+                    "created"
+                } else {
+                    "existing (idempotent; nothing written)"
+                };
+                println!(
+                    "{} worker {:?} role={} parent={} marker={}",
+                    shape,
+                    record.launch_token,
+                    record.role.as_str(),
+                    record.parent_token.as_deref().unwrap_or("(top)"),
+                    record.session_marker.as_deref().unwrap_or("(unknown)")
+                );
+            }
+            Ok(())
+        }
+        "ls" => {
+            let mut records = crate::worker_identity::list_records(&home)?;
+            if let Some(role_raw) = workers_flag_value(args, "--role") {
+                let role = crate::worker_identity::WorkerRole::parse(&role_raw)
+                    .ok_or_else(|| anyhow::anyhow!("unknown role {role_raw:?}"))?;
+                records.retain(|record| record.role == role);
+            }
+            if json {
+                println!("{}", serde_json::to_string_pretty(&records)?);
+            } else if records.is_empty() {
+                println!("no worker identities registered on this host");
+            } else {
+                for record in &records {
+                    let state = if record.retired.is_some() {
+                        "retired"
+                    } else if record.pinned {
+                        "pinned"
+                    } else {
+                        "active"
+                    };
+                    println!(
+                        "{}\t{}\t{}\t{}",
+                        record.launch_token,
+                        record.role.as_str(),
+                        state,
+                        record.session_marker.as_deref().unwrap_or("(unknown)")
+                    );
+                }
+            }
+            Ok(())
+        }
+        "show" => {
+            let token = workers_flag_value(args, "--launch-token")
+                .ok_or_else(|| anyhow::anyhow!("show needs --launch-token <token>"))?;
+            let record = crate::worker_identity::load_record(&home, &token)?
+                .ok_or_else(|| anyhow::anyhow!("no worker identity registered under launch token {token:?}"))?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&record)?);
+            } else {
+                println!(
+                    "{}\t{}\tretired={}\tpid={}\tcgroup={}",
+                    record.launch_token,
+                    record.role.as_str(),
+                    record.retired.is_some(),
+                    record.pid.map(|pid| pid.to_string())
+                        .unwrap_or_else(|| "unknown".to_string()),
+                    record.cgroup.as_deref().unwrap_or("unknown"),
+                );
+            }
+            Ok(())
+        }
+        "annotate" => {
+            let token = workers_flag_value(args, "--launch-token")
+                .ok_or_else(|| anyhow::anyhow!("annotate needs --launch-token <token>"))?;
+            let pid = workers_flag_value(args, "--pid")
+                .map(|raw| raw.parse::<u32>())
+                .transpose()
+                .map_err(|_| anyhow::anyhow!("--pid expects a number"))?;
+            let pinned = workers_flag_value(args, "--pinned")
+                .map(|raw| match raw.as_str() {
+                    "true" => Ok(true),
+                    "false" => Ok(false),
+                    other => Err(anyhow::anyhow!("--pinned expects true|false, got {other:?}")),
+                })
+                .transpose()?;
+            let record = crate::worker_identity::annotate(
+                &home,
+                &token,
+                pid,
+                workers_flag_value(args, "--session-id").as_deref(),
+                workers_flag_value(args, "--harness").as_deref(),
+                workers_flag_value(args, "--title").as_deref(),
+                pinned,
+                crate::worker_identity::now_millis(),
+            )?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&record)?);
+            } else {
+                println!("annotated worker {token:?} (updated_at_ms={})", record.updated_at_ms);
+            }
+            Ok(())
+        }
+        "retire" => {
+            let token = workers_flag_value(args, "--launch-token")
+                .ok_or_else(|| anyhow::anyhow!("retire needs --launch-token <token>"))?;
+            let reason = workers_flag_value(args, "--reason").unwrap_or_else(|| "unspecified".to_string());
+            let outcome = crate::worker_identity::retire(
+                &home,
+                &token,
+                &reason,
+                &crate::worker_identity::pid_is_live,
+                args.iter().any(|arg| arg == "--force"),
+                crate::worker_identity::now_millis(),
+            )?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&outcome)?);
+            } else {
+                match &outcome {
+                    crate::worker_identity::RetireOutcome::Retired { record } => {
+                        println!("retired worker {:?}", record.launch_token)
+                    }
+                    crate::worker_identity::RetireOutcome::AlreadyRetired { .. } => {
+                        println!("worker {token:?} was already retired")
+                    }
+                    crate::worker_identity::RetireOutcome::Vetoed { reason: veto, .. } => {
+                        anyhow::bail!(
+                            "retire vetoed ({veto}); pass --force to override and record the override"
+                        );
+                    }
+                }
+            }
+            Ok(())
+        }
+        _ => workers_usage(),
+    }
+}

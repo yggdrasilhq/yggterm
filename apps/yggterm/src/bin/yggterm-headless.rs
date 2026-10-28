@@ -189,6 +189,13 @@ fn print_server_help() {
   yggterm-headless server connect --list
   yggterm-headless server write-lock <acquire|release|status> [--holder <who>]
   yggterm-headless server relay-boundary [--by <who>] [--wait-secs <n>] [--json]
+  yggterm-headless server workers <register|ls|show|annotate|retire> [flags] [--json]
+    THE WORKER IDENTITY PLANE — daemon-home records naming what a row IS in
+    the coordination topology (worker | group | orchestrator | sub-orchestrator
+    | context-successor), keyed by a caller-supplied launch token. Idempotent:
+    a retried register returns the existing record verbatim. Retire is
+    veto-first on a live pid or a pinned row. Reads and writes
+    <home>/runtime/workers/ and talks to no daemon and no GUI.
   yggterm-headless server rows live [--mismatches-only]
     THE METADATA SSOT INSTRUMENT — every live row beside what its own CLI
     store says the session should be titled; a mismatch is a fault made
@@ -2243,6 +2250,13 @@ impl std::io::Write for LossyStderrHandle {
         && args.get(1).is_some_and(|arg| arg == "relay-boundary")
     {
         return yggterm_server::server_cli::run_server_relay_boundary_cli(&store, &args);
+    }
+    if args.first().is_some_and(|arg| arg == "server")
+        && args.get(1).is_some_and(|arg| arg == "workers")
+    {
+        // The ygg4 worker identity plane — daemon-home files, no daemon
+        // socket, no GUI. The headless door is the GUI-independent one.
+        return yggterm_server::server_cli::run_server_workers_cli(&store, &args[2..]);
     }
     // `--endpoint <path|version|pid>` aims a READ-ONLY verb at one of the
     // daemons the census names. Read-only on purpose: seeing all 28 and being
