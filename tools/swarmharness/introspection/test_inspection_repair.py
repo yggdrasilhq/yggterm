@@ -6,10 +6,14 @@ collection. Also: bounded reads before allocation, empty-file invalid versus
 absent, source-shape fuzz, snapshot/cursor/history/partial-scope, privacy,
 and retention. All fixtures live under ~/.yggterm/scratchpad (never /tmp);
 every test is hermetic — no systemctl, no queue subprocess, no dmesg."""
+import calendar
+import contextlib
+import io
 import json
 import os
 import shutil
 import sys
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -231,10 +235,35 @@ class EnrollmentModes(unittest.TestCase):
             frame = adapters.capture(now=NOW, root=self.fix / "store")
         self.assertTrue(all(c.get("collection_mode") == "standing"
                             for c in frame["coverage"]))
+        # An empty fixture tree has NO verified sources: every previously
+        # reader-clock-"verified" row now carries its (missing) source clock
+        # and is demoted with the exact reason — verified on a source whose
+        # observation time is unknown was the Law-1 violation.
         ok_rows = [c for c in frame["coverage"] if c["quality"] == "verified"]
-        self.assertTrue(ok_rows)
-        for c in ok_rows:
-            self.assertIn("not configured-complete", c["reason"])
+        self.assertEqual(ok_rows, [])
+        for c in frame["coverage"]:
+            self.assertNotEqual(c.get("observed_at"), model.iso(NOW),
+                                c["source"] + " must not carry the reader clock")
+        # A file-backed source with its own fresh as_of is verified from the
+        # SOURCE clock; an old as_of is stale even though the read succeeded.
+        dream = self.fix / "dream" / "state.json"
+        dream.write_text(json.dumps({"as_of": model.iso(NOW - 30),
+                                     "counts": {"queued": 1}}))
+        os.utime(dream, (NOW - 30, NOW - 30))
+        with self.h1, self.h2, self._load(self._cfg()):
+            frame = adapters.capture(now=NOW, root=self.fix / "store")
+        cov = {c["source"]: c for c in frame["coverage"]}
+        fresh = cov["dream-state:" + os.uname().nodename.split(".")[0]]
+        self.assertEqual(fresh["quality"], "verified")
+        self.assertEqual(model.epoch(fresh["observed_at"]), NOW - 30)
+        dream.write_text(json.dumps({"as_of": model.iso(NOW - 10 * 86400)}))
+        with self.h1, self.h2, self._load(self._cfg()):
+            frame = adapters.capture(now=NOW, root=self.fix / "store")
+        cov = {c["source"]: c for c in frame["coverage"]}
+        stale = cov["dream-state:" + os.uname().nodename.split(".")[0]]
+        self.assertEqual(stale["quality"], "stale")
+        self.assertIn("exceeds ttl", stale["reason"])
+        self.assertEqual(model.epoch(stale["observed_at"]), NOW - 10 * 86400)
 
     def test_explicit_disable_fails_closed_without_standing_substitution(self):
         with self.h1, self.h2, self._load(self._cfg({"enabled": False})):
@@ -754,3 +783,455 @@ class ComposerInspectors(unittest.TestCase):
         self.assertFalse(gone.exists())
         self.assertTrue(keep.exists())
         self.assertGreaterEqual(removed["protected_by_review"], 1)
+
+
+_EMPTY = {k: [] for k in ("dreams", "attempts", "services", "schedules", "plans",
+                          "events", "heartbeat", "findings", "repairs", "workers",
+                          "composer", "reviews", "summary")}
+
+
+class ObservationFixFalsifiers(unittest.TestCase):
+    """The seven Gemini-accepted negatives, the parent review-association
+    binding, and the pinned-frame/physical-attempt dream-open contract, as
+    executable repairs (2026-10-28)."""
+
+    def setUp(self):
+        self.fix = fixture(self.__class__.__name__)
+        self.h1, self.h2 = hermetic(self.fix)
+        self.local = os.uname().nodename.split(".")[0]
+        self.root = self.fix / "store"
+
+    def tearDown(self):
+        shutil.rmtree(self.fix, ignore_errors=True)
+
+    def _cfg(self, sub):
+        return {"mode": "active", "config": {"fleet": {}, "introspection": sub},
+                "faults": []}
+
+    # --- F1: standing coverage carries the SOURCE clock, never the reader's
+    def test_standing_maintenance_coverage_uses_supervisor_pass_time(self):
+        sup = self.fix / "swarm" / "supervisor.json"
+        sup.parent.mkdir(parents=True, exist_ok=True)
+        old = model.iso(NOW - 2 * 86400)
+        sup.write_text(json.dumps({"at": old,
+                                   "executor": {"unit": "u.service", "active": True,
+                                                "action": "n"}}))
+        with self.h1, self.h2:
+            frame = adapters.capture(now=NOW, root=self.root)
+        cov = {c["source"]: c for c in frame["coverage"]}
+        m = cov["maintenance:" + self.local]
+        self.assertEqual(model.epoch(m["observed_at"]), model.epoch(old))
+        self.assertEqual(m["quality"], "stale")
+        self.assertEqual(model.epoch(m["received_at"]), NOW)
+
+    # --- F2: configured capture reads nothing unenrolled
+    def test_configured_capture_reads_neither_workers_nor_pressure_unenrolled(self):
+        sub = {"version": 1, "enabled": True, "sources": {
+            "hb-off": {"kind": "heartbeat", "host": "local", "enabled": False,
+                       "ttl_seconds": 60, "path": "/unused"}}}
+
+        def boom(*a, **k):
+            raise AssertionError("unenrolled collector invoked")
+
+        with self.h1, self.h2:
+            with mock.patch("swarmharness.swarmconfig.load", return_value=self._cfg(sub)), \
+                 mock.patch.object(adapters.collectors, "collect_workers", boom), \
+                 mock.patch.object(adapters.collectors, "collect_pressure", boom):
+                frame = adapters.capture(now=NOW, root=self.root)
+        sources = [c["source"] for c in frame["coverage"]]
+        self.assertNotIn("workers-registry:" + self.local, sources)
+        self.assertNotIn("pressure:" + self.local, sources)
+        self.assertEqual(frame["datasets"]["workers"], [])
+        self.assertEqual(frame["datasets"]["plans"], [])
+
+    def test_configured_workers_source_is_enrollment_scoped(self):
+        reg = self.fix / "rows"
+        reg.mkdir(parents=True)
+        (reg / "w1.json").write_text(json.dumps({"id": "w1", "status": "claimed"}))
+        os.utime(reg / "w1.json", (NOW - 10, NOW - 10))
+        sub = {"version": 1, "enabled": True, "sources": {
+            "reg": {"kind": "workers", "host": "local", "enabled": True,
+                    "ttl_seconds": 60, "path": str(reg)}}}
+        with self.h1, self.h2:
+            with mock.patch("swarmharness.swarmconfig.load", return_value=self._cfg(sub)):
+                frame = adapters.capture(now=NOW, root=self.root)
+        cov = {c["source"]: c for c in frame["coverage"]}
+        row = cov["workers:reg:" + self.local]
+        self.assertEqual(row["quality"], "verified")
+        self.assertEqual(model.epoch(row["observed_at"]), NOW - 10)
+        self.assertEqual(len(frame["datasets"]["workers"]), 1)
+
+    # --- F2b/--host all: remote enrolled host is expected-unknown coverage,
+    # never folded into local-only coverage
+    def test_configured_remote_host_is_unknown_coverage_not_local(self):
+        sub = {"version": 1, "enabled": True, "sources": {
+            "svc": {"kind": "services", "host": "oc", "enabled": True,
+                    "ttl_seconds": 60, "units": ["x.service"]}}}
+        with self.h1, self.h2:
+            with mock.patch("swarmharness.swarmconfig.load", return_value=self._cfg(sub)):
+                frame = adapters.capture(now=NOW, root=self.root)
+        row = {c["source"]: c for c in frame["coverage"]}["services:svc:" + self.local]
+        self.assertEqual(row["host"], "oc")
+        self.assertEqual(row["quality"], "unknown")
+        self.assertIn("not silently widened", row["reason"])
+        res, code = model.query(frame, ("service", "ps"), {"host": "all"}, NOW)
+        self.assertIn("oc", {c["host"] for c in res["coverage"]})
+        self.assertEqual(code, 3)  # an all-hosts scope with unknown hosts is not complete
+        res, _ = model.query(frame, ("service", "ps"), {"host": "oc"}, NOW)
+        self.assertTrue(any(c["host"] == "oc" for c in res["coverage"]))
+
+    def _pressure_scope(self, kind):
+        heartbeat = self.fix / "heartbeat.json"
+        write_heartbeat(self.fix, NOW, {
+            "fixture-plane": {"quality": "verified", "observed_at": NOW,
+                              "obs": {"grants": [{"grant_units": 99}]}}})
+        source = {"kind": kind, "host": "local", "enabled": True, "ttl_seconds": 60}
+        if kind == "heartbeat":
+            source["path"] = str(heartbeat)
+        sub = {"version": 1, "enabled": True, "sources": {"fixture": source}}
+        queue = {"tasks": [], "events": [], "serve": {"routes": {}}, "runs": []}
+        with self.h1, self.h2:
+            with mock.patch("swarmharness.swarmconfig.load", return_value=self._cfg(sub)), \
+                 mock.patch.object(collectors, "collect_queue", return_value=(queue, "ok", {})):
+                return adapters.capture(now=NOW, root=self.root)
+
+    def test_heartbeat_enrollment_cannot_certify_an_uncollected_pressure_population(self):
+        frame = self._pressure_scope("heartbeat")
+        result, code = model.query(frame, ("swarm", "pressure"), {}, NOW)
+        self.assertEqual(frame["datasets"]["plans"], [])
+        self.assertEqual(result["coverage"], [])
+        self.assertEqual(code, 3)
+        self.assertIn("NO_ENROLLED_SOURCE", {f["code"] for f in result["findings"]})
+
+    def test_pressure_enrollment_certifies_its_own_population_and_not_heartbeat(self):
+        frame = self._pressure_scope("pressure")
+        result, code = model.query(frame, ("swarm", "pressure"), {}, NOW)
+        self.assertTrue(result["items"])
+        self.assertEqual({c["kind"] for c in result["coverage"]}, {"pressure"})
+        self.assertEqual(code, 0)
+        self.assertNotIn("NO_ENROLLED_SOURCE", {f["code"] for f in result["findings"]})
+        _, heartbeat_code = model.query(frame, ("swarm", "heartbeat"), {}, NOW)
+        self.assertEqual(heartbeat_code, 3)
+
+    def test_standing_pressure_has_explicit_pressure_coverage(self):
+        write_heartbeat(self.fix, NOW, {})
+        with self.h1, self.h2:
+            frame = adapters.capture(now=NOW, root=self.root)
+        result, _ = model.query(frame, ("swarm", "pressure"), {}, NOW)
+        self.assertTrue(result["coverage"])
+        self.assertEqual({c["kind"] for c in result["coverage"]}, {"pressure"})
+
+    def test_supported_enrollment_validates_activates_and_loads_without_mocking_loader(self):
+        from swarmharness import swarmconfig as sc
+        genesis = Path(__file__).resolve().parents[1] / "fixtures/valid/genesis.yaml"
+        cfg, error = sc.parse_yaml_bytes(genesis.read_bytes())
+        self.assertIsNone(error)
+        if self.local not in cfg["fleet"]["hosts"]:
+            cfg["fleet"]["hosts"].append(self.local)
+        declared = self.fix / "declared-heartbeat.json"
+        declared.write_text(json.dumps({"as_of": NOW, "planes": {
+            "declared-plane": {"quality": "verified", "observed_at": NOW,
+                               "obs": {"grants": [{"grant_units": 99}]}}}}))
+        rows = self.fix / "declared-rows"
+        rows.mkdir()
+        (rows / "fixture.json").write_text(json.dumps({"id": "fixture-worker"}))
+        os.utime(rows / "fixture.json", (NOW, NOW))
+        cfg["introspection"] = {"version": 1, "enabled": True, "sources": {
+            "pressure-fixture": {"kind": "pressure", "host": self.local,
+                "path": str(declared), "enabled": True, "ttl_seconds": 60,
+                "privacy": "inspection-metadata-v1"},
+            "workers-fixture": {"kind": "workers", "host": self.local,
+                "path": str(rows), "enabled": True, "ttl_seconds": 60,
+                "privacy": "inspection-metadata-v1"}}}
+        self.assertEqual(sc.validate(cfg), [])
+        state = self.fix / "config-state"
+        receipt = sc.accept(cfg, proposed_by="owner", authority_class="owner", state_dir=state)
+        self.assertEqual(receipt["decision"], "accepted", receipt)
+        self.assertEqual(sc.load(state_dir=state)["mode"], "active")
+        queue = {"tasks": [], "events": [], "serve": {"routes": {}}, "runs": []}
+        with self.h1, self.h2:
+            with mock.patch.object(collectors, "collect_queue", return_value=(queue, "ok", {})):
+                frame = adapters.capture(now=NOW, root=self.root, config_state_dir=state)
+        self.assertEqual({c["kind"] for c in frame["coverage"]}, {"pressure", "workers"})
+        self.assertEqual({r["plane"] for r in frame["datasets"]["plans"]}, {"declared-plane", "queue"})
+        self.assertEqual(len(frame["datasets"]["workers"]), 1)
+        pressure, code = model.query(frame, ("swarm", "pressure"), {}, NOW)
+        self.assertEqual(code, 0, pressure)
+        workers, code = model.query(frame, ("worker", "ls"), {}, NOW)
+        self.assertEqual(code, 0, workers)
+
+    # --- F3: refresh forces an exact new frame; the pin cannot be bypassed
+    def test_refresh_forces_a_new_frame_despite_fresh_cache(self):
+        with self.h1, self.h2:
+            first = adapters.capture(now=time.time(), root=self.root)
+            write_heartbeat(self.fix, time.time(), {
+                "fixture-plane": {"quality": "verified", "observed_at": time.time(),
+                                  "obs": {"grants": [{"grant_units": 99}]}}})
+            real = adapters.capture
+            seen = []
+            def spy(now=None, root=None):
+                seen.append(1)
+                return real(now=now, root=root)
+            def serve_json(args):
+                buf = io.StringIO()
+                with mock.patch.object(adapters, "capture", spy), \
+                     contextlib.redirect_stdout(buf):
+                    adapters.serve(("swarm", "status"), dict(args, json=True),
+                                   root=self.root)
+                return json.loads(buf.getvalue())
+            refreshed = serve_json({"refresh": True})
+            self.assertTrue(seen)  # capture ran despite the fresh cached frame
+            self.assertNotEqual(refreshed["snapshot_id"], first["snapshot_id"])
+            seen.clear()
+            serve_json({})
+            self.assertFalse(seen)  # fresh cache reused without refresh
+            seen.clear()
+            pinned = serve_json({"refresh": True, "snapshot": first["snapshot_id"]})
+            self.assertFalse(seen)  # an explicit snapshot pin cannot be bypassed
+            self.assertEqual(pinned["snapshot_id"], first["snapshot_id"])
+
+    # --- F4: --all --since keeps work whose historical attempt is in window
+    def test_dream_all_since_keeps_work_whose_attempt_is_in_window(self):
+        old_parent = {"id": "work-old", "state": "completed",
+                      "created_at": model.iso(NOW - 2 * 86400),
+                      "updated_at": model.iso(NOW - 2 * 86400),
+                      "attempt_ids": ["attempt-recent"]}
+        recent = {"id": "attempt-recent", "work_id": "work-old", "state": "failed",
+                  "finished_at": NOW - 600}
+        stale_parent = {"id": "work-stale", "state": "failed",
+                        "created_at": model.iso(NOW - 2 * 86400),
+                        "updated_at": model.iso(NOW - 2 * 86400),
+                        "attempt_ids": ["attempt-ancient"]}
+        ancient = {"id": "attempt-ancient", "work_id": "work-stale",
+                   "state": "failed", "finished_at": NOW - 2 * 86400}
+        cov = [model.coverage("queue:h", "queue", "queue", observed_at=model.iso(NOW),
+                              received_at=model.iso(NOW), ttl=60)]
+        frame = model.frame("a" * 64, model.iso(NOW), cov,
+                            dict(_EMPTY, dreams=[old_parent, stale_parent],
+                                 attempts=[recent, ancient]))
+        res, _ = model.query(frame, ("dream", "ls"), {"all": True, "since": "1h"}, NOW)
+        self.assertEqual([r["id"] for r in res["items"]], ["work-old"])
+        res, _ = model.query(frame, ("dream", "ls"), {"all": True, "since": "3d"}, NOW)
+        self.assertEqual(sorted(r["id"] for r in res["items"]),
+                         ["work-old", "work-stale"])
+
+    # --- F5: partition retention is evaluated in UTC
+    def test_partition_end_is_utc_not_local(self):
+        old_tz = os.environ.get("TZ")
+        try:
+            os.environ["TZ"] = "Asia/Kolkata"
+            time.tzset()
+            self.assertEqual(store._partition_end("2026-10"),
+                             calendar.timegm((2026, 11, 1, 0, 0, 0, 0, 0, 0)))
+            self.assertEqual(store._partition_end("2026-12"),
+                             calendar.timegm((2027, 1, 1, 0, 0, 0, 0, 0, 0)))
+        finally:
+            if old_tz is None:
+                os.environ.pop("TZ", None)
+            else:
+                os.environ["TZ"] = old_tz
+            time.tzset()
+
+    # --- F6: dedupe read + append are one critical section
+    def test_event_dedupe_read_happens_inside_the_lock(self):
+        order = []
+        month = store.events_partition(NOW)
+        real_read = Path.read_text
+        real_flock = store.fcntl.flock
+        def spy_read(path_self, *a, **k):
+            if path_self.name == month:
+                order.append("read")
+            return real_read(path_self, *a, **k)
+        def spy_flock(fd, op):
+            if op == store.fcntl.LOCK_EX:
+                order.append("lock")
+            return real_flock(fd, op)
+        with mock.patch.object(Path, "read_text", spy_read), \
+             mock.patch.object(store.fcntl, "flock", spy_flock):
+            store.append_events([{"id": "ev-race", "summary": "s"}],
+                                root=self.root, now=NOW)
+        self.assertEqual(order[:2], ["lock", "read"])
+
+    def test_two_writers_same_id_append_once(self):
+        results = []
+        barrier = threading.Barrier(2)
+        def writer():
+            barrier.wait()
+            results.append(store.append_events(
+                [{"id": "ev-dup", "summary": "x"}], root=self.root, now=NOW))
+        threads = [threading.Thread(target=writer) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(sum(r["appended"] for r in results), 1)
+        self.assertEqual(len(store.read_events(root=self.root)), 1)
+
+    # --- F7: ONE clock-skew policy across capture, collectors and query
+    def test_one_clock_skew_policy_across_capture_collect_query(self):
+        future = NOW + 100  # inside the old loose gate, outside the strict one
+        row = model.coverage("s", "h", "queue", observed_at=model.iso(future),
+                             received_at=model.iso(NOW), ttl=60)
+        self.assertEqual(model.assess(row, NOW)["quality"], "conflicting")
+        self.assertEqual(collectors.plane_fresh({"observed_at": future}, NOW, 60),
+                         "unknown")
+        cov = adapters._coverage("s", "queue", "ok", NOW, 60,
+                                 source_observed_at=future)
+        self.assertEqual(cov["quality"], "conflicting")
+        within = NOW + 1  # inside the shared bound: certifiable everywhere
+        self.assertEqual(adapters._coverage("s", "queue", "ok", NOW, 60,
+                                            source_observed_at=within)["quality"],
+                         "verified")
+        self.assertEqual(collectors.plane_fresh({"observed_at": within}, NOW, 60),
+                         "current")
+        ok = model.coverage("s", "h", "queue", observed_at=model.iso(within),
+                            received_at=model.iso(NOW), ttl=60)
+        self.assertEqual(model.assess(ok, NOW)["quality"], "verified")
+
+    # --- trusted review association: same work or unverified
+    def _bound_chain(self, rid, session, subject, overall="accept"):
+        from swarmharness import session_review as sr
+        key_path = self.fix / "control.key"
+        key_path.write_bytes(b"fixture-control-key\n")
+        criteria = ["fixture criterion"]
+        review = sr.SessionReview.create(
+            review_id=rid, base=self.fix / "reviews",
+            worker={"session": session}, acceptance_criteria=criteria,
+            editor_binding="fixture-editor",
+            provenance_verifier=sr.hmac_provenance_verifier(key_path))
+        snap = review.stage_snapshot(subject=subject, completion_claim="fixture accepted")
+        digest = snap["subject_digest"]
+        checks = [{"status": "pass", "snapshot_digest": digest,
+                   "receipt_ref": "isolated-fixture-check"}]
+        editor = {"identity": "fixture-editor", "invocation_ref": "isolated-fixture"}
+        payload = sr.verdict_payload(overall, [], approval_scope=criteria,
+                                     checks_evidence=checks)
+        editor["invocation_receipt"] = sr.editor_receipt(
+            rid, review.rows[0], snap, editor, payload,
+            key=key_path.read_bytes().strip(), review_head=review.rows[-1]["record_hash"])
+        result = review.ingest_verdict(snapshot_digest=digest, editor=editor,
+                                       findings=[], overall=overall,
+                                       approval_scope=criteria, checks_evidence=checks)
+        self.assertTrue(result["ok"], result)
+        result = review.resolve(current_subject_digest=digest, checks_evidence=checks)
+        self.assertEqual(result["outcome"], "COMPLETE" if overall == "accept" else "REVISE", result)
+        if overall != "accept":
+            review._chain_append({"kind": "resolution", "outcome": "COMPLETE",
+                                  "result": {"outcome": "COMPLETE", "reasons": [], "unresolved": []},
+                                  "at": "isolated-forged-completion"})
+        return key_path, digest
+
+    def test_unreviewed_snapshot_cannot_borrow_earlier_acceptance(self):
+        from swarmharness import session_review as sr
+        key, _ = self._bound_chain("rev-drift", "sess-original", "accepted payload")
+        review = sr.SessionReview("rev-drift", base=self.fix / "reviews")
+        digest, manifest = sr._subject_identity("unreviewed payload")
+        newer = {"kind": "snapshot_staged", "subject_digest": digest,
+                 "subject_manifest": manifest, "round": 2,
+                 "completion_claim": "worker says done", "at": "isolated-unreviewed-drift"}
+        review._chain_append(newer)
+        state, reason = adapters._receipt_state(
+            "rev-drift", self.fix / "reviews", key_path=key,
+            claim={"session_id": "sess-original", "subject_digest": newer["subject_digest"]})
+        self.assertEqual(state, "unverified", reason)
+
+    def test_later_worker_annotation_cannot_supply_review_session_binding(self):
+        from swarmharness import session_review as sr
+        key, digest = self._bound_chain("rev-rebind", "sess-original", "accepted payload")
+        review = sr.SessionReview("rev-rebind", base=self.fix / "reviews")
+        review._chain_append({"kind": "worker_disposition", "finding_id": "fixture",
+                              "action": "rebuttal", "session_id": "sess-unrelated",
+                              "evidence_refs": [], "at": "isolated-rebinding-attempt"})
+        state, reason = adapters._receipt_state(
+            "rev-rebind", self.fix / "reviews", key_path=key,
+            claim={"session_id": "sess-unrelated", "subject_digest": digest})
+        self.assertEqual(state, "unverified", reason)
+
+    def test_authentic_revise_cannot_be_promoted_by_a_worker_complete_row(self):
+        key, digest = self._bound_chain("rev-revise", "sess-original", "unaccepted payload",
+                                        overall="revise")
+        state, reason = adapters._receipt_state(
+            "rev-revise", self.fix / "reviews", key_path=key,
+            claim={"session_id": "sess-original", "subject_digest": digest})
+        self.assertEqual(state, "unverified", reason)
+
+    def test_bound_valid_review_makes_repair_editor_verified(self):
+        subject = "a" * 64
+        key_path, subject = self._bound_chain("rev-bound", "sess-fix-1", subject)
+        state, why = adapters._receipt_state(
+            "rev-bound", self.fix / "reviews", key_path=key_path,
+            claim={"session_id": "sess-fix-1", "subject_digest": subject})
+        self.assertEqual(state, "editor-verified", why)
+
+    def test_copied_valid_review_for_different_work_stays_unverified(self):
+        subject = "b" * 64
+        key_path, subject = self._bound_chain("rev-copy", "sess-other-work", subject)
+        state, why = adapters._receipt_state(
+            "rev-copy", self.fix / "reviews", key_path=key_path,
+            claim={"session_id": "sess-this-work", "subject_digest": subject})
+        self.assertEqual(state, "unverified")
+        self.assertIn("not the audit row's session", why)
+        state, why = adapters._receipt_state(
+            "rev-copy", self.fix / "reviews", key_path=key_path,
+            claim={"session_id": "sess-other-work", "subject_digest": "c" * 64})
+        self.assertEqual(state, "unverified")
+        self.assertIn("subject", why)
+        state, why = adapters._receipt_state(
+            "rev-copy", self.fix / "reviews", key_path=key_path,
+            claim={"session_id": "sess-other-work"})
+        self.assertEqual(state, "unverified")
+        self.assertIn("subject digest", why)
+
+    def test_repairs_never_verify_from_unrelated_complete_review(self):
+        key_path, _ = self._bound_chain("rev-unrel", "sess-x", "d" * 64)
+        d = self.fix / "dreamer"
+        d.mkdir(parents=True)
+        (d / "audit-ledger.jsonl").write_text(json.dumps(
+            {"id": "t1", "repair_ref": "r1", "verdict": "PASS",
+             "audited_at": NOW, "review_id": "rev-unrel",
+             "session_id": "sess-y", "subject_digest": "e" * 64}) + "\n")
+        with self.h1, self.h2:
+            frame = adapters.capture(now=NOW, root=self.root)
+        rep = frame["datasets"]["repairs"][0]
+        self.assertEqual(rep["verification"], "unverified")
+        self.assertIn("session", rep["verification_reason"])
+
+    # --- dream open: exact pinned frame, exact physical attempt, no fake jump
+    def test_dream_open_uses_the_pinned_frame_and_physical_attempt(self):
+        cov = [model.coverage("queue:h", "queue", "queue", observed_at=model.iso(NOW),
+                              received_at=model.iso(NOW), ttl=60)]
+        work = {"id": "work:queue:t9", "queue_id": "t9", "state": "failed",
+                "current_attempt_id": "attempt:old",
+                "attempt_ids": ["attempt:old", "attempt:new"]}
+        a_old = {"id": "attempt:old", "work_id": "work:queue:t9", "state": "failed",
+                 "evidence_state": "verified", "session_id": "sess-old"}
+        a_new = {"id": "attempt:new", "work_id": "work:queue:t9",
+                 "state": "completed", "evidence_state": "verified",
+                 "session_id": "sess-new"}
+        old_frame = model.frame("a" * 64, model.iso(NOW), cov,
+                                dict(_EMPTY, dreams=[work], attempts=[a_old]))
+        new_frame = model.frame("b" * 64, model.iso(NOW), cov,
+                                dict(_EMPTY, dreams=[dict(work, current_attempt_id="attempt:new")],
+                                     attempts=[a_new]))
+        store.save_snapshot(old_frame, root=self.root)
+        store.save_snapshot(new_frame, root=self.root)
+        def no_latest(*a, **k):
+            raise AssertionError("latest_snapshot consulted despite pinned frame")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            with mock.patch.object(store, "latest_snapshot", no_latest):
+                result, code = adapters.dream_open(
+                    "work:queue:t9", {"attempt": "attempt:old"},
+                    frame=old_frame, root=self.root)
+        self.assertEqual(code, 3)  # a known native session still cannot fake a jump
+        self.assertEqual(result["session_id"], "sess-old")
+        with contextlib.redirect_stdout(out):
+            result, _ = adapters.dream_open("work:queue:t9", {},
+                                            frame=old_frame, root=self.root)
+        self.assertEqual(result["session_id"], "sess-old")  # current attempt IN the pin
+        with contextlib.redirect_stdout(out):
+            result, code = adapters.dream_open(
+                "work:queue:t9", {"attempt": "attempt:new"},
+                frame=old_frame, root=self.root)
+        self.assertEqual(code, 3)
+        self.assertIn("not in the selected snapshot", result["error"])

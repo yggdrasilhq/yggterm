@@ -682,7 +682,7 @@ def _validate_introspection(f, cfg):
         _fault(f, "inspection_schema", "introspection.sources must be a mapping")
         return
     kinds = {"queue", "attempt_history", "heartbeat", "services", "task_ledger",
-             "schedule", "composer", "reviews", "memory_lock"}
+             "schedule", "composer", "reviews", "memory_lock", "workers", "pressure"}
     for sid, source in sources.items():
         if not isinstance(sid, str) or not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_-]{0,79}", sid) or not isinstance(source, dict):
             _fault(f, "inspection_schema", "invalid introspection source ID/record")

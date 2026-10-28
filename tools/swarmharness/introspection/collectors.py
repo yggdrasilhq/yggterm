@@ -345,10 +345,10 @@ def collect_dreamer_ledgers(now):
     return rows, overall, detail
 
 
-def collect_heartbeat(now):
+def collect_heartbeat(now, path=None):
     """The observation-only heartbeat state. Quota planes carry their native
     units; unreadable funding readers stay QUOTA_UNKNOWN — never zeros."""
-    data, state, detail = _state(HEARTBEAT_STATE)
+    data, state, detail = _state(path if path is not None else HEARTBEAT_STATE)
     if state != "ok":
         return {"planes": [], "findings": [], "as_of": None}, state, detail or "heartbeat state absent"
     planes, findings = [], []
@@ -573,19 +573,19 @@ def plane_fresh(entry, now, ttl):
     obs = entry.get("observed_at") if isinstance(entry, dict) else None
     if not isinstance(obs, (int, float)) or isinstance(obs, bool):
         return "unknown"
-    if obs > now + 120:
+    if obs > now + model.CLOCK_SKEW_SECONDS:
         return "unknown"  # source clock ahead: not certifiable as current
     return "stale" if (now - obs) > ttl else "current"
 
 
-def collect_pressure(now, heartbeat_ttl=None):
+def collect_pressure(now, heartbeat_ttl=None, heartbeat_path=None):
     """Native quota/execution capacity: the heartbeat's verified planes in
     their own units, queue depth, and orchestrator backlog. A plane that is
     stale or untimeable is demoted here — its numbers remain on the row as
     historical observations but never present as current verified capacity,
     and an unreadable funding reader stays an unknown reader, never zeros."""
     hb_ttl = heartbeat_ttl if isinstance(heartbeat_ttl, (int, float)) and heartbeat_ttl > 0 else 60
-    hb, hb_state, hb_detail = collect_heartbeat(now)
+    hb, hb_state, hb_detail = collect_heartbeat(now, heartbeat_path)
     rows = []
     for plane in hb["planes"]:
         fresh = plane_fresh(plane, now, hb_ttl)
@@ -708,6 +708,13 @@ def collect_commitments(state_dir=None, now=None):
         ok, bad = sl.verify_ancestry(state)
     except Exception:
         ok = False
+    # The journal rows' own recorded time is the source observation clock for
+    # coverage; the reader's clock is never substituted for it.
+    extras["observed_at"] = max(
+        (t for rec in journal if isinstance(rec, dict)
+         for k in ("at", "recorded_at", "timestamp", "recorded_utc", "when")
+         for t in [model.epoch(rec.get(k))] if t),
+        default=None)
     return rows, ("ok" if ok else "conflicting"), extras if ok else \
         ("chain broken at %s" % bad)
 
@@ -717,13 +724,16 @@ def parse_tasks_ledger(path=None):
     parser when importable; absence is a normal local state."""
     p = Path(path or LEDGER_PATH).expanduser()
     try:
+        observed_at = p.stat().st_mtime
         text = p.read_text(errors="replace")
     except OSError:
         return None
     open_n = len(re.findall(r"^\#{2,3}\s*T-\d+.*?\n.*?status:\s*open", text, re.M))
     claimed_n = len(re.findall(r"^\#{2,3}\s*T-\d+.*?\n.*?status:\s*claimed", text, re.M))
+    # The ledger file's own write time is the source observation clock; the
+    # parse moment is the reader's clock and must never stand in for it.
     return {"path": str(p), "open": open_n, "claimed": claimed_n,
-            "observed_at": time.time()}
+            "observed_at": observed_at}
 
 
 _ROW_KEYS = ("id", "kind", "number", "claim", "harness", "host", "status",
@@ -903,13 +913,17 @@ def collect_memory_lock(now, limits=None, kernel_dir=None):
 
 def collect_workers(now, registry_dir=None):
     """Manually owned worker rows from the yggterm row registry
-    (``${YGGTERM_HOME:-~/.yggterm}/rows``). These are dynamically discovered
+    (an explicitly enrolled registry dir, else ``${YGGTERM_HOME:-~/.yggterm}/rows``).
+    These are dynamically discovered
     manual owner workers — a separate compute population from the
     autonomous queue-admitted dream stream. An undiscoverable or unreadable
     registry is reported as unknown worker coverage, never as zero workers,
     and never folded into the queue count."""
-    base = Path(registry_dir or os.environ.get("YGGTERM_HOME",
-                                               str(_HOME / ".yggterm"))).expanduser() / "rows"
+    if registry_dir:
+        base = Path(registry_dir).expanduser()
+    else:
+        base = Path(os.environ.get("YGGTERM_HOME",
+                                   str(_HOME / ".yggterm"))).expanduser() / "rows"
     rows = []
     try:
         entries = sorted(base.glob("*.json"))
@@ -931,5 +945,7 @@ def collect_workers(now, registry_dir=None):
                 out[k] = model.text(row[k], 120) if isinstance(row[k], (str, list)) else row[k]
         rows.append(out)
     detail = {"registry": str(base), "skipped": skipped,
-              "entries": len(entries)}
+              "entries": len(entries),
+              "newest_mtime": max((p.stat().st_mtime for p in entries[:200]
+                                   if p.is_file()), default=None)}
     return rows, ("ok" if rows or not skipped else "invalid"), detail
