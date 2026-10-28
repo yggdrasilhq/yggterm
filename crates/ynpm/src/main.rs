@@ -2077,6 +2077,7 @@ fn verb_self_update(paths: &Paths, args: &[String]) -> anyhow::Result<()> {
 
 // ===== the install pipeline =====
 
+#[derive(Debug, Clone)]
 pub struct InstallOutcome {
     pub name: String,
     pub version: String,
