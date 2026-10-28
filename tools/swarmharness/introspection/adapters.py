@@ -36,44 +36,163 @@ DEFAULT_TTLS = {"queue": 30, "attempt_history": 30, "dream_state": 60,
 
 
 def enrollment():
-    """Read the optional introspection subtree. It is supported by every
-    reader but is NOT activated fleet-side; absence returns the standing
-    defaults with activated=False (never a silent config adoption)."""
-    spec = {"activated": False, "enabled": True, "sources": [],
-            "limits": dict(collectors.DEFAULT_LIMITS),
-            "retention": dict(collectors.DEFAULT_RETENTION), "faults": []}
+    """Read the optional introspection subtree and classify the collection
+    mode honestly:
+
+      configured — an ACTIVE config with an enabled subtree: the enrolled
+                   sources (kind/host/path/units/ttl) drive capture and only
+                   those sources are collected.
+      disabled   — an active config whose subtree is explicitly disabled: a
+                   standing read is NOT silently substituted; capture fails
+                   closed with the disable recorded.
+      invalid    — introspection-related config faults or an unreadable
+                   config layer: enrollment intent existed but cannot be
+                   trusted, so collection is refused, never widened.
+      standing   — no active introspection subtree: the documented standing
+                   read-only operator defaults apply, and every coverage row
+                   carries collection_mode=standing (never configured-complete).
+    """
+    spec = {"mode": "standing", "activated": False, "enabled": False,
+            "sources": [], "limits": dict(collectors.DEFAULT_LIMITS),
+            "retention": dict(collectors.DEFAULT_RETENTION), "faults": [],
+            "config_state": "absent"}
     try:
         sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
         from swarmharness import swarmconfig as sc
         res = sc.load()
-        cfg = (res or {}).get("config") or {}
-        sub = cfg.get("introspection")
-        if isinstance(sub, dict) and sub.get("enabled"):
-            spec.update(activated=True, enabled=True,
-                        limits={**spec["limits"], **(sub.get("limits") or {})},
-                        retention={**spec["retention"], **(sub.get("retention") or {})},
-                        faults=list((res or {}).get("faults") or [])[:4])
-            for sid, s in (sub.get("sources") or {}).items():
-                if isinstance(s, dict) and s.get("enabled"):
-                    spec["sources"].append({"id": sid, **{k: s.get(k) for k in
-                                          ("kind", "host", "path", "units", "ttl_seconds")}})
     except Exception as exc:
-        spec["faults"].append({"code": "enrollment_unreadable", "detail": type(exc).__name__})
+        spec["mode"] = "invalid"
+        spec["faults"].append({"code": "enrollment_unreadable",
+                               "detail": type(exc).__name__})
+        return spec
+    res = res or {}
+    cfg = res.get("config") or {}
+    faults = [f for f in (res.get("faults") or []) if isinstance(f, dict)]
+    spec["faults"] = faults[:4]
+    insp_faults = [f for f in faults
+                   if str(f.get("code", "")) == "inspection_schema"
+                   or "introspection" in str(f.get("detail", "")).lower()]
+    if insp_faults:
+        spec.update(mode="invalid", config_state="inspection_faults")
+        return spec
+    if res.get("mode") != "active" or not isinstance(cfg, dict) or not cfg:
+        spec.update(config_state=str(res.get("mode", "absent")))
+        return spec
+    sub = cfg.get("introspection")
+    if not isinstance(sub, dict):
+        spec.update(config_state="active")
+        return spec
+    spec.update(config_state="active", config_revision=res.get("revision"))
+    if sub.get("enabled") is not True:
+        spec.update(mode="disabled")
+        return spec
+    spec.update(mode="configured", activated=True, enabled=True)
+    for sid, s in (sub.get("sources") or {}).items():
+        if not isinstance(s, dict):
+            continue
+        spec["sources"].append({"id": sid, "enabled": s.get("enabled") is True,
+                                **{k: s.get(k) for k in ("kind", "host", "path",
+                                                         "units", "ttl_seconds",
+                                                         "queue_source_ref")}})
+    spec["limits"] = {**spec["limits"], **(sub.get("limits") or {})}
+    spec["retention"] = {**spec["retention"], **(sub.get("retention") or {})}
     return spec
 
 
-def _coverage(source, kind, state, now, ttl, reason=None, host="local"):
+STANDING_NOTE = ("standing read-only operator default (introspection config "
+                 "not activated; not configured-complete)")
+
+
+def _coverage(source, kind, state, now, ttl, source_observed_at=None,
+              reason=None, host="local", collection_mode=None):
+    """One coverage record. ``observed_at`` is the SOURCE's own observation
+    time, never the reader's clock: a read that just succeeded does not
+    freshen an old observation. Only a source as-of inside the TTL with a
+    known time can stay verified; everything else is demoted with the exact
+    reason on the record."""
     quality = {"ok": "verified", "absent": "unavailable", "stale": "stale",
                "invalid": "unknown", "unobserved": "unknown",
-               "timeout": "unknown", "conflicting": "conflicting"}.get(state, "unknown")
+               "refused": "unavailable", "timeout": "unknown",
+               "conflicting": "conflicting"}.get(state, "unknown")
     if quality in ("unknown", "unavailable") and not reason:
         reason = state
     if state == "absent":
         reason = reason or "source absent (not unobserved)"
-    return model.coverage(source, host, kind, observed_at=model.iso(now),
+    if quality == "verified":
+        if source_observed_at is None:
+            quality, reason = "unknown", reason or "source observation time unknown"
+        else:
+            age = now - source_observed_at
+            if age > ttl:
+                quality = "stale"
+                reason = ("source observation age %ds exceeds ttl %ds"
+                          % (int(age), int(ttl)))
+            elif age < -120:
+                quality = "conflicting"
+                reason = "source clock ahead of reader by %ds" % int(-age)
+    if collection_mode == "standing" and reason:
+        reason = str(reason) + "; " + STANDING_NOTE
+    elif collection_mode == "standing":
+        reason = STANDING_NOTE
+    return model.coverage(source, host, kind,
+                          observed_at=(model.iso(source_observed_at)
+                                       if source_observed_at is not None else None),
                           received_at=model.iso(now), ttl=ttl,
-                          quality=quality, reason=reason,
-                          revision=None)
+                          quality=quality, reason=reason, revision=None,
+                          collection_mode=collection_mode)
+
+
+def _reviews_dir():
+    return Path(os.environ.get("YGG_INSPECT_REVIEWS",
+                               str(HOME / ".yggterm/swarm/reviews"))).expanduser()
+
+
+def _receipt_state(review_id, review_dir=None, key_path=None):
+    """Validate one sessionReview chain for repair verification. Returns
+    (verification, reason). ``editor-verified`` requires ALL of: an intact
+    hash chain (any corruption raises on read), a terminal COMPLETE
+    resolution, a recorded editor verdict, and an editor invocation receipt
+    that authenticates against the control key on this reader. A
+    structurally valid chain without a verifiable receipt stays unverified —
+    a verdict claim, even PASS, is never editor-verified by itself."""
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+        from swarmharness import session_review as sr
+        review = sr.SessionReview(str(review_id), base=str(review_dir or _reviews_dir()))
+        rows = review.rows  # corrupt/rewritten/reordered chains raise here
+    except Exception as exc:
+        return "unverified", ("review chain unreadable or corrupt: "
+                              + type(exc).__name__)
+    if not rows:
+        return "unverified", "review chain empty"
+    if not any(r.get("kind") == "resolution" and r.get("outcome") == "COMPLETE"
+               for r in rows):
+        return "unverified", "review chain has no COMPLETE resolution"
+    verdicts = [r for r in rows if r.get("kind") == "editor_verdict"]
+    if not verdicts:
+        return "unverified", "review chain carries no editor verdict"
+    try:
+        verifier = sr.hmac_provenance_verifier(sr._load_key(key_path))
+    except Exception:
+        return "unverified", ("review chain structurally valid; editor "
+                              "provenance not verifiable (no control key on "
+                              "this reader)")
+    verdict = verdicts[-1]
+    snaps = [r for r in rows if r.get("kind") == "snapshot_staged"]
+    matching = ([s for s in snaps if s.get("subject_digest") == verdict.get("snapshot_digest")]
+                or snaps)
+    if not matching:
+        return "unverified", "review chain carries no staged snapshot for the verdict"
+    try:
+        ok = verifier(review.review_id, rows[0], matching[-1],
+                      verdict.get("editor"), verdict.get("signed_payload"),
+                      verdict.get("verification_head")) is True
+    except Exception as exc:
+        return "unverified", ("editor receipt verification failed: "
+                              + type(exc).__name__)
+    if not ok:
+        return "unverified", "editor invocation receipt did not authenticate"
+    return "editor-verified", ""
 
 
 def _runmeta(audit_rows, now):
@@ -102,43 +221,122 @@ def _runmeta(audit_rows, now):
     return meta
 
 
+_EMPTY_DATASETS = {"dreams": [], "attempts": [], "services": [], "schedules": [],
+                   "plans": [], "events": [], "heartbeat": [], "findings": [],
+                   "repairs": [], "workers": [], "summary": []}
+
+
+def _failclosed_frame(spec, now, root):
+    """A capture that read NOTHING. An explicit disable or an invalid
+    enrollment is recorded as an unavailable collection with the exact
+    reason — never an empty-looking healthy frame and never a silent
+    standing substitution."""
+    mode = spec["mode"]
+    host = os.uname().nodename.split(".")[0]
+    reason = ("introspection collection disabled by enrollment (owner disable "
+              "respected; no standing substitution)" if mode == "disabled" else
+              "introspection enrollment invalid or unreadable; collection "
+              "refused (fail closed)")
+    faults = "; ".join("%s:%s" % (f.get("code", "?"), str(f.get("detail", ""))[:60])
+                       for f in spec["faults"][:3])
+    cov = [_coverage("collection:" + host, "collection", "refused", now, 60,
+                     reason=reason + (("; faults: " + faults) if faults else ""),
+                     collection_mode=mode)]
+    datasets = {k: list(v) for k, v in _EMPTY_DATASETS.items()}
+    datasets["findings"] = [{"id": "finding:collection:" + mode,
+                             "scope": "collection", "verdict": "unknown",
+                             "detail": reason + (("; faults: " + faults) if faults else "")}]
+    datasets["summary"] = [{"id": "summary:1", "collection_mode": mode,
+                            "sources_collected": 0, "dreams": None,
+                            "workers": None,
+                            "note": "fail-closed capture: no sources were read"}]
+    frame = model.frame(model.digest({"mode": mode, "faults": spec["faults"],
+                                      "sources": sorted(c["source"] + ":" + c["kind"]
+                                                        for c in cov)}),
+                        model.iso(now), cov, datasets)
+    try:
+        store.save_snapshot(frame, root=root)
+    except Exception:
+        pass
+    return frame
+
+
+def _repairs_from_audit(audit_rows, now, reviews_dir=None):
+    """Repairs from the dreamer audit ledger. The audit verdict (PASS/FAIL)
+    is a worker-graded claim from the same population it grades: it is
+    retained verbatim but can never self-certify. ``editor-verified``
+    requires a trusted sessionReview chain linked by the audit row's
+    review_id and validated end to end; everything else records exactly why
+    it stays unverified."""
+    repairs = []
+    for row in audit_rows:
+        if not isinstance(row, dict) or not row.get("repair_ref"):
+            continue
+        rec = {"id": "repair:" + str(row["repair_ref"])[:60],
+               "work_id": "work:queue:" + str(row.get("id")),
+               "ref": model.text(row["repair_ref"], 120),
+               "verdict": model.text(row.get("verdict"), 24) or "unknown",
+               "at": model.epoch(row.get("audited_at")),
+               "verification": "unverified", "verification_reason": None}
+        review_id = row.get("review_id")
+        if review_id:
+            rec["review_id"] = model.text(review_id, 80)
+            state, why = _receipt_state(str(review_id)[:80], reviews_dir)
+            rec["verification"] = state
+            rec["verification_reason"] = why or None
+        else:
+            rec["verification_reason"] = ("worker audit claim (no sessionReview "
+                                          "linkage); verdict PASS/FAIL never "
+                                          "self-certifies")
+        repairs.append(rec)
+    return repairs
+
+
 def capture(now=None, root=None):
-    """One bounded read-only pass over the standing sources -> frame."""
+    """One bounded read-only pass -> frame. The enrollment mode decides what
+    is read: standing defaults, exactly the enrolled configured sources, or
+    nothing (fail closed)."""
     now = now if now is not None else time.time()
     spec = enrollment()
+    if spec["mode"] in ("disabled", "invalid"):
+        return _failclosed_frame(spec, now, root)
+    host = os.uname().nodename.split(".")[0]
+    if spec["mode"] == "configured":
+        return _capture_configured(spec, now, root, host)
+    return _capture_standing(spec, now, root, host)
+
+
+def _capture_standing(spec, now, root, host):
     limits = spec["limits"]
+    mode = "standing"
     datasets, coverage = {}, []
 
     q, qstate, qdetail = collectors.collect_queue(now, limits)
-    host = os.uname().nodename.split(".")[0]
     dstate, dst, ddetail = collectors.collect_dream_state(now)
     dl, dlst, dldetail = collectors.collect_dreamer_ledgers(now)
     runmeta = _runmeta(dl["audit"], now)
     work, attempts = model.queue_records(q["tasks"], q["events"], runmeta,
                                          "queue", host, now)
+    for w in work:
+        w["origin"] = "queue-admitted"
     datasets["dreams"] = work
     datasets["attempts"] = attempts
 
-    repairs = []
-    for row in dl["audit"]:
-        if row.get("repair_ref"):
-            repairs.append({"id": "repair:" + str(row["repair_ref"])[:60],
-                            "work_id": "work:queue:" + str(row.get("id")),
-                            "ref": model.text(row["repair_ref"], 120),
-                            "verdict": model.text(row.get("verdict"), 24) or "unknown",
-                            "at": model.epoch(row.get("audited_at")),
-                            "verification": "editor-verified" if row.get("verdict") in ("PASS", "FAIL") else "unverified"})
-    datasets["repairs"] = repairs
+    datasets["repairs"] = _repairs_from_audit(dl["audit"], now)
 
     hb, hbst, hbdetail = collectors.collect_heartbeat(now)
     hb_rows = []
     for plane in hb["planes"]:
-        hb_rows.append({"id": "plane:" + plane["plane"], "row_type": "plane", **plane})
+        hb_rows.append({"id": "plane:" + plane["plane"], "row_type": "plane",
+                        "freshness": collectors.plane_fresh(plane, now, DEFAULT_TTLS["heartbeat"]),
+                        **plane})
     for f in hb["findings"]:
         hb_rows.append({"id": "finding:" + str(f.get("id", ""))[:80], "row_type": "finding", **f})
     datasets["heartbeat"] = hb_rows
 
     services, svst, svdetail = collectors.collect_services(STANDING_UNITS, now, limits)
+    for s in services:
+        s["provenance"] = "systemd"
     maint, mst, mdetail = collectors.collect_maintenance(now)
     ex = maint["pass"].get("executor") or {}
     if ex.get("unit") and not any(s.get("unit") == ex["unit"] for s in services):
@@ -151,8 +349,13 @@ def capture(now=None, root=None):
                          "pid": None, "since": model.epoch(maint["pass"].get("at")),
                          "restarts": None,
                          "description": "supervisor-observed executor (%s)" % ex.get("action", "n/a"),
-                         "cpu_seconds": None, "rss_bytes": None})
+                         "cpu_seconds": None, "rss_bytes": None,
+                         "provenance": "supervisor-read"})
     datasets["services"] = services
+    sv_reason = None
+    if isinstance(svdetail, dict) and svdetail.get("expected_not_found"):
+        sv_reason = ("expected roster units not observed by systemctl: "
+                     + ", ".join(svdetail["expected_not_found"][:6]))
 
     sched, scst, scdetail = collectors.collect_timers(STANDING_TIMER_PATTERNS, now, limits)
     for ov in dstate["overlays"]:
@@ -190,7 +393,10 @@ def capture(now=None, root=None):
         sched.append({"id": c["id"], "kind": "commitment", **{k: v for k, v in c.items() if k != "id"}})
     datasets["schedules"] = sched
 
-    pressure, pst, pdetail = collectors.collect_pressure(now)
+    workers, wst, wdetail = collectors.collect_workers(now)
+    datasets["workers"] = workers
+
+    pressure, pst, pdetail = collectors.collect_pressure(now, DEFAULT_TTLS["heartbeat"])
     datasets["plans"] = [{"id": "plan:" + r["kind"] + ":" + str(r.get("plane", ""))[:60], **r}
                          for r in pressure]
 
@@ -243,39 +449,214 @@ def capture(now=None, root=None):
 
     findings = _checks(datasets, q, hb, services, dstate, now)
     datasets["findings"] = findings
-    datasets["summary"] = [{"id": "summary:1", "dreams": len(work),
+    datasets["summary"] = [{"id": "summary:1", "collection_mode": mode,
+                            "dreams": len(work),
                             "running": len([w for w in work if w.get("state") == "running"]),
                             "failed": len([w for w in work if str(w.get("state", "")).startswith("failed")]),
+                            "workers": len(workers) if workers else 0,
+                            "workers_state": wst,
+                            "queue_is_not_whole_compute": True,
                             "services": len(services), "schedules": len(sched),
                             "events": len(events), "heartbeat_planes": len(hb["planes"]),
                             "active_findings": len([f for f in hb["findings"] if f.get("active")])}]
 
     cov = [
         _coverage("queue:" + host, "queue", qstate, now, DEFAULT_TTLS["queue"],
-                  reason=None if qstate == "ok" else str(qdetail)[:120], host=host),
+                  source_observed_at=now,
+                  reason=None if qstate == "ok" else str(qdetail)[:120], host=host,
+                  collection_mode=mode),
         _coverage("queue-metrics:" + host, "attempt_history", qdetail.get("metrics_state", "absent") if isinstance(qdetail, dict) else qstate,
-                  now, DEFAULT_TTLS["attempt_history"],
-                  reason=str(qdetail)[:120] if qstate != "ok" else None, host=host),
+                  now, DEFAULT_TTLS["attempt_history"], source_observed_at=now,
+                  reason=str(qdetail)[:120] if qstate != "ok" else None, host=host,
+                  collection_mode=mode),
         _coverage("dream-state:" + host, "schedule", dst, now, DEFAULT_TTLS["dream_state"],
-                  reason=str(ddetail)[:120] if dst != "ok" else None, host=host),
+                  source_observed_at=now,
+                  reason=str(ddetail)[:120] if dst != "ok" else None, host=host,
+                  collection_mode=mode),
         _coverage("dreamer-ledgers:" + host, "attempt_history", dlst, now, DEFAULT_TTLS["dreamers"],
-                  reason=str(dldetail)[:120] if dlst != "ok" else None, host=host),
+                  source_observed_at=now,
+                  reason=str(dldetail)[:120] if dlst != "ok" else None, host=host,
+                  collection_mode=mode),
         _coverage("heartbeat:" + host, "heartbeat", hbst, now, DEFAULT_TTLS["heartbeat"],
-                  reason=str(hbdetail)[:120] if hbst != "ok" else None, host=host),
+                  source_observed_at=hb.get("as_of"),
+                  reason=str(hbdetail)[:120] if hbst != "ok" else None, host=host,
+                  collection_mode=mode),
         _coverage("services:" + host, "services", svst, now, DEFAULT_TTLS["services"],
-                  reason=str(svdetail)[:120] if svst != "ok" else None, host=host),
+                  source_observed_at=now,
+                  reason=sv_reason if svst == "ok" else
+                  (str(svdetail)[:120] if not isinstance(svdetail, dict) else json.dumps(svdetail, sort_keys=True)[:120]),
+                  host=host, collection_mode=mode),
         _coverage("timers:" + host, "schedule", scst, now, DEFAULT_TTLS["schedule"],
-                  reason=str(scdetail)[:120] if scst != "ok" else None, host=host),
+                  source_observed_at=now,
+                  reason=str(scdetail)[:120] if scst != "ok" else None, host=host,
+                  collection_mode=mode),
         _coverage("maintenance:" + host, "services", mst, now, DEFAULT_TTLS["maintenance"],
-                  reason=str(mdetail)[:120] if mst != "ok" else None, host=host),
+                  source_observed_at=now,
+                  reason=str(mdetail)[:120] if mst != "ok" else None, host=host,
+                  collection_mode=mode),
+        _coverage("workers-registry:" + host, "workers", wst, now, DEFAULT_TTLS["services"],
+                  source_observed_at=now,
+                  reason=str(wdetail)[:120] if wst != "ok" else None, host=host,
+                  collection_mode=mode),
         _coverage("kernel-ring:" + host, "events", kst, now, DEFAULT_TTLS["kernel"],
-                  reason=str(kdetail)[:120] if kst != "ok" else None, host=host),
+                  source_observed_at=now,
+                  reason=str(kdetail)[:120] if kst != "ok" else None, host=host,
+                  collection_mode=mode),
         _coverage("commitments:" + host, "task_ledger", cmtst, now, DEFAULT_TTLS["commitments"],
-                  reason=str(cmtdetail)[:120] if cmtst != "ok" else None, host=host),
+                  source_observed_at=now,
+                  reason=str(cmtdetail)[:120] if cmtst != "ok" else None, host=host,
+                  collection_mode=mode),
     ]
     frame = model.frame(model.digest({"sources": sorted(c["source"] + ":" + c["kind"] for c in cov),
                                       "limits": limits, "retention": spec["retention"],
-                                      "activated": spec["activated"]}),
+                                      "activated": spec["activated"], "mode": mode}),
+                        model.iso(now), cov, datasets)
+    try:
+        store.save_snapshot(frame, root=root)
+        store.prune(root=root, now=now, retention=spec["retention"])
+    except Exception:
+        pass
+    return frame
+
+
+_CONFIGURED_KINDS = ("queue", "attempt_history", "heartbeat", "services",
+                     "schedule", "task_ledger", "composer", "reviews",
+                     "memory_lock")
+
+
+def _capture_configured(spec, now, root, host):
+    """Collect EXACTLY the enrolled sources. An enrolled host this adapter
+    cannot serve is reported unobserved rather than silently widened to
+    local, a disabled enrolled source is recorded as not collected, and a
+    kind without an implemented collector is an explicit open — none of
+    these fall back to standing sources."""
+    limits = spec["limits"]
+    mode = "configured"
+    datasets = {k: list(v) for k, v in _EMPTY_DATASETS.items()}
+    coverage = []
+
+    def served(entry):
+        # only local hosts are served by this adapter; anything else is a
+        # fail-visible unobserved, never a silent local read
+        return entry.get("host") in (host, "local", None)
+
+    have_queue = False
+    hb = {"planes": [], "findings": [], "as_of": None}
+    services = []
+    for s in spec["sources"]:
+        sid, kind = str(s.get("id", "")), s.get("kind")
+        ttl = s.get("ttl_seconds") if isinstance(s.get("ttl_seconds"), int) else DEFAULT_TTLS.get(kind, 120)
+        src = kind + ":" + sid + ":" + host
+        if not s.get("enabled"):
+            coverage.append(_coverage(src, kind or "unknown", "unobserved", now, ttl,
+                                      reason="enrolled source disabled; not collected",
+                                      collection_mode=mode))
+            continue
+        if kind not in _CONFIGURED_KINDS:
+            coverage.append(_coverage(src, kind or "unknown", "unobserved", now, ttl,
+                                      reason="unsupported source kind", collection_mode=mode))
+            continue
+        if not served(s):
+            coverage.append(_coverage(src, kind, "unobserved", now, ttl,
+                                      reason="enrolled host %r is not served by this "
+                                             "local adapter (not silently widened)"
+                                             % str(s.get("host"))[:40],
+                                      collection_mode=mode))
+            continue
+        if kind in ("queue", "attempt_history"):
+            if have_queue:
+                coverage.append(_coverage(src, kind, "ok", now, ttl,
+                                          source_observed_at=now, collection_mode=mode))
+                continue
+            have_queue = True
+            q, qstate, qdetail = collectors.collect_queue(now, limits)
+            runmeta = _runmeta([], now)
+            work, attempts = model.queue_records(q["tasks"], q["events"], runmeta,
+                                                 "queue", host, now)
+            for w in work:
+                w["origin"] = "queue-admitted"
+            datasets["dreams"] = work
+            datasets["attempts"] = attempts
+            coverage.append(_coverage(src, kind, qstate, now, ttl, source_observed_at=now,
+                                      reason=None if qstate == "ok" else str(qdetail)[:120],
+                                      collection_mode=mode))
+        elif kind == "heartbeat":
+            hb, hbst, hbdetail = collectors.collect_heartbeat(now)
+            for plane in hb["planes"]:
+                datasets["heartbeat"].append({"id": "plane:" + plane["plane"],
+                                              "row_type": "plane",
+                                              "freshness": collectors.plane_fresh(plane, now, ttl),
+                                              **plane})
+            for f in hb["findings"]:
+                datasets["heartbeat"].append({"id": "finding:" + str(f.get("id", ""))[:80],
+                                              "row_type": "finding", **f})
+            coverage.append(_coverage(src, kind, hbst, now, ttl,
+                                      source_observed_at=hb.get("as_of"),
+                                      reason=str(hbdetail)[:120] if hbst != "ok" else None,
+                                      collection_mode=mode))
+        elif kind == "services":
+            rows, sst, sdetail = collectors.collect_services(s.get("units"), now, limits)
+            for r in rows:
+                r["provenance"] = "systemd"
+            services.extend(rows)
+            reason = None
+            if sst == "ok" and isinstance(sdetail, dict) and sdetail.get("expected_not_found"):
+                reason = ("expected roster units not observed by systemctl: "
+                          + ", ".join(sdetail["expected_not_found"][:6]))
+            elif sst != "ok":
+                reason = json.dumps(sdetail, sort_keys=True)[:160] if isinstance(sdetail, dict) else str(sdetail)[:120]
+            datasets["services"].extend(rows)
+            coverage.append(_coverage(src, kind, sst, now, ttl, source_observed_at=now,
+                                      reason=reason, collection_mode=mode))
+        elif kind == "schedule":
+            rows, schst, schdetail = collectors.collect_timers(s.get("units") or [], now, limits)
+            datasets["schedules"].extend(rows)
+            coverage.append(_coverage(src, kind, schst, now, ttl, source_observed_at=now,
+                                      reason=str(schdetail)[:120] if schst != "ok" else None,
+                                      collection_mode=mode))
+        elif kind == "task_ledger":
+            row = collectors.parse_tasks_ledger(s.get("path"))
+            if row:
+                datasets["schedules"].append({"id": "schedule:ledger:" + sid, "kind": "commitment",
+                                              **row})
+                coverage.append(_coverage(src, kind, "ok", now, ttl,
+                                          source_observed_at=row.get("observed_at"),
+                                          collection_mode=mode))
+            else:
+                coverage.append(_coverage(src, kind, "absent", now, ttl, collection_mode=mode))
+        else:
+            coverage.append(_coverage(src, kind, "unobserved", now, ttl,
+                                      reason="collector not implemented for kind %s "
+                                             "(recorded open, not healthy-empty)" % kind,
+                                      collection_mode=mode))
+
+    workers, wst, wdetail = collectors.collect_workers(now)
+    datasets["workers"] = workers
+    pressure, pst, pdetail = collectors.collect_pressure(now, DEFAULT_TTLS["heartbeat"])
+    datasets["plans"] = [{"id": "plan:" + r["kind"] + ":" + str(r.get("plane", ""))[:60], **r}
+                         for r in pressure]
+    datasets["findings"] = _checks(datasets,
+                                   {"serve": {}}, hb, services, {"state": {}}, now)
+    datasets["summary"] = [{"id": "summary:1", "collection_mode": mode,
+                            "dreams": len(datasets["dreams"]),
+                            "workers": len(workers) if workers else 0,
+                            "workers_state": wst,
+                            "services": len(datasets["services"]),
+                            "schedules": len(datasets["schedules"]),
+                            "events": 0, "heartbeat_planes": len(hb["planes"]),
+                            "sources_enrolled": len(spec["sources"]),
+                            "queue_is_not_whole_compute": True}]
+    cov = coverage + [
+        _coverage("workers-registry:" + host, "workers", wst, now, DEFAULT_TTLS["services"],
+                  source_observed_at=now,
+                  reason=str(wdetail)[:120] if wst != "ok" else None, host=host,
+                  collection_mode=mode),
+        _coverage("pressure:" + host, "heartbeat", pst, now, DEFAULT_TTLS["pressure"],
+                  source_observed_at=hb.get("as_of"), host=host, collection_mode=mode),
+    ]
+    frame = model.frame(model.digest({"sources": sorted(c["source"] + ":" + c["kind"] for c in cov),
+                                      "limits": limits, "retention": spec["retention"],
+                                      "activated": True, "mode": mode}),
                         model.iso(now), cov, datasets)
     try:
         store.save_snapshot(frame, root=root)
@@ -313,17 +694,24 @@ def _checks(datasets, q, hb, services, dstate, now):
                     "detail": "no units observed"})
     funding_findings = [f for f in hb["findings"] if f.get("active") and f.get("kind") in
                         ("QUOTA_UNKNOWN", "AUTH_BLOCKED", "QUOTA_SCOPE_CONFLICT")]
+    current_planes = [p for p in hb["planes"]
+                      if collectors.plane_fresh(p, now, DEFAULT_TTLS["heartbeat"]) == "current"
+                      and p.get("quality") == "verified"]
     if funding_findings:
         out.append({"id": "check:funding", "scope": "funding", "verdict": "falsified",
                     "detail": "%d active funding findings (unknown readers): %s" % (
                         len(funding_findings),
                         ", ".join(str(f.get("id", ""))[:40] for f in funding_findings[:4]))})
-    elif hb["planes"]:
+    elif current_planes:
         out.append({"id": "check:funding", "scope": "funding", "verdict": "held",
-                    "detail": "%d funding planes verified in native units" % len(hb["planes"])})
+                    "detail": "%d funding planes verified and current in native units" % len(current_planes)})
     else:
+        stale_n = len(hb["planes"]) - len(current_planes)
         out.append({"id": "check:funding", "scope": "funding", "verdict": "unknown",
-                    "detail": "heartbeat state absent"})
+                    "detail": ("no current verified funding plane; %d plane(s) stale, "
+                               "failed or untimeable — an old heartbeat never "
+                               "certifies current capacity" % stale_n)
+                              if hb["planes"] else "heartbeat state absent"})
     broken = [f for f in hb["findings"] if f.get("active") and f.get("kind") == "RUNNER_BROKEN"
               and "ledger" in str(f.get("source", ""))]
     out.append({"id": "check:memory", "scope": "memory",

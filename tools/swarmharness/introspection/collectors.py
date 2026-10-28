@@ -46,24 +46,41 @@ LEDGER_PATH = _HOME / ".yggterm/memory/namespaces/_global/fleet-task-ledger.md"
 _DMESG_FOCUS = re.compile(
     r"(?i)out of memory|oom-kill|killed process|segfault|general protection|"
     r"blocked for more|\bi/o error|filesystem.*read-only|thermal|throttl")
-_LOGNAME_SAFE = re.compile(r"[^A-Za-z0-9._-]")
+# The dreamer's own production ledger location (dream-audit.py writes it);
+# this module only ever reads it.
+DREAMER_STATE = Path("/tmp/dreamer")
 
 
-def _state(path, reader=json.loads):
-    """Read a JSON file: (value, state, detail). absent != unreadable."""
+def _state(path, reader=json.loads, max_bytes=None):
+    """Read a JSON file: (value, state, detail). absent != unreadable, and an
+    empty or oversized file is invalid — not a proven absence. The read is
+    bounded BEFORE allocation: the size is checked first and at most one byte
+    past the limit is ever read, so a huge file is refused without being
+    loaded, and its content is reported unknown rather than truncated-then-
+    parsed."""
+    limit = max_bytes or DEFAULT_LIMITS["max_bytes"]
     p = Path(path).expanduser()
     try:
-        raw = p.read_bytes()
+        size = p.stat().st_size
     except FileNotFoundError:
         return None, "absent", str(p)
     except (IsADirectoryError, PermissionError):
         return None, "unreadable", "permission"
     except OSError:
         return None, "unreadable", "os error"
+    if size == 0:
+        return None, "invalid", "empty file (not a proven absence)"
+    if size > limit:
+        return None, "invalid", "over read limit (%d > %d bytes); content unknown" % (size, limit)
+    try:
+        with p.open("rb") as f:
+            raw = f.read(limit + 1)
+    except OSError:
+        return None, "unreadable", "os error"
+    if len(raw) > limit:
+        return None, "invalid", "over read limit; content unknown"
     if not raw.strip():
-        return None, "absent", "empty file"
-    if len(raw) > DEFAULT_LIMITS["max_bytes"]:
-        raw = raw[:DEFAULT_LIMITS["max_bytes"]]
+        return None, "invalid", "empty file (not a proven absence)"
     try:
         return reader(raw), "ok", ""
     except Exception as exc:
@@ -85,6 +102,10 @@ def read_jsonl(path, tail=None, max_bytes=None, now=None):
         return [], "absent", 0, False
     except OSError:
         return [], "unreadable", 0, False
+    if size == 0:
+        # An existing-but-empty ledger is an anomaly (or a truncated write),
+        # not a verified empty history and not a proven absence.
+        return [], "invalid", 0, False
     start = max(0, size - max_bytes)
     truncated = start > 0
     try:
@@ -106,6 +127,9 @@ def read_jsonl(path, tail=None, max_bytes=None, now=None):
     if isinstance(tail, int) and tail is not None and len(rows) > tail:
         rows = rows[-tail:]
         truncated = True
+    if not raw.strip():
+        # a whitespace-only ledger is an anomaly, not a verified empty history
+        return [], "invalid", skipped, truncated
     return rows, "ok", skipped, truncated
 
 
@@ -291,8 +315,8 @@ def collect_dream_state(now):
 def collect_dreamer_ledgers(now):
     """The dreamer side ledgers: dispatch audit rows and terminal audit
     verdicts (verdicts/checks are metadata; no transcript bodies)."""
-    dispatch, dstate, dskip, dtrunc = read_jsonl(Path("/tmp/dreamer/dream-ledger.jsonl"), tail=800)
-    audit, astate, askip, atrunc = read_jsonl(Path("/tmp/dreamer/audit-ledger.jsonl"), tail=800)
+    dispatch, dstate, dskip, dtrunc = read_jsonl(DREAMER_STATE / "dream-ledger.jsonl", tail=800)
+    audit, astate, askip, atrunc = read_jsonl(DREAMER_STATE / "audit-ledger.jsonl", tail=800)
     rows = {
         "dispatch": [r for r in dispatch if isinstance(r, dict)],
         "audit": [],
@@ -397,8 +421,12 @@ def collect_services(units, now, limits=None):
             # fixed offset from the end is safe.
             if cols and re.fullmatch(r"[A-Za-z0-9@_.:-]+\.(?:service|timer|target|socket)", cols[0]):
                 found.append(cols[0])
+    roster = {"expected": names, "observed": found,
+              "expected_not_found": [u for u in names if u not in found]}
     if not found:
-        return [], ("absent" if state == "ok" else state), "no matching user units"
+        detail = dict(roster, note="no matching user units observed for the expected roster")
+        return [], ("absent" if state == "ok" else state), detail
+    detail = dict(roster)
     props = ["Id,ActiveState,SubState,MainPID,ExecMainStartTimestamp,NRestarts,Description,LoadState"]
     out2, state2 = _systemctl(["show", *found, "--no-pager", "--property", props[0]], timeout)
     if state2 != "ok":
@@ -442,7 +470,7 @@ def collect_services(units, now, limits=None):
                 s["rss_bytes"] = int(fields[21]) * os.sysconf("SC_PAGE_SIZE")
             except (OSError, IndexError, ValueError):
                 pass
-    return services, "ok", ""
+    return services, "ok", detail
 
 
 def collect_timers(patterns, now, limits=None):
@@ -519,19 +547,46 @@ def collect_dmesg(now, limits=None):
     return rows, "ok", ""
 
 
-def collect_pressure(now):
+def plane_fresh(entry, now, ttl):
+    """Freshness of one heartbeat plane against ITS OWN observation time.
+    Re-reading the source file cannot freshen an old observation: only the
+    plane's recorded observed_at decides current vs stale vs unknown."""
+    obs = entry.get("observed_at") if isinstance(entry, dict) else None
+    if not isinstance(obs, (int, float)) or isinstance(obs, bool):
+        return "unknown"
+    if obs > now + 120:
+        return "unknown"  # source clock ahead: not certifiable as current
+    return "stale" if (now - obs) > ttl else "current"
+
+
+def collect_pressure(now, heartbeat_ttl=None):
     """Native quota/execution capacity: the heartbeat's verified planes in
-    their own units, queue depth, and orchestrator backlog. Unreadable
-    funding readers surface as unknown readers, never as zero capacity."""
+    their own units, queue depth, and orchestrator backlog. A plane that is
+    stale or untimeable is demoted here — its numbers remain on the row as
+    historical observations but never present as current verified capacity,
+    and an unreadable funding reader stays an unknown reader, never zeros."""
+    hb_ttl = heartbeat_ttl if isinstance(heartbeat_ttl, (int, float)) and heartbeat_ttl > 0 else 60
     hb, hb_state, hb_detail = collect_heartbeat(now)
     rows = []
     for plane in hb["planes"]:
+        fresh = plane_fresh(plane, now, hb_ttl)
+        # Only a current observation from a verified reader is current
+        # verified capacity. Failed/lastverified/unverified reader states,
+        # stale observations and untimeable observations are all demoted;
+        # the numbers stay on the row as historical facts.
+        if fresh == "stale":
+            quality = "stale"
+        elif fresh == "unknown" or plane["quality"] != "verified":
+            quality = "unknown"
+        else:
+            quality = "verified"
         entry = {"kind": "funding", "plane": plane["plane"], "host": "local",
-                 "quality": plane["quality"],
+                 "quality": quality, "plane_freshness": fresh,
+                 "reader_quality": plane["quality"],
                  "grants": plane.get("grants", []),
                  "observed_at": plane.get("observed_at"),
                  "error": plane.get("error"),
-                 "unknown_reader": plane["quality"] != "verified"}
+                 "unknown_reader": quality != "verified"}
         if plane.get("available") is not None:
             entry["available"] = plane["available"]
         rows.append(entry)
@@ -544,8 +599,21 @@ def collect_pressure(now):
                  "quality": "verified" if qstate == "ok" else "unavailable",
                  "counts": counts, "serve": (q.get("serve") or {}).get("serve"),
                  "unknown_reader": qstate != "ok"})
-    return rows, "ok" if hb_state == "ok" and qstate == "ok" else "stale", {
-        "heartbeat": hb_state, "queue": qstate, "heartbeat_detail": hb_detail}
+    hb_as_of = hb.get("as_of")
+    hb_fresh = plane_fresh({"observed_at": hb_as_of}, now, hb_ttl)
+    overall = "ok" if (hb_state == "ok" and qstate == "ok"
+                       and hb_fresh == "current") else "stale"
+    return rows, overall, {
+        "heartbeat": hb_state, "queue": qstate, "heartbeat_detail": hb_detail,
+        "heartbeat_as_of": hb_as_of, "heartbeat_freshness": hb_fresh}
+
+
+def _ledger_path_dirs():
+    """Candidate dirs holding swarm_ledger.py across layouts: the repo tree
+    (<root>/tools/swarmharness) and a staged kernel payload (share/ygg/kernel
+    with swarmharness/ or a flat introspection/ layout)."""
+    here = Path(__file__).resolve()
+    return [here.parents[1], here.parents[1] / "swarmharness", here.parents[2]]
 
 
 def collect_commitments(state_dir=None, now=None):
@@ -554,7 +622,10 @@ def collect_commitments(state_dir=None, now=None):
     row; this is the human-readable accountability view."""
     rows = []
     state = str(state_dir or SWARM_STATE)
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    import sys as _sys
+    for cand in _ledger_path_dirs():
+        if (cand / "swarm_ledger.py").exists() and str(cand) not in _sys.path:
+            _sys.path.insert(0, str(cand))
     try:
         import swarm_ledger as sl
     except Exception as exc:
@@ -592,3 +663,42 @@ def parse_tasks_ledger(path=None):
     claimed_n = len(re.findall(r"^\#{2,3}\s*T-\d+.*?\n.*?status:\s*claimed", text, re.M))
     return {"path": str(p), "open": open_n, "claimed": claimed_n,
             "observed_at": time.time()}
+
+
+_ROW_KEYS = ("id", "kind", "number", "claim", "harness", "host", "status",
+             "state", "pid", "campaign", "role", "updated_at", "claimed_at",
+             "released_at", "note")
+
+
+def collect_workers(now, registry_dir=None):
+    """Manually owned worker rows from the yggterm row registry
+    (``${YGGTERM_HOME:-~/.yggterm}/rows``). These are dynamically discovered
+    manual owner workers — a separate compute population from the
+    autonomous queue-admitted dream stream. An undiscoverable or unreadable
+    registry is reported as unknown worker coverage, never as zero workers,
+    and never folded into the queue count."""
+    base = Path(registry_dir or os.environ.get("YGGTERM_HOME",
+                                               str(_HOME / ".yggterm"))).expanduser() / "rows"
+    rows = []
+    try:
+        entries = sorted(base.glob("*.json"))
+    except OSError:
+        return rows, "unreadable", {"registry": str(base)}
+    if not entries:
+        return rows, "absent", {"registry": str(base)}
+    skipped = 0
+    for p in entries[:200]:
+        row, state, _ = _state(p, max_bytes=65536)
+        if state != "ok" or not isinstance(row, dict):
+            skipped += 1
+            continue
+        out = {"id": "worker:" + model.text(p.stem, 80),
+               "row_type": "worker", "origin": "manual-owner-worker",
+               "registry": model.text(str(base), 120)}
+        for k in _ROW_KEYS:
+            if row.get(k) is not None:
+                out[k] = model.text(row[k], 120) if isinstance(row[k], (str, list)) else row[k]
+        rows.append(out)
+    detail = {"registry": str(base), "skipped": skipped,
+              "entries": len(entries)}
+    return rows, ("ok" if rows or not skipped else "invalid"), detail
