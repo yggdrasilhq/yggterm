@@ -23,7 +23,7 @@ use std::process::{Command, Stdio};
 use crate::{
     copy_dir_all, extract_tarball, package_integration, package_storage_key, publish_link,
     run_version, set_executable, sha256_file, sync_app_registration, trace_safe_text,
-    version_answer_matches, InstallOutcome, Paths,
+    version_answer_matches, ynpm_trace, InstallOutcome, Paths,
 };
 
 /// `https://github.com/<owner>/<repo>[@tag]` and `github:<owner>/<repo>[@tag]`
@@ -834,12 +834,11 @@ fn publish_release_generation(
     entry.dev_generation = None;
     entry.channel = Some("github-release".to_string());
     entry.source = Some(origin.to_string());
-    let integration = package
-        .app
-        .as_ref()
-        .map(|app| package_integration(&serde_json::json!({ "yggterm": app })))
-        .transpose()
-        .context("release manifest app block")?;
+    let integration = match &package.app {
+        Some(app) => package_integration(&serde_json::json!({ "yggterm": app }))
+            .context("release manifest app block")?,
+        None => None,
+    };
     entry.integration = integration.clone();
     std::fs::create_dir_all(&destination)?;
     for bin in artifact.bins.iter() {
@@ -1284,7 +1283,7 @@ mod tests {
         fs::create_dir_all(&build).unwrap();
         for bin in bins {
             let path = build.join(bin);
-            fs::write(&path, bin_script(format!("example-{bin} {version}"))).unwrap();
+            fs::write(&path, bin_script(&format!("example-{bin} {version}"))).unwrap();
             set_executable(&path).unwrap();
         }
         if let Some(bundle) = bundle {

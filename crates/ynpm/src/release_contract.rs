@@ -256,7 +256,7 @@ pub fn safe_content_relpath(rel: &str) -> Result<()> {
     Ok(())
 }
 
-fn safe_tag(tag: &str) -> Result<()> {
+pub(crate) fn safe_tag(tag: &str) -> Result<()> {
     let ok = !tag.is_empty()
         && tag.len() <= 128
         && tag
