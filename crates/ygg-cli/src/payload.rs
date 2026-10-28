@@ -84,7 +84,7 @@ pub fn manifest() -> Manifest {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Debug)]
 pub struct VerifyRow {
     pub path: String,
     pub status: String, // verified | missing | mismatch | unreadable
@@ -92,7 +92,7 @@ pub struct VerifyRow {
     pub found_sha256: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Debug)]
 pub struct VerifyReport {
     pub schema_version: u32,
     pub dir: String,

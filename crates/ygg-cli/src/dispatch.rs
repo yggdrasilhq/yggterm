@@ -5,6 +5,7 @@
 
 use crate::grammar::Args;
 use crate::ir::{Component, Loaded};
+use sha2::Digest;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 

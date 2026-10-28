@@ -216,13 +216,11 @@ pub fn parse(loaded: &Loaded, words: &[String]) -> ParseOutcome {
                             "argument {flag}: expected one argument\n{usage}"
                         ));
                     };
-                    if let Some(cho) = &option.choices {
-                        if !cho.is_empty() && !cho.contains(&value) {
-                            return ParseOutcome::Invalid(format!(
-                                "argument {flag}: invalid choice: {value:?} (choose from {})\n{usage}",
-                                cho.join(", ")
-                            ));
-                        }
+                    if !option.choices.is_empty() && !option.choices.contains(&value) {
+                        return ParseOutcome::Invalid(format!(
+                            "argument {flag}: invalid choice: {value:?} (choose from {})\n{usage}",
+                            option.choices.join(", ")
+                        ));
                     }
                     if let ArgValue::List(list) = args.get(&name).cloned().unwrap_or(ArgValue::List(vec![])) {
                         let mut list = list;
@@ -236,13 +234,11 @@ pub fn parse(loaded: &Loaded, words: &[String]) -> ParseOutcome {
                             "argument {flag}: expected one argument\n{usage}"
                         ));
                     };
-                    if let Some(cho) = &option.choices {
-                        if !cho.is_empty() && !cho.contains(&value) {
-                            return ParseOutcome::Invalid(format!(
-                                "argument {flag}: invalid choice: {value:?} (choose from {})\n{usage}",
-                                cho.join(", ")
-                            ));
-                        }
+                    if !option.choices.is_empty() && !option.choices.contains(&value) {
+                        return ParseOutcome::Invalid(format!(
+                            "argument {flag}: invalid choice: {value:?} (choose from {})\n{usage}",
+                            option.choices.join(", ")
+                        ));
                     }
                     args.insert(name, ArgValue::Str(value));
                 }
@@ -331,7 +327,7 @@ fn finish(
     for group in &record.conflicts {
         let chosen = group
             .iter()
-            .filter(|name| !matches!(args.get(**name), None | Some(ArgValue::Null) | Some(ArgValue::Bool(false))))
+            .filter(|name| !matches!(args.get(*name), None | Some(ArgValue::Null) | Some(ArgValue::Bool(false))))
             .count();
         if chosen > 1 {
             let names: Vec<String> = group.iter().map(|n| format!("--{n}")).collect();
@@ -517,7 +513,10 @@ pub fn examples_text(loaded: &Loaded, path: &[String]) -> String {
     lines.join("\n")
 }
 
-fn all_examples(loaded: &Loaded, path: &[String]) -> Vec<(Vec<String>, &crate::ir::ExampleEntry)> {
+fn all_examples<'a>(
+    loaded: &'a Loaded,
+    path: &[String],
+) -> Vec<(Vec<String>, &'a crate::ir::ExampleEntry)> {
     let mut found = Vec::new();
     for (p, n) in &loaded.tree {
         if p.starts_with(path) {
@@ -598,7 +597,10 @@ mod tests {
     fn loaded() -> crate::ir::Loaded {
         // Unit tests always read the embedded contract; the env pointer is
         // cleared so an ambient YGG_COMMAND_IR cannot skew the fixture.
-        env::remove_var("YGG_COMMAND_IR");
+        // SAFETY: process env is only mutated here, to the same absent
+        // state every loader path already treats as the default; no other
+        // test in this target writes YGG_COMMAND_IR concurrently.
+        unsafe { env::remove_var("YGG_COMMAND_IR") };
         load().expect("embedded contract loads")
     }
 
@@ -706,7 +708,7 @@ mod tests {
             }
             other => panic!("expected planned refusal, got {other:?}"),
         }
-        assert!(grammar::help_text(&loaded, &words(&["daemon"])).contains("planned"));
+        assert!(help_text(&loaded, &words(&["daemon"])).contains("planned"));
     }
 
     #[test]
