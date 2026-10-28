@@ -1,0 +1,89 @@
+{
+  "schema": 1,
+  "release": {
+    "version": "4.0.0",
+    "tag": "v4.0.0"
+  },
+  "packages": [
+    {
+      "id": "yggterm-gui",
+      "role": "desktop",
+      "summary": "yggterm desktop client (optional porcelain over the ygg seed)",
+      "artifacts": [
+        {
+          "platform": "linux-x64",
+          "format": "tar.gz",
+          "filename": "yggterm-gui-4.0.0-linux-x86_64.tar.gz",
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+          "bins": [],
+          "bundle": "yggterm",
+          "comment": "all-zero sha256 values are placeholders: this file is a shape example for release tooling that validates as schema-1 except for the digests, which the pipeline replaces with real ones"
+        },
+        {
+          "platform": "linux-arm64",
+          "format": "tar.gz",
+          "filename": "yggterm-gui-4.0.0-linux-aarch64.tar.gz",
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+          "bins": [],
+          "bundle": "yggterm"
+        },
+        {
+          "platform": "macos-arm64",
+          "format": "tar.gz",
+          "filename": "yggterm-gui-4.0.0-macos-aarch64.tar.gz",
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+          "bins": [],
+          "bundle": "yggterm.app",
+          "comment": "macOS ships the .app bundle inside a tar.gz; live macOS installation is untested from the Linux lane and declared in docs/ynpm-desktop-releases.md"
+        },
+        {
+          "platform": "windows-x64",
+          "format": "zip",
+          "filename": "yggterm-gui-4.0.0-windows-x86_64.zip",
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+          "bins": [
+            "yggterm.exe"
+          ],
+          "comment": "zip artifacts must carry plain files only; bundle publication needs symlink support and stays declared-not-shipped on Windows"
+        }
+      ],
+      "version_probe": {
+        "file": "yggterm/version"
+      },
+      "launch": {
+        "entry": "yggterm/yggterm"
+      },
+      "comment": "a bundle-only desktop package REQUIRES version_probe; bins+bundle packages may rely on the bin gate instead"
+    },
+    {
+      "id": "yggterm-web",
+      "role": "web",
+      "summary": "yggterm web client bundle (delivered by the yggterm web plane, not by ynpm install)",
+      "artifacts": [
+        {
+          "platform": "linux-x64",
+          "format": "tar.gz",
+          "filename": "yggterm-web-4.0.0.tar.gz",
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+        }
+      ]
+    },
+    {
+      "id": "yggterm-mobile",
+      "role": "mobile",
+      "summary": "yggterm Android client (official package handoff; ynpm never installs it and adb is never used)",
+      "artifacts": [
+        {
+          "platform": "android-arm64",
+          "format": "apk",
+          "filename": "yggterm-4.0.0-android.apk",
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+        }
+      ],
+      "handoff": {
+        "url": "https://github.com/yggdrasilhq/yggterm/releases/tag/v4.0.0",
+        "installer_hint": "Obtainium or the official store page; never adb"
+      }
+    }
+  ]
+}
