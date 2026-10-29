@@ -38,12 +38,17 @@ def main():
     for n in rep.get("notes", [])[:5]:
         print("  note:", n)
     # loop-closure trigger: if the outbox gained new proposals, the
-    # brain-pair review runs automatically (idempotent per batch)
+    # brain-pair review runs automatically (idempotent per batch). Its
+    # failure is review DEBT — reported distinctly, mining stays success.
     try:
         import composer_review
-        composer_review.main()  # prints its own noop/review line
-    except Exception as e:  # review failure never breaks the tick
-        print("  review-step skipped:", e)
+        review_rc = composer_review.main()  # prints its own noop/review line
+    except Exception as e:  # a broken review module never breaks mining
+        review_rc = None
+        print("  review-step error:", e)
+    if review_rc:
+        print(f"  review-debt: proposal review did NOT complete "
+              f"(exit {review_rc}) — debt retained, mining unaffected")
     return 0
 
 
