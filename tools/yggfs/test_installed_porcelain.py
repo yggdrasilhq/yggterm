@@ -3,6 +3,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import py_compile
 import subprocess
 import sys
 import tempfile
@@ -88,6 +89,51 @@ class InstalledPorcelain(unittest.TestCase):
         module=self.home/'.yggterm/bin/ygg/ygg-steer-compiler.py'
         self.assertTrue(module.is_file())
         self.assertFalse(module.is_symlink())
+
+    def test_same_metadata_upgrade_cannot_execute_old_timestamp_bytecode(self):
+        self.assert_metadata_upgrade_uses_current_source()
+
+    def test_prefixed_bytecode_and_approved_payload_alias_upgrade(self):
+        self.run_ygg('fs','init','--json')
+        self.env['PYTHONPYCACHEPREFIX']=str(self.home/'private-python-cache')
+        self.env['YGG_DISPERSE_BIN']=str(self.home/'.ygg/bin/ygg')
+        self.env['YGG_BIN_DIR']=str(self.home/'.ygg/bin/ygg')
+        self.assert_metadata_upgrade_uses_current_source()
+
+    def assert_metadata_upgrade_uses_current_source(self):
+        module=self.home/'.yggterm/bin/ygg/ygg_command_tree.py'
+        original=module.read_bytes()
+        self.assertIn(b'"Usage: "',original)
+        old=original.replace(b'"Usage: "',b'"Stale: "')
+        self.assertEqual(len(old),len(original))
+        before=module.stat()
+        module.write_bytes(old)
+        os.utime(module,ns=(before.st_atime_ns,before.st_mtime_ns))
+        compile_result=subprocess.run([sys.executable,'-c',
+            'import py_compile,sys;print(py_compile.compile(sys.argv[1],doraise=True,invalidation_mode=py_compile.PycInvalidationMode.TIMESTAMP))',
+            str(module)],env=self.env,text=True,capture_output=True,timeout=15)
+        self.assertEqual(compile_result.returncode,0,compile_result.stderr)
+        self.assertIn('Stale: ygg',self.run_ygg('help','steer'))
+        cache=Path(compile_result.stdout.strip()).parent
+        custom=cache/'operator-notes.txt';custom.write_text('keep unknown owner data')
+        self.install()
+        self.assertEqual(module.read_bytes(),original)
+        self.assertEqual(int(module.stat().st_mtime),int(before.st_mtime))
+        self.assertEqual(module.stat().st_size,before.st_size)
+        self.assertIn('Usage: ygg',self.run_ygg('help','steer'))
+        self.assertNotIn('Stale: ygg',self.run_ygg('help','steer'))
+        self.assertEqual(custom.read_text(),'keep unknown owner data')
+
+    def test_symlinked_bytecode_parent_is_not_followed(self):
+        directory=self.home/'.yggterm/bin/ygg/__pycache__'
+        self.assertFalse(directory.exists())
+        outside=self.home/'unrelated-cache';outside.mkdir()
+        sentinel=outside/'operator-notes.txt';sentinel.write_text('preserve')
+        directory.symlink_to(outside)
+        result=subprocess.run([sys.executable,str(FLEET/'ygg-disperse.py'),'install',
+            '--repo',str(FLEET),'--local','--json'],env=self.env,text=True,capture_output=True,timeout=30)
+        self.assertNotEqual(result.returncode,0)
+        self.assertEqual(sentinel.read_text(),'preserve')
 
 
 if __name__=='__main__':unittest.main()
