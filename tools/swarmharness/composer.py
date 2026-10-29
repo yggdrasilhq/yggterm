@@ -370,13 +370,24 @@ def validate_observation(obs):
     return None
 
 
+def _record_lines(text):
+    """Match read_page's raw LF/CRLF/CR framing after decoding.
+
+    Unicode-only separators remain record content. Splitting on them would
+    desynchronize supplied raw offsets and trigger lossy re-encoding of
+    replacement characters instead of retaining the original byte spans.
+    The final regex match is the empty end-of-input sentinel.
+    """
+    return re.findall(r"[^\r\n]*(?:\r\n|\r|\n|$)", text)[:-1]
+
+
 def extract(source_kind, path, gen, lineage, page_text, byte_start,
             line_offs=None):
     """Single-page detector pass with ABSOLUTE byte-offset spans. Returns
     (observations, sig_at). Command-loop state is handled by
     extract_page_with_state."""
     observations = []
-    lines = page_text.splitlines(keepends=True)  # CRLF-exact offsets (P6)
+    lines = _record_lines(page_text)
     if line_offs is None or len(line_offs) < len(lines):
         line_offs = []
         off = byte_start
@@ -422,7 +433,7 @@ def extract_page_with_state(source_kind, path, gen, lineage, page_text,
                             "byte_off": p["byte_off"]})
     att_offs = dict(att_offs or {})
     observations = []
-    lines = page_text.splitlines(keepends=True)  # CRLF-exact offsets (P6)
+    lines = _record_lines(page_text)
     if line_offs is None or len(line_offs) < len(lines):
         line_offs = []
         off = byte_start
