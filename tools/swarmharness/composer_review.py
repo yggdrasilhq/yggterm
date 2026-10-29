@@ -98,9 +98,15 @@ def _nfc(v):
 def _canonical(row):
     """Deterministic serialization — the bytes identity is bound to. NFC-
     normalized, true UTF-8 (no \\u escaping of non-ASCII, RFC 8785 style);
-    NaN/Infinity are refused (ValueError): they have no canonical form."""
-    return json.dumps(_nfc(row), sort_keys=True, separators=(",", ":"),
+    NaN/Infinity are refused (ValueError): they have no canonical form.
+    The encode/decode round-trip is lossless AND makes lone Unicode
+    surrogates raise (UnicodeEncodeError, a ValueError) HERE — at the
+    canonical check the loader types them non-canonical — instead of
+    crashing identity computation later: identity bytes must be UTF-8-
+    encodable by construction."""
+    text = json.dumps(_nfc(row), sort_keys=True, separators=(",", ":"),
                       allow_nan=False, ensure_ascii=False)
+    return text.encode("utf-8").decode("utf-8")
 
 
 def proposal_identity(row):

@@ -657,6 +657,23 @@ def main():
     finally:
         sb.cleanup()
 
+    # ---- R29 lone-surrogate row -> typed hold at the canonical check ----
+    sb = Sandbox()
+    try:
+        fake = sb.install_fake()
+        sb.outbox_write(json.dumps(a) + "\n"
+                        + '{"kind": "claim_proposal", "note": "\\ud800"}\n')
+        r = sb.run_review(COMPOSER_REVIEW_BIN=fake, COMPOSER_FAKE_MODE="valid")
+        holds = sb.holds()
+        check("R29 lone Unicode surrogate -> typed non-canonical hold, "
+              "identity never crashes",
+              r.returncode == 2 and "hold:outbox-malformed" in r.stdout
+              and "non-canonical-row" in r.stdout
+              and "UnicodeEncodeError" not in r.stderr and sb.marker() is None,
+              r.stdout.strip()[:200] + r.stderr[-120:])
+    finally:
+        sb.cleanup()
+
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
     if FAIL:
         print("FAILED:", *FAIL, sep="\n  ")
