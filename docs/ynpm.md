@@ -586,3 +586,15 @@ must carry the second flag and the launched Codex TUI must paint its warning.
 - `ynpx` does not mask a reachable-but-broken package as an offline cache hit;
   it only falls back when the network/registry is unavailable. Flags after the
   package name are passed verbatim to the launched bin.
+
+## Ygg root transition
+
+The canonical logical operating root is `~/.ygg`; the first compatibility
+phase aliases it to an existing `~/.yggterm` store without moving live state.
+See [the filesystem contract](spec-ygg-fs.md). ynpm retains ownership of its
+state, executable generations, publication and rollback. Optional graphical
+porcelains are packages, while app-owned mutable data has a separate target
+under `libyggterm/<app-id>/{config,state,cache}`. Existing readers and app
+state are not claimed migrated merely because a location ID is available.
+Rootwide GC planning does not authorize invoking package collectors on
+unowned, active, pinned or evidence-linked content.

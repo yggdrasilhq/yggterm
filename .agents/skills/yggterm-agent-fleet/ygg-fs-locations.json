@@ -1,0 +1,36 @@
+{
+  "schema": 1,
+  "contract_version": 1,
+  "canonical_directory": ".ygg",
+  "legacy_directory": ".yggterm",
+  "locations": {
+    "root": {"owner": "yggfs", "path": ".", "class": "identity"},
+    "kernel.swarm": {"owner": "swarmharness2", "path": "swarm", "target": "kernel/swarm", "class": "durable", "conversion": "owner-migration-required"},
+    "kernel.server": {"owner": "server", "path": ".", "target": "kernel/server", "class": "durable", "conversion": "owner-migration-required"},
+    "package.store": {"owner": "ynpm", "path": "ynpm", "class": "durable"},
+    "package.generations": {"owner": "ynpm", "path": "ynpm/generations", "class": "generations"},
+    "memory.hub": {"owner": "memory", "path": "memory", "class": "durable"},
+    "review.store": {"owner": "swarmharness2", "path": "swarm/reviews", "target": "reviews", "class": "evidence", "conversion": "owner-migration-required"},
+    "library.skills": {"owner": "ynpm", "path": "skills", "target": "library/skills", "class": "durable", "conversion": "owner-migration-required"},
+    "library.verbs": {"owner": "disperse", "path": "bin/ygg", "target": "library/verbs", "class": "replica", "conversion": "owner-migration-required"},
+    "vault.auth": {"owner": "auth", "path": "auth", "target": "vault/auth", "class": "secret", "conversion": "owner-migration-required", "indexable": false},
+    "app.yggterm": {"owner": "yggterm-gui", "path": "libyggterm/yggterm", "class": "app-config", "conversion": "new-location-not-yet-consumed"},
+    "app.ychrome": {"owner": "ychrome", "path": "libyggterm/ychrome", "class": "app-config", "conversion": "new-location-not-yet-consumed"},
+    "scratch": {"owner": "registered-component", "path": "scratchpad", "class": "mixed-retain"},
+    "runtime": {"owner": "registered-component", "path": "run", "class": "runtime-retain"},
+    "gc": {"owner": "yggfs", "path": "gc", "class": "audit"}
+  },
+  "gc_policy": {
+    "version": 1,
+    "automatic_apply": false,
+    "unknown_ownership": "retain",
+    "monthly_action": "plan",
+    "scratch_eligible_after_days": 7,
+    "cache_eligible_after_days": 30,
+    "logs_keep_days": 30,
+    "trace_keep_days": 7,
+    "quarantine_keep_days": 14,
+    "quarantine_cap_bytes": 2147483648,
+    "apply_requires": ["owner-object-manifest", "launch-pin-fence", "fresh-reference-snapshot", "complete-platform-liveness", "exact-object-identity", "unexpired-plan", "restore-procedure"]
+  }
+}

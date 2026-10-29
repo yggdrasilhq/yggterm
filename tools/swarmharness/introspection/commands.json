@@ -2022,6 +2022,42 @@
           "tags": "auth vault account profile rotation"
         }
       ]
+    },
+    {
+      "path": [
+        "fs"
+      ],
+      "summary": "Inspect stable filesystem locations, initialize compatible roots, and plan safe collection.",
+      "effect": "legacy",
+      "handler": "legacy",
+      "options": [],
+      "examples": [
+        {
+          "title": "Explain the selected store and root identity",
+          "command": "ygg fs status",
+          "tags": "root inspect"
+        },
+        {
+          "title": "Initialize the canonical alias without moving legacy state",
+          "command": "ygg fs init",
+          "tags": "root migration"
+        },
+        {
+          "title": "Find the config location for a graphical porcelain",
+          "command": "ygg fs path app.yggterm",
+          "tags": "config location"
+        },
+        {
+          "title": "Plan collection and show protected objects",
+          "command": "ygg fs gc plan --json",
+          "tags": "gc plan json"
+        }
+      ],
+      "legacy": [
+        "ygg-fs.py"
+      ],
+      "strict": false,
+      "component": "fs"
     }
   ],
   "contract": "ygg4-cli",
@@ -2249,6 +2285,22 @@
       "interpreter": "bash",
       "owns": [
         "shell-based compatibility row claiming"
+      ]
+    },
+    "fs": {
+      "runner": "ygg-fs.py",
+      "aliases": [
+        "ygg-fs.py"
+      ],
+      "resolution": [
+        "env_dir:YGG_BIN_DIR",
+        "payload:ygg-fs.py"
+      ],
+      "interpreter": "python3",
+      "owns": [
+        "root identity and compatibility aliases",
+        "versioned filesystem location contract",
+        "non-destructive garbage collection plans"
       ]
     }
   }

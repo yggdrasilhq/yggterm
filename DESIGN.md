@@ -18,5 +18,5 @@ fix the drifted layer and record the correction in both.
 - [design/11-yggterm-overlay](design/11-yggterm-overlay.md) — yggterm's own overlay: product vocabulary, workflows, UI emphasis.
 - [design/Inheritance](design/Inheritance.md) — the chain: Dioxus → yggui (libyggterm) → yggterm shell chrome.
 - [design/assets](design/assets/) — design assets by kind (icons/, fonts/, components/, img/). Build-bundled packaging icons stay in the repo's own `assets/` — that is build input, not design material.
-- [docs/spec-yggterm-fs](docs/spec-yggterm-fs.md) — the `~/.yggterm` filesystem organization spec: what lives where, what is ephemeral, who owns each subtree.
+- [docs/spec-ygg-fs](docs/spec-ygg-fs.md) — the `~/.ygg` filesystem organization and compatibility spec: what lives where, what is ephemeral, who owns each subtree.
 - [ydesign skill](~/.yggterm/skills/ydesign/SKILL.md) — navigation for the design system; installed copy at `~/.yggterm/skills/ydesign/`.
