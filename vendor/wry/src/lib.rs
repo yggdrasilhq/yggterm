@@ -1192,6 +1192,7 @@ impl<'a> WebViewBuilder<'a> {
   // requests on the GTK main loop, so the gtk build keeps the 0.55
   // `'static`-only contract that dioxus-desktop's Rc-bound asset handlers
   // need (the virtualdom is not Send). DO NOT widen the gtk arm.
+  #[cfg(gtk)]
   pub fn with_custom_protocol<F>(mut self, name: String, handler: F) -> Self
   where
     F: Fn(WebViewId, Request<Vec<u8>>) -> Response<Cow<'static, [u8]>> + 'static,
@@ -1298,6 +1299,7 @@ impl<'a> WebViewBuilder<'a> {
   // requests on the GTK main loop, so the gtk build keeps the 0.55
   // `'static`-only contract that dioxus-desktop's Rc-bound asset handlers
   // need (the virtualdom is not Send). DO NOT widen the gtk arm.
+  #[cfg(gtk)]
   pub fn with_asynchronous_custom_protocol<F>(mut self, name: String, handler: F) -> Self
   where
     F: Fn(WebViewId, Request<Vec<u8>>, RequestAsyncResponder) + 'static,
