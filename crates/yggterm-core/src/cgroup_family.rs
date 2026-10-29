@@ -390,6 +390,7 @@ const FAMILY_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_sec
 /// with the process.
 ///
 /// `home` is the perf home the `family_migration` events land in.
+#[cfg(target_os = "linux")]
 pub fn spawn_family_sweep(home: std::path::PathBuf) {
     let _ = std::thread::Builder::new()
         .name("cgroup-family-sweep".to_string())
@@ -428,6 +429,11 @@ pub fn spawn_family_sweep(home: std::path::PathBuf) {
             }
         });
 }
+
+// cgroupfs and /proc renderer recycling are Linux policies. Other platforms
+// use their own resource managers and must never start this signal loop.
+#[cfg(not(target_os = "linux"))]
+pub fn spawn_family_sweep(_home: std::path::PathBuf) {}
 
 /// [11.108] The web child's committed footprint that earns its WebKit
 /// renderers a recycle. Committed = `memory.current` + `memory.swap.current`:
@@ -477,6 +483,7 @@ pub fn web_recycle_renderers(child_procs: &[(i32, String)]) -> Vec<i32> {
 /// The [11.108] half of the sweep: watch the web child's committed footprint
 /// and recycle its renderers past the watermark. Silence on any unreadable
 /// file — a probe that cannot see must not act.
+#[cfg(target_os = "linux")]
 fn maybe_recycle_web_child(home: &std::path::PathBuf, self_pid: i32) {
     let flag = std::env::var("YGGTERM_DISABLE_WEB_RECYCLE").ok();
     if web_recycle_disabled_from_env(flag.as_deref()) {
