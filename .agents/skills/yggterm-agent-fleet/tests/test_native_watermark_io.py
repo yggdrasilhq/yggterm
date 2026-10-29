@@ -70,6 +70,43 @@ class NativeWatermarkIO(unittest.TestCase):
         self.assertEqual(self.sync(), (0, 0, 0))
         self.assertEqual(ym.get_journal_path(self.root).read_bytes(), journal)
 
+    def test_many_changed_documents_share_one_durable_checkpoint(self):
+        for i in range(12):
+            (self.native / f"note-{i:02}.md").write_text(f"Revised synthetic note {i}\n")
+        with patch.object(ym, "save_watermark", wraps=ym.save_watermark) as saves:
+            self.assertEqual(self.sync()[0], 12)
+        self.assertEqual(saves.call_count, 1)
+        states = ym.load_watermark(self.root, "zcode")["native_documents"]
+        actual = {s.get("delivered_payload_digest") for s in states.values()}
+        for i in range(12):
+            self.assertIn(ym.text_sha256(f"Revised synthetic note {i}"), actual)
+        self.assertEqual(self.sync(), (0, 0, 0))
+
+    def test_exception_does_not_checkpoint_failed_document_mutations(self):
+        (self.native / "note-00.md").write_text("Completed first edit\n")
+        original = ym._sync_native_document
+        calls = 0
+        before = ym.load_watermark(self.root, "zcode")["native_documents"]
+        failed_key = None
+
+        def fail_second(*args, **kwargs):
+            nonlocal calls, failed_key
+            calls += 1
+            if calls == 2:
+                failed_key = f"{args[3]}/{args[4]}::{kwargs['state_scope']}"
+                kwargs["_watermark"]["native_documents"][failed_key]["delivered_payload_digest"] = "uncommitted"
+                raise OSError("failure after partial state mutation")
+            return original(*args, **kwargs)
+
+        with patch.object(ym, "_sync_native_document", side_effect=fail_second):
+            with self.assertRaisesRegex(OSError, "partial state"):
+                self.sync()
+        disk = ym.load_watermark(self.root, "zcode")["native_documents"]
+        self.assertEqual(disk[failed_key], before[failed_key])
+        self.assertIn(ym.text_sha256("Completed first edit"),
+                      [v.get("delivered_payload_digest") for v in disk.values()])
+        self.assertEqual(self.sync(), (0, 0, 0))
+
     def test_completed_document_survives_later_document_failure(self):
         (self.native / "note-00.md").write_text("Durable edit before failure\n")
         original = ym._sync_native_document
