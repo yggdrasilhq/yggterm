@@ -113,7 +113,7 @@
         },
         {
           "title": "Find complete failure lookup examples",
-          "command": "ygg help examples --query failure",
+          "command": "ygg help examples --search failure",
           "tags": "discovery"
         },
         {

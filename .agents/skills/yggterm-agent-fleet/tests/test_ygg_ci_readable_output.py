@@ -21,6 +21,7 @@ import importlib.util
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -179,6 +180,27 @@ def main():
     run_root = SCRATCH_ROOT / time.strftime("%Y%m%d-%H%M%S")
     run_root.mkdir(parents=True, exist_ok=True)
     try:
+        # Root discovery examples are part of the same operator contract as
+        # the CI leaves. Parse every declared example without invoking any
+        # backend; a teaching command with a rejected flag is a broken door.
+        command_module = ygg_ci.parent / "ygg_command_tree.py"
+        spec = importlib.util.spec_from_file_location("ci_example_contract",command_module)
+        tree = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = tree
+        spec.loader.exec_module(tree)
+        command_data = json.loads((command_module.resolve().with_name("commands.json")).read_text())
+        for node in command_data["commands"]:
+            for example in node.get("examples",[]):
+                words = shlex.split(example["command"])
+                if words[:1] != ["ygg"]:
+                    failures.append("example must name the ygg entrypoint: " + example["command"])
+                    continue
+                try:
+                    tree.parse(words[1:])
+                except tree.PlannedFamily:
+                    pass  # unavailable is distinct from a syntax rejection
+                except (ValueError, SystemExit) as exc:
+                    failures.append("rejected teaching command: " + example["command"] + " (" + str(exc) + ")")
         # ── pure render helpers ──────────────────────────────────────────
         m = load_ci(ygg_ci, new_home(run_root, "pure-home"))
         if "clock ahead 2m" not in m._build_line({"at": NOW + 120, "status": "built"}, NOW):
@@ -292,6 +314,21 @@ def main():
         r = run_ci(ygg_ci, home, "events", "--kind", "never_happened_fixture")
         if "no events match the filters" not in r.stdout:
             failures.append(f"events zero-match state lost:\n{r.stdout}")
+
+        # A recorded reset target exists even when the actual git reset
+        # fails. Absence of a success witness cannot become a success claim.
+        failed_reset = {"event_id":"ci-fixture-reset-failed", "at":NOW,
+                        "project":"yggterm", "kind":"gate_failed",
+                        "reset_to":"b"*40, "detail":"fixture reset failed"}
+        seed_events(home,[failed_reset])
+        r = run_ci(ygg_ci,home,"events")
+        if "reset target bbbbbbbbbbbb" not in r.stdout or "outcome unverified" not in r.stdout:
+            failures.append("events must explain reset target without inventing a successful reset")
+        if "main reset to" in r.stdout:
+            failures.append("events claimed an unverified main reset completed")
+        r = run_ci(ygg_ci,home,"events","--json")
+        if json.loads(r.stdout) != [failed_reset]:
+            failures.append("failed-reset event JSON changed its existing payload")
 
         # ── cache: --json purity (the old code printed human lines first) ─
         home = new_home(run_root, "cache-home")

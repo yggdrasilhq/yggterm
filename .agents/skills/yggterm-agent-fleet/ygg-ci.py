@@ -795,7 +795,7 @@ def _event_line(e):
     if e.get("sha"):
         detail.append(f"sha {str(e['sha'])[:12]}")
     if e.get("reset_to"):
-        detail.append(f"main reset to {str(e['reset_to'])[:12]}")
+        detail.append(f"reset target {str(e['reset_to'])[:12]}; outcome unverified")
     if e.get("budget_secs"):
         detail.append(f"budget was {e['budget_secs']}s")
     if e.get("deploy_ok") is True:
