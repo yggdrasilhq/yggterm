@@ -1330,21 +1330,77 @@ fn read_pointer_generation_name(seed_root: &Path) -> Option<String> {
     }
 }
 
-/// The already-active no-op gate: the platform pointer names this exact
-/// generation AND every declared bin is present in it. A pointer over an
-/// emptied generation is a crashed activation and is replaced wholesale by
-/// the staging path, never honored.
-fn pointer_names_complete_generation(
-    seed_root: &Path,
-    generation_name: &str,
-    generation_dir: &Path,
-    bins: &[String],
-) -> bool {
-    if read_pointer_generation_name(seed_root).as_deref() != Some(generation_name) {
-        return false;
+/// Compare archived content and restore only absent files; existing bytes
+/// and running executables are never overwritten during repair.
+fn reconcile_verified_seed(staging: &Path, generation: &Path) -> Result<usize> {
+    // Check every archive file before repairing any missing path. Presence
+    // alone cannot establish integrity or authorize new pointer digests.
+    if std::fs::symlink_metadata(generation)?.file_type().is_symlink() {
+        bail!("seed generation is a link; refusing to reuse it");
     }
-    bins.iter()
-        .all(|bin| generation_dir.join("bin").join(bin_file_name(bin)).is_file())
+    let mut pending = vec![staging.to_path_buf()];
+    let mut missing = Vec::new();
+    while let Some(directory) = pending.pop() {
+        for entry in std::fs::read_dir(directory)? {
+            let entry = entry?;
+            let source = entry.path();
+            let kind = entry.file_type()?;
+            if kind.is_symlink() {
+                bail!("verified seed staging contains a link");
+            }
+            if kind.is_dir() {
+                pending.push(source);
+                continue;
+            }
+            if !kind.is_file() {
+                bail!("verified seed staging contains an unsupported file type");
+            }
+            let relative = source.strip_prefix(staging)?;
+            let target = generation.join(relative);
+            let expected = sha256_file(&source)?;
+            let mut ancestor = generation.to_path_buf();
+            for component in relative.components() {
+                ancestor.push(component.as_os_str());
+                match std::fs::symlink_metadata(&ancestor) {
+                    Ok(meta) if meta.file_type().is_symlink() => {
+                        bail!("existing seed path {} is a link", ancestor.display());
+                    }
+                    Ok(_) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            match std::fs::symlink_metadata(&target) {
+                Ok(meta) if meta.is_file() && sha256_file(&target)? == expected => {}
+                Ok(_) => bail!(
+                    "existing seed file {} differs from the verified archive; refusing activation",
+                    target.display()
+                ),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    missing.push((source, target, expected));
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+    let repaired = missing.len();
+    for (source, target, expected) in missing {
+        std::fs::create_dir_all(target.parent().context("seed file has no parent")?)?;
+        // Staging and generations share a filesystem. A hard link publishes
+        // one complete missing file without truncating a running executable.
+        match std::fs::hard_link(source, &target) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let meta = std::fs::symlink_metadata(&target)?;
+                if meta.file_type().is_symlink() || !meta.is_file()
+                    || sha256_file(&target)? != expected {
+                    bail!("seed repair raced a different file at {}", target.display());
+                }
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(repaired)
 }
 
 /// `ynpm seed-activate --archive PATH --manifest PATH [--seed-root DIR]
@@ -1476,31 +1532,8 @@ pub fn verb_seed_activate(paths: &Paths, args: &[String]) -> Result<()> {
     let generation_dir = seed_root
         .join("generations")
         .join(format!("{}-{}", manifest.release.version, digest12));
-    // Idempotent: the same version+digest already active is a no-op — but
-    // only while the generation it names is actually complete.
-    if pointer_names_complete_generation(
-        &seed_root,
-        &format!("{}-{}", manifest.release.version, digest12),
-        &generation_dir,
-        &artifact.bins,
-    ) {
-        // The no-op still re-ensures the root marker: a deleted or
-        // replaced marker fails loudly here instead of an activation
-        // reporting success over an unmarked root (which alias creation
-        // would then refuse).
-        write_seed_root_marker(&seed_root)?;
-        report_seed_activation(
-            paths,
-            &seed_root,
-            &generation_dir,
-            &manifest,
-            &package.id,
-            digest12,
-            "already-active",
-            json,
-        )?;
-        return Ok(());
-    }
+    let already_active = read_pointer_generation_name(&seed_root).as_deref()
+        == generation_dir.file_name().and_then(|name| name.to_str());
     let scratch = paths
         .scratch()
         .join(format!("seed-{}-{}", package_storage_key(&package.id), std::process::id()));
@@ -1548,36 +1581,31 @@ pub fn verb_seed_activate(paths: &Paths, args: &[String]) -> Result<()> {
         let _ = std::fs::remove_dir_all(&scratch);
         return Err(error);
     }
+    let mut verified_bins = BTreeMap::new();
+    for bin in &artifact.bins {
+        verified_bins.insert(
+            bin_program_key(bin).to_string(),
+            sha256_file(&staging.join("bin").join(bin_file_name(bin)))?,
+        );
+    }
+    write_seed_root_marker(&seed_root)?;
+    let mut repaired_files = 0;
     if generation_dir.exists() {
-        // Keep a COMPLETE generation (idempotent repoint); an incomplete or
-        // corrupt one - a crashed earlier activation, an emptied directory -
-        // is replaced wholesale, never trusted and flipped onto the pointer.
-        let complete = artifact
-            .bins
-            .iter()
-            .all(|bin| generation_dir.join("bin").join(bin_file_name(bin)).is_file());
-        if complete {
-            let _ = std::fs::remove_dir_all(&staging);
-        } else {
-            std::fs::remove_dir_all(&generation_dir).with_context(|| {
-                format!(
-                    "replacing incomplete seed generation {}",
-                    generation_dir.display()
-                )
-            })?;
-            std::fs::rename(&staging, &generation_dir)
-                .with_context(|| format!("publishing {}", generation_dir.display()))?;
+        let result = reconcile_verified_seed(&staging, &generation_dir);
+        let _ = std::fs::remove_dir_all(&staging);
+        match result {
+            Ok(count) => repaired_files = count,
+            Err(error) => {
+                let _ = std::fs::remove_dir_all(&scratch);
+                return Err(error);
+            }
         }
     } else {
         std::fs::rename(&staging, &generation_dir)
             .with_context(|| format!("publishing {}", generation_dir.display()))?;
     }
     let _ = std::fs::remove_dir_all(&scratch);
-    // The seed-root marker is written BEFORE any pointer moves: a marker
-    // failure (disk, foreign root) must leave the previous pointer fully in
-    // charge, and no alias frontend can be created against this root
-    // before the identity it records exists.
-    write_seed_root_marker(&seed_root)?;
+    // Root identity was checked before generation repair/publication.
     // The unix flip is the last unix write: a staged-symlink rename swaps
     // current atomically, and any earlier failure left the previous
     // generation in charge. The pointer is a RELATIVE link
@@ -1615,13 +1643,8 @@ pub fn verb_seed_activate(paths: &Paths, args: &[String]) -> Result<()> {
     // std::fs::rename replaces an existing FILE on Windows, so the flip
     // needs no delete-then-rename — and a failed rename is still refused
     // explicitly, never papered over.
-    let mut bins = BTreeMap::new();
     for bin in &artifact.bins {
-        bins.insert(
-            bin_program_key(bin).to_string(),
-            sha256_file(&generation_dir.join("bin").join(bin_file_name(bin)))
-                .with_context(|| format!("hashing activated bin {bin}"))?,
-        );
+        set_executable(&generation_dir.join("bin").join(bin_file_name(bin)))?;
     }
     let generation_name = generation_dir
         .file_name()
@@ -1630,7 +1653,7 @@ pub fn verb_seed_activate(paths: &Paths, args: &[String]) -> Result<()> {
     let pointer = serde_json::json!({
         "schema": 1,
         "generation": generation_name,
-        "bins": bins,
+        "bins": verified_bins,
     });
     let pointer_path = seed_root.join("active.json");
     let staging_pointer =
@@ -1655,7 +1678,13 @@ pub fn verb_seed_activate(paths: &Paths, args: &[String]) -> Result<()> {
         &manifest,
         &package.id,
         digest12,
-        "activated",
+        if already_active && repaired_files > 0 {
+            "repaired-active"
+        } else if already_active {
+            "already-active"
+        } else {
+            "activated"
+        },
         json,
     )?;
     Ok(())
@@ -2371,6 +2400,18 @@ mod tests {
             .join("generations")
             .join(format!("4.0.0-{}", &digest[..12]));
         assert!(generation_dir.join("bin/ygg").is_file());
+        // A present-but-changed executable must never be blessed by a
+        // repeated activation, even while its --version still looks right.
+        let pointer_before = fs::read(seed_root.join("active.json")).unwrap();
+        let binary = generation_dir.join("bin/ygg");
+        let original = fs::read(&binary).unwrap();
+        let mut changed = original.clone();
+        changed.extend_from_slice(b"\n# changed fixture bytes\n");
+        fs::write(&binary, &changed).unwrap();
+        assert!(verb_seed_activate(&sandbox.paths(), &args).is_err());
+        assert_eq!(fs::read(seed_root.join("active.json")).unwrap(), pointer_before);
+        assert_eq!(fs::read(&binary).unwrap(), changed);
+        fs::write(&binary, original).unwrap();
         // A complete generation is kept across a re-activation (idempotent
         // repoint), never restaged over.
         fs::write(generation_dir.join(".marker"), "kept").unwrap();

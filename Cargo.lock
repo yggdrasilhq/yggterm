@@ -7403,7 +7403,7 @@ dependencies = [
 [[package]]
 name = "ytrace"
 version = "0.2.3"
-source = "git+https://github.com/yggdrasilhq/ytrace?rev=e6fb2cb#e6fb2cbff91d23c111b4ac2cdb38b822491ea69d"
+source = "git+https://github.com/yggdrasilhq/ytrace?rev=128bc1d#128bc1d1d94f79de9090b400ad189158dbe1aa7a"
 dependencies = [
  "anyhow",
  "chrono",
