@@ -40,13 +40,19 @@ def main():
     # loop-closure trigger: if the outbox gained new proposals, the
     # brain-pair review runs automatically (idempotent per batch). Its
     # failure is review DEBT — reported distinctly, mining stays success.
+    # rc=3 means another dispatch holds the review lock: serialization,
+    # not debt.
+    review_rc = 0
     try:
         import composer_review
         review_rc = composer_review.main()  # prints its own noop/review line
     except Exception as e:  # a broken review module never breaks mining
-        review_rc = None
+        review_rc = 2
         print("  review-step error:", e)
-    if review_rc:
+    if review_rc == 3:
+        print("  review-busy: another dispatch holds the review lock — "
+              "serialization working, not debt")
+    elif review_rc:
         print(f"  review-debt: proposal review did NOT complete "
               f"(exit {review_rc}) — debt retained, mining unaffected")
     return 0

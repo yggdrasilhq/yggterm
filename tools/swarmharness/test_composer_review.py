@@ -10,6 +10,8 @@ reviewer transport is a local fake binary.
 
 Run:  python3 tools/swarmharness/test_composer_review.py
 """
+import fcntl
+import hashlib
 import json
 import os
 import re
@@ -26,6 +28,13 @@ HERE = Path(__file__).resolve().parent
 SRC = HERE / "composer_review.py"
 TICK = HERE / "composer-tick.py"
 PASS, FAIL = [], []
+# the harness itself prints check lines with non-ASCII separators; it must
+# survive the same C-locale hosts it tests for
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
 
 
 def check(name, cond, detail=""):
@@ -58,7 +67,7 @@ if os.environ.get("COMPOSER_FAKE_COUNT"):
     with open(os.environ["COMPOSER_FAKE_COUNT"], "a") as f:
         f.write("1\n")
 
-brief = Path("brief.md").read_text()
+brief = Path("brief.md").read_text(encoding="utf-8")
 ids = re.findall(r"^- ([0-9a-f]{16}) pattern=", brief, re.M)
 footer = re.search(r"^BATCH ([0-9a-f]{16}) reviewed=(\d+)", brief, re.M)
 if not footer or not ids:
@@ -84,6 +93,18 @@ if mode == "valid":
     for l in verdicts(ids):
         print(l)
     print(f"BATCH {batch} reviewed={len(ids)} accepts=0 rebut=0 defers={len(ids)}")
+elif mode == "valid-loose":
+    # structural variants that must NOT fail: lowercase verdict keyword,
+    # uppercase hex ids, plural footer keys, fences + commentary around it
+    print("Reviewing the staged batch. My verdict lines follow.")
+    print("```")
+    for p in ids:
+        print(f"verdict {p.upper()} defer -- single-observation proposal; "
+              f"needs a second independent lineage before triage")
+    print(f"BATCH {batch} reviewed={len(ids)} accepts=0 rebuts=0 "
+          f"defers={len(ids)}")
+    print("All proposals deferred pending a second lineage.")
+    print("```")
 elif mode == "valid-delay":
     time.sleep(float(os.environ.get("COMPOSER_FAKE_SLEEP", "1.2")))
     for l in verdicts(ids):
@@ -151,7 +172,7 @@ class Sandbox:
         binp = self.root / "bin"
         binp.mkdir(exist_ok=True)
         fake = binp / "fake-codex"
-        fake.write_text(FAKE)
+        fake.write_text(FAKE, encoding="utf-8")
         fake.chmod(0o755)
         return str(fake)
 
@@ -167,7 +188,7 @@ class Sandbox:
     def run_review(self, **over):
         e = self.env(**over)
         return subprocess.run([sys.executable, str(SRC)],
-                              capture_output=True, text=True, env=e,
+                              capture_output=True, encoding="utf-8", errors="replace", env=e,
                               cwd=str(self.root), timeout=60)
 
     def outbox_write(self, rows_or_text):
@@ -379,19 +400,19 @@ def main():
                       COMPOSER_FAKE_SLEEP="1.2",
                       COMPOSER_FAKE_COUNT=str(sb.count))
         p1 = subprocess.Popen([sys.executable, str(SRC)], stdout=subprocess.PIPE,
-                              stderr=subprocess.PIPE, text=True, env=env1)
+                              stderr=subprocess.PIPE, encoding="utf-8", errors="replace", env=env1)
         time.sleep(0.15)
         p2 = subprocess.Popen([sys.executable, str(SRC)], stdout=subprocess.PIPE,
-                              stderr=subprocess.PIPE, text=True, env=env1)
+                              stderr=subprocess.PIPE, encoding="utf-8", errors="replace", env=env1)
         o1, _ = p1.communicate(timeout=30)
         o2, _ = p2.communicate(timeout=30)
         n_calls = len(sb.count.read_text().splitlines()) if sb.count.exists() else 0
+        rcs = sorted([p1.returncode, p2.returncode])
         busy = ("busy" in o2) or ("busy" in o1)
         check("R15 concurrent dispatch: exactly ONE transport invocation",
               n_calls == 1, f"calls={n_calls}")
-        check("R15b loser reports typed busy with rc=0",
-              busy and p1.returncode == 0 and p2.returncode == 0
-              and sb.marker() is not None)
+        check("R15b loser reports typed busy with distinct rc=3 (not 0/2)",
+              busy and rcs == [0, 3] and sb.marker() is not None)
     finally:
         sb.cleanup()
 
@@ -487,7 +508,7 @@ def main():
         sb.outbox_write([a])
         e = sb.env(COMPOSER_REVIEW_BIN=fake, COMPOSER_FAKE_MODE="exit1")
         r = subprocess.run([sys.executable, str(TICK)], capture_output=True,
-                           text=True, env=e, timeout=60)
+                           encoding="utf-8", errors="replace", env=e, timeout=60)
         out = r.stdout
         check("R21 mining tick still SUCCEEDS (rc=0) when review fails",
               r.returncode == 0 and '"proposals": 1' in out)
@@ -512,6 +533,127 @@ def main():
         r = sb.run_review()
         check("R22b empty outbox -> typed noop rc=0",
               r.returncode == 0 and "outbox-empty" in r.stdout)
+    finally:
+        sb.cleanup()
+
+    # ---- R23 tick: composer_review.main() EXCEPTION still surfaces debt ----
+    sb = Sandbox()
+    try:
+        kernel = sb.home / ".yggterm/swarm/composer/kernel"
+        kernel.mkdir(parents=True)
+        (kernel / "composer.py").write_text(
+            "def tick(sources, state_dir=None, **kw):\n"
+            "    return {'census_sources': 1, 'gaps': 0, 'pages_read': 0,\n"
+            "            'observations': 1, 'patterns': 1, 'proposals': 1,\n"
+            "            'scanned_lineages': 1, 'enrolled_lineages': 1,\n"
+            "            'backlog_remaining': 0, 'notes': []}\n")
+        # a broken review module that RAISES from main() — kernel dir is
+        # first on tick's sys.path, so it shadows the real module
+        (kernel / "composer_review.py").write_text(
+            "def main():\n"
+            "    raise RuntimeError('broken review module')\n")
+        cfg = sb.home / ".yggterm/config/swarm"
+        cfg.mkdir(parents=True)
+        (cfg / "composer-sources.json").write_text(
+            json.dumps({"sources": {}, "bounds": {}}))
+        sb.outbox_write([a])
+        e = sb.env()
+        r = subprocess.run([sys.executable, str(TICK)], capture_output=True,
+                           encoding="utf-8", errors="replace", env=e, timeout=60)
+        check("R23 tick rc=0 on review-module exception (mining unaffected)",
+              r.returncode == 0 and '"proposals": 1' in r.stdout)
+        check("R23b exception debt VISIBLE as review-debt (never silent)",
+              "review-debt" in r.stdout and "broken review module" in r.stdout,
+              r.stdout[-300:])
+    finally:
+        sb.cleanup()
+
+    # ---- R24 held lock from another process -> distinct busy rc=3 ----
+    sb = Sandbox()
+    try:
+        fake = sb.install_fake()
+        sb.outbox_write([a])
+        holder = open(sb.state / "review.lock", "a+")
+        fcntl.flock(holder, fcntl.LOCK_EX)
+        r = sb.run_review(COMPOSER_REVIEW_BIN=fake, COMPOSER_FAKE_MODE="valid")
+        fcntl.flock(holder, fcntl.LOCK_UN)
+        holder.close()
+        check("R24 lock contention -> rc=3 busy observable, no dispatch",
+              r.returncode == 3 and "busy" in r.stdout
+              and sb.marker() is None and not sb.count.exists(),
+              r.stdout.strip()[:160])
+    finally:
+        sb.cleanup()
+
+    # ---- R25 non-ASCII proposal under a C locale ----
+    sb = Sandbox()
+    try:
+        fake = sb.install_fake()
+        uni = dict(mkproposal("unicode-fault"),
+                   assertion="café probe — naïve assertion (中文)",
+                   disproof="série de contrôles ne sépare pas; incidents")
+        sb.outbox_write([uni])
+        r = sb.run_review(COMPOSER_REVIEW_BIN=fake, COMPOSER_FAKE_MODE="valid",
+                          LC_ALL="C", LANG="C", PYTHONCOERCECLOCALE="0",
+                          PYTHONUTF8="0")
+        m = sb.marker()
+        snap = None
+        if m:
+            snap = (sb.state / "reviews" / f"batch-{m['batch']}"
+                    / "outbox-snapshot.jsonl").read_bytes()
+        check("R25 non-ASCII proposal survives C locale (explicit utf-8)",
+              r.returncode == 0 and m is not None
+              and m.get("status") == "advisory-ok"
+              and snap is not None and "café".encode("utf-8") in snap,
+              r.stdout[-200:] + r.stderr[-200:])
+    finally:
+        sb.cleanup()
+
+    # ---- R26 loose-but-bound verdict structure is ACCEPTED ----
+    sb = Sandbox()
+    try:
+        fake = sb.install_fake()
+        sb.outbox_write([a])
+        r = sb.run_review(COMPOSER_REVIEW_BIN=fake,
+                          COMPOSER_FAKE_MODE="valid-loose")
+        m = sb.marker()
+        check("R26 lowercase/uppercase/plural/fenced verdict accepted",
+              r.returncode == 0 and m is not None
+              and m.get("status") == "advisory-ok"
+              and m.get("counts", {}).get("defers") == 1,
+              r.stdout[-200:] + r.stderr[-200:])
+    finally:
+        sb.cleanup()
+
+    # ---- R27 NaN row in outbox -> typed hold, never a crash ----
+    sb = Sandbox()
+    try:
+        fake = sb.install_fake()
+        sb.outbox_write(json.dumps(a) + "\n"
+                        + '{"kind": "claim_proposal", "weight": NaN}\n')
+        r = sb.run_review(COMPOSER_REVIEW_BIN=fake, COMPOSER_FAKE_MODE="valid")
+        holds = sb.holds()
+        check("R27 NaN/Infinity row -> typed non-canonical hold, no crash",
+              r.returncode == 2 and "hold:outbox-malformed" in r.stdout
+              and "non-canonical-row" in r.stdout
+              and "ValueError" not in r.stderr and sb.marker() is None,
+              r.stdout.strip()[:200] + r.stderr[-120:])
+    finally:
+        sb.cleanup()
+
+    # ---- R28 marker binds the EXACT parsed bytes (single-read basis) ----
+    sb = Sandbox()
+    try:
+        fake = sb.install_fake()
+        sb.outbox_write([a, mkproposal("second-fault")])
+        data = (sb.state / "outbox.jsonl").read_bytes()
+        expect = hashlib.sha256(data).hexdigest()
+        r = sb.run_review(COMPOSER_REVIEW_BIN=fake, COMPOSER_FAKE_MODE="valid")
+        m = sb.marker()
+        check("R28 marker outbox_sha256 == digest of the parsed bytes",
+              r.returncode == 0 and m is not None
+              and m.get("outbox_sha256") == expect
+              and len(m.get("proposal_ids", [])) == 2)
     finally:
         sb.cleanup()
 

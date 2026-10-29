@@ -41,6 +41,7 @@ import re
 import subprocess
 import sys
 import time
+import unicodedata
 from pathlib import Path
 
 REVIEW_PROTOCOL = "composer-review-v2"
@@ -68,20 +69,38 @@ SILENT = os.environ.get("COMPOSER_REVIEW_SILENT") == "1"
 
 SNAPSHOT_NAME = "outbox-snapshot.jsonl"
 MIN_REASON_CHARS = 10
+# Case/plural tolerant on STRUCTURE; every binding property (batch id, id
+# set, counts vs real dispositions, dedupe, reason length) stays strict.
 VERDICT_RE = re.compile(
-    r"^VERDICT\s+([0-9a-f]{16})\s+(accept|rebut|defer)\s+(?:—|--|-)\s+(.+)$")
+    r"^VERDICT\s+([0-9a-f]{16})\s+(accept|rebut|defer)\s+(?:—|--|-)\s+(.+)$",
+    re.IGNORECASE)
 FOOTER_RE = re.compile(
-    r"^BATCH\s+([0-9a-f]{16})\s+reviewed=(\d+)\s+accepts=(\d+)\s+"
-    r"rebut=(\d+)\s+defers=(\d+)\s*$")
+    r"^BATCH\s+([0-9a-f]{16})\s+reviewed=(\d+)\s+accepts?=(\d+)\s+"
+    r"rebuts?=(\d+)\s+defers?=(\d+)\s*$", re.IGNORECASE)
 
 
 def _now():
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
+def _nfc(v):
+    """Unicode-normalize recursively so two encodings of the SAME string
+    (NFC vs NFD) carry one identity, not two."""
+    if isinstance(v, str):
+        return unicodedata.normalize("NFC", v)
+    if isinstance(v, list):
+        return [_nfc(x) for x in v]
+    if isinstance(v, dict):
+        return {_nfc(k): _nfc(x) for k, x in v.items()}
+    return v
+
+
 def _canonical(row):
-    """Deterministic serialization — the bytes identity is bound to."""
-    return json.dumps(row, sort_keys=True, separators=(",", ":"))
+    """Deterministic serialization — the bytes identity is bound to. NFC-
+    normalized, true UTF-8 (no \\u escaping of non-ASCII, RFC 8785 style);
+    NaN/Infinity are refused (ValueError): they have no canonical form."""
+    return json.dumps(_nfc(row), sort_keys=True, separators=(",", ":"),
+                      allow_nan=False, ensure_ascii=False)
 
 
 def proposal_identity(row):
@@ -108,13 +127,15 @@ def build_batch(rows):
     return batch_identity(ids), [{"id": i, "row": by_id[i]} for i in ids]
 
 
-def load_outbox(path=None):
-    """-> (rows, faults). Partial/malformed lines are typed, never raised."""
+def load_outbox_bytes(data):
+    """-> (rows, faults) over ONE raw byte read (the same bytes the basis
+    digest covers, so parse and basis can never disagree). Partial/
+    malformed lines are typed, never raised."""
     faults, rows = [], []
     try:
-        text = Path(path or OUTBOX).read_text()
-    except (OSError, UnicodeDecodeError) as e:
-        return [], [{"line": 0, "fault": "unreadable-outbox",
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as e:
+        return [], [{"line": 0, "fault": "undecodable-outbox",
                      "detail": str(e)[:120]}]
     for ln, line in enumerate(text.splitlines(), 1):
         if not line.strip():
@@ -128,24 +149,40 @@ def load_outbox(path=None):
         if not isinstance(row, dict):
             faults.append({"line": ln, "fault": "not-an-object"})
             continue
+        try:
+            _canonical(row)
+        except ValueError:
+            faults.append({"line": ln, "fault": "non-canonical-row",
+                           "detail": "NaN/Infinity have no canonical JSON "
+                                     "form"})
+            continue
         rows.append(row)
     return rows, faults
 
 
+def load_outbox(path=None):
+    """Wrapper for callers that just want the current file parsed."""
+    try:
+        return load_outbox_bytes(Path(path or OUTBOX).read_bytes())
+    except OSError as e:
+        return [], [{"line": 0, "fault": "unreadable-outbox",
+                     "detail": str(e)[:120]}]
+
+
 def observation_count():
     try:
-        with OBSERVATIONS.open() as f:
+        with OBSERVATIONS.open(encoding="utf-8") as f:
             return sum(1 for _ in f)
-    except OSError:
+    except (OSError, UnicodeError):
         return 0
 
 
 def needs_state():
     try:
-        d = json.loads(NEEDS.read_text())
+        d = json.loads(NEEDS.read_text(encoding="utf-8"))
         return {"available": bool(d.get("available")),
                 "reason": str(d.get("reason", ""))[:120]}
-    except (OSError, json.JSONDecodeError):
+    except (OSError, ValueError):
         return {"available": False, "reason": "needs snapshot absent"}
 
 
@@ -153,11 +190,11 @@ def resource_bound():
     """Native read bound actually reached by the miner (cursor bytes), when
     the state carries it; absence is stated, never invented."""
     try:
-        cur = json.loads(CURSORS.read_text())
+        cur = json.loads(CURSORS.read_text(encoding="utf-8"))
         total = sum(int(c.get("offset", 0)) for c in cur.values()
                     if isinstance(c, dict))
         return {"sources_tracked": len(cur), "bytes_cursor_total": total}
-    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+    except (OSError, ValueError, TypeError):
         return {"sources_tracked": 0, "bytes_cursor_total": 0,
                 "note": "cursor state absent"}
 
@@ -169,17 +206,17 @@ def record_hold(status, detail, batch=None):
         row["batch"] = batch
     try:
         HOLDS.parent.mkdir(parents=True, exist_ok=True)
-        with HOLDS.open("a") as f:
+        with HOLDS.open("a", encoding="utf-8") as f:
             f.write(json.dumps(row) + "\n")
-    except OSError:
+    except (OSError, UnicodeError):
         pass  # the typed stdout record remains the observable
     return row
 
 
 def load_attempts():
     try:
-        return json.loads(ATTEMPTS.read_text())
-    except (OSError, json.JSONDecodeError):
+        return json.loads(ATTEMPTS.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
         return {}
 
 
@@ -192,8 +229,8 @@ def record_failure(reason, batch=None):
     if batch:
         a["last_batch"] = batch
     try:
-        ATTEMPTS.write_text(json.dumps(a, indent=1))
-    except OSError:
+        ATTEMPTS.write_text(json.dumps(a, indent=1), encoding="utf-8")
+    except (OSError, UnicodeError):
         pass
     return a
 
@@ -223,8 +260,8 @@ def cooldown_active():
 
 def read_marker():
     try:
-        return json.loads(MARKER.read_text())
-    except (OSError, json.JSONDecodeError):
+        return json.loads(MARKER.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
         return {}
 
 
@@ -240,12 +277,12 @@ def stage_snapshot(batch_dir, entries):
     for byte — batch records are immutable. Returns the digest or None on
     conflict."""
     payload = "".join(_canonical(e["row"]) + "\n" for e in entries)
-    digest = hashlib.sha256(payload.encode()).hexdigest()
+    digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
     existing = snapshot_digest(batch_dir)
     if existing is not None:
         return digest if existing == digest else None
     batch_dir.mkdir(parents=True, exist_ok=True)
-    (batch_dir / SNAPSHOT_NAME).write_text(payload)
+    (batch_dir / SNAPSHOT_NAME).write_text(payload, encoding="utf-8")
     return digest
 
 
@@ -326,27 +363,34 @@ def resolve_transport():
 def parse_verdict(stdout, expected_ids, expected_batch):
     """Strict typed validation of the reviewer output. Returns
     (verdicts, counts); raises ValueError with the exact rejection reason.
-    Prose is tolerated; verdict structure is not."""
-    lines = [l.strip() for l in (stdout or "").splitlines() if l.strip()]
+    Prose, trailing markdown fences and structural case/plural variants are
+    tolerated; every binding property (batch id, id set, counts, dedupe,
+    reason length) is not."""
+    raw = [l.strip() for l in (stdout or "").splitlines() if l.strip()]
+    # markdown fence lines (``` or ```lang) are wrapping, never content
+    lines = [l for l in raw if not l.startswith("```")]
     if not lines:
         raise ValueError("empty stdout — no verdict")
-    footer = FOOTER_RE.match(lines[-1])
-    if not footer:
-        raise ValueError("final nonempty line is not a valid BATCH footer")
-    if footer.group(1) != expected_batch:
+    footers = [(i, FOOTER_RE.match(l)) for i, l in enumerate(lines)
+               if FOOTER_RE.match(l)]
+    if not footers:
+        raise ValueError("no valid BATCH footer found")
+    if len(footers) > 1:
+        raise ValueError("multiple BATCH footers")
+    fidx, footer = footers[0]
+    if footer.group(1).lower() != expected_batch:
         raise ValueError(f"footer batch {footer.group(1)} != expected "
                          f"{expected_batch}")
-    for l in lines[:-1]:
-        if FOOTER_RE.match(l):
-            raise ValueError("multiple BATCH footers")
     verdicts = {}
-    for l in lines[:-1]:
-        if not l.startswith("VERDICT"):
+    for l in lines[:fidx]:
+        if not l.upper().startswith("VERDICT"):
             continue
         m = VERDICT_RE.match(l)
         if not m:
             raise ValueError(f"malformed VERDICT line: {l[:80]}")
-        pid, disp, reason = m.group(1), m.group(2), m.group(3).strip()
+        pid = m.group(1).lower()
+        disp = m.group(2).lower()
+        reason = m.group(3).strip()
         if pid not in expected_ids:
             raise ValueError(f"verdict for unknown proposal id {pid}")
         if pid in verdicts:
@@ -387,10 +431,10 @@ def post_board(body, host):
                 "from": {"row_uuid": f"composer-review-{host}",
                          "harness": "composer-review", "seat": None},
                 "kind": "note", "body": body[:3500]}
-        with p.open("a") as f:
+        with p.open("a", encoding="utf-8") as f:
             f.write(json.dumps(post) + "\n")
         return "posted"
-    except OSError as e:
+    except (OSError, UnicodeError) as e:
         return f"board-error: {e}"
 
 
@@ -399,20 +443,22 @@ def write_marker(payload):
     evidence instead of being silently destroyed."""
     prev_raw = None
     try:
-        prev_raw = MARKER.read_text()
+        prev_raw = MARKER.read_text(encoding="utf-8")
     except OSError:
         prev_raw = None
+    except UnicodeError:
+        prev_raw = ""  # undecodable bytes == corrupt
     if prev_raw is not None:
         try:
             json.loads(prev_raw)
-        except json.JSONDecodeError:
+        except ValueError:
             try:
                 MARKER.rename(MARKER.with_name(
                     f"dispatch.corrupt-{int(time.time())}.json"))
             except OSError:
                 pass
     tmp = MARKER.with_name("dispatch.json.tmp")
-    with tmp.open("w") as f:
+    with tmp.open("w", encoding="utf-8") as f:
         f.write(json.dumps(payload, indent=1) + "\n")
         f.flush()
         os.fsync(f.fileno())
@@ -439,7 +485,15 @@ def _hold_exit(status, detail, batch=None, rc=2):
 
 
 def _dispatch(host):
-    rows, faults = load_outbox()
+    # ONE raw read binds parse and basis: rows, faults and outbox_bytes_digest
+    # all derive from the same bytes, so a proposal appended between the parse
+    # and the digest can never be silently stamped over (no parse/digest split).
+    try:
+        data = OUTBOX.read_bytes()
+    except OSError as e:
+        return _hold_exit("hold:outbox-unreadable", str(e)[:200])
+    rows, faults = load_outbox_bytes(data)
+    outbox_bytes_digest = hashlib.sha256(data).hexdigest()
     if faults:
         return _hold_exit("hold:outbox-malformed",
                           f"{len(faults)} malformed/partial outbox line(s): "
@@ -464,7 +518,6 @@ def _dispatch(host):
                           f" retry in ~{cd['retry_in_s']}s"
                           f" (last: {cd['last_failure_reason']})", batch)
 
-    outbox_bytes_digest = hashlib.sha256(OUTBOX.read_bytes()).hexdigest()
     batch_dir = REVIEWS / f"batch-{batch}"
     try:
         digest = stage_snapshot(batch_dir, entries)
@@ -477,8 +530,8 @@ def _dispatch(host):
                           "immutable record never overwritten", batch)
     try:
         brief_text = stage_brief(batch_dir, batch, entries)
-        (batch_dir / "brief.md").write_text(brief_text)
-    except OSError as e:
+        (batch_dir / "brief.md").write_text(brief_text, encoding="utf-8")
+    except (OSError, UnicodeError) as e:
         return _hold_exit("hold:storage-failure",
                           f"brief write failed: {e}", batch)
 
@@ -487,14 +540,24 @@ def _dispatch(host):
         record_failure("transport-absent", batch)
         return _hold_exit("review-unavailable:transport-absent",
                           f"no reviewer transport for model {MODEL}", batch)
+    # ASCII pointer prompt — the full brief is staged as ./brief.md in the
+    # transport cwd. The brief text itself is NEVER passed as argv: argv is
+    # locale/ARG_MAX fragile (a C-locale host cannot even encode an
+    # em-dash there) and the file is the authoritative bytes anyway.
+    prompt = ("You are the composer brain-pair reviewer. Read ./brief.md in "
+              "this directory IN FULL (it carries the checkpoint brief, the "
+              "proposal snapshot pointer and the exact output contract), "
+              "then follow it exactly.")
     cmd = [codex, "exec", "--skip-git-repo-check",
            "--dangerously-bypass-approvals-and-sandbox",
-           "-m", MODEL, "-c", f'model_reasoning_effort="{EFFORT}"',
-           brief_text + "\nFull proposal snapshot: ./outbox-snapshot.jsonl"
-           " in this directory. Read it before verdicting."]
+           "-m", MODEL, "-c", f'model_reasoning_effort="{EFFORT}"', prompt]
     try:
+        # Deterministic decode of transport output: model CLIs emit UTF-8;
+        # locale-locked hosts must not crash on it (errors=replace keeps
+        # weird bytes visible without breaking validation).
         r = subprocess.run(cmd, cwd=batch_dir, capture_output=True,
-                           text=True, timeout=TIMEOUT_S)
+                           encoding="utf-8", errors="replace",
+                           timeout=TIMEOUT_S)
         stdout = r.stdout or ""
     except subprocess.TimeoutExpired as e:
         record_failure("timeout", batch)
@@ -513,15 +576,17 @@ def _dispatch(host):
     except ValueError as e:
         record_failure(f"verdict-schema: {e}", batch)
         try:
-            (batch_dir / "verdict-rejected.txt").write_text(stdout)
-        except OSError:
+            (batch_dir / "verdict-rejected.txt").write_text(
+                stdout, encoding="utf-8")
+        except (OSError, UnicodeError):
             pass
         return _hold_exit("review-rejected:verdict-schema", str(e), batch)
 
     if hashlib.sha256(OUTBOX.read_bytes()).hexdigest() != outbox_bytes_digest:
         try:
-            (batch_dir / "verdict-stale.txt").write_text(stdout)
-        except OSError:
+            (batch_dir / "verdict-stale.txt").write_text(
+                stdout, encoding="utf-8")
+        except (OSError, UnicodeError):
             pass
         return _hold_exit("stale-basis",
                           "outbox changed while the review ran — verdict "
@@ -529,7 +594,7 @@ def _dispatch(host):
                           batch)
 
     try:
-        (batch_dir / "verdict.md").write_text(stdout)
+        (batch_dir / "verdict.md").write_text(stdout, encoding="utf-8")
         (batch_dir / "verdict.json").write_text(json.dumps(
             {"protocol": REVIEW_PROTOCOL, "batch": batch,
              "snapshot_sha256": digest,
@@ -537,7 +602,8 @@ def _dispatch(host):
              "proposal_ids": ids,
              "verdicts": {pid: verdicts[pid] for pid in ids},
              "counts": counts, "model": MODEL, "effort": EFFORT,
-             "advisory": True, "at": _now()}, indent=1) + "\n")
+             "advisory": True, "at": _now()}, indent=1) + "\n",
+            encoding="utf-8")
         write_marker({
             "protocol": REVIEW_PROTOCOL, "batch": batch,
             "snapshot_sha256": digest, "outbox_sha256": outbox_bytes_digest,
@@ -547,7 +613,7 @@ def _dispatch(host):
                              "worker-completion acceptance, NOT a "
                              "completion receipt, no repairs executed",
             "dispatched_at": _now(), "review_dir": str(batch_dir)})
-    except OSError as e:
+    except (OSError, UnicodeError) as e:
         return _hold_exit("hold:storage-failure",
                           f"verdict/marker write failed: {e}", batch)
     record_success()
@@ -582,15 +648,18 @@ def main():
         try:
             fcntl.flock(lockf, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
+            # Contention is serialization working, not debt: distinct rc=3
+            # observable so no caller can mistake busy for success OR debt.
             _emit({"review": "busy",
                    "why": "another dispatch holds the review lock"})
-            return 0
+            return 3
         return _dispatch(host)
     finally:
         try:
             fcntl.flock(lockf, fcntl.LOCK_UN)
         except OSError:
             pass
+        lockf.close()
 
 
 if __name__ == "__main__":
