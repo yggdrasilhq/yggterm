@@ -369,10 +369,27 @@ def cooldown_path(harness):
 
 
 def load_cooldowns(harness):
-    try:
-        return read_json(cooldown_path(harness))
-    except (OSError, ValueError):
+    """Missing sidecar = no cooldowns. A PRESENT but corrupt sidecar fails
+    closed (fresh-P4-cooldown): reading corruption as an empty table would
+    silently erase a live exclusion and re-activate a cooling account."""
+    path = cooldown_path(harness)
+    if not os.path.exists(path):
         return {}
+    try:
+        doc = read_json(path)
+    except (OSError, ValueError) as exc:
+        raise AuthError(5, f"cooldown metadata at {path} is unreadable; refusing "
+                           "to treat corruption as 'no cooldown'",
+                        {"reason": "invalid_metadata"}) from exc
+    if not isinstance(doc, dict) or any(
+            not isinstance(slug, str) or not slug
+            or isinstance(until, bool) or not isinstance(until, (int, float))
+            or not math.isfinite(until)
+            for slug, until in doc.items()):
+        raise AuthError(5, f"cooldown metadata at {path} is malformed; refusing "
+                           "to treat corruption as 'no cooldown'",
+                        {"reason": "invalid_metadata"})
+    return doc
 
 
 def save_cooldowns(harness, data):
@@ -406,10 +423,25 @@ def provenance_path(harness):
 
 
 def load_provenance(harness):
-    try:
-        return read_json(provenance_path(harness))
-    except (OSError, ValueError):
+    """Missing sidecar = no lineage. A PRESENT but corrupt sidecar fails
+    closed with a schema-validated read (fresh-P4-lineage): reading corruption
+    as an empty table would turn a held foreign-writer grant refreshable."""
+    path = provenance_path(harness)
+    if not os.path.exists(path):
         return {}
+    try:
+        doc = read_json(path)
+    except (OSError, ValueError) as exc:
+        raise AuthError(5, f"lineage metadata at {path} is unreadable; refusing "
+                           "to treat corruption as 'no writer'",
+                        {"reason": "invalid_metadata"}) from exc
+    if not isinstance(doc, dict) or any(
+            not isinstance(slug, str) or not slug or not isinstance(entry, dict)
+            for slug, entry in doc.items()):
+        raise AuthError(5, f"lineage metadata at {path} is malformed; refusing "
+                           "to treat corruption as 'no writer'",
+                        {"reason": "invalid_metadata"})
+    return doc
 
 
 def save_provenance(harness, prov):
@@ -1211,11 +1243,26 @@ def bound_slug_by_digest(harness, record):
     return None
 
 
+def _quota_evidence(snap):
+    """True only when the snapshot carries at least one supported, well-formed
+    quota reading: a usable window with a numeric used_percent, or an explicit
+    boolean limit verdict. HTTP success alone is NOT quota evidence
+    (fresh-P6): an empty payload stays unmeasured, never zero."""
+    for w in (snap.get("primary"), snap.get("secondary")):
+        if isinstance(w, dict):
+            used = w.get("used_percent")
+            if (type(used) in (int, float) and not isinstance(used, bool)
+                    and math.isfinite(used) and 0 <= used <= 100):
+                return True
+    return any(type(flag) is bool for flag in (snap.get("limit_reached"), snap.get("allowed")))
+
+
 def meter_snapshot(harness, record, measure=False):
     """Identity-safe quota meter for the exec receipt. Measuring is explicit
     (--measure): it is the preflight's ONLY optional network touch and exists
     only for adapters with quota_measurement. Everything else stays unknown —
-    an unknown meter is never reported as free."""
+    an unknown meter is never reported as free, and a response without valid
+    quota evidence is never labeled measured (fresh-P6)."""
     if not measure:
         return {"measured": False, "state": "unknown"}
     if not capabilities(harness)["quota_measurement"]:
@@ -1224,6 +1271,9 @@ def meter_snapshot(harness, record, measure=False):
     if not snap.get("ok"):
         return {"measured": False, "state": "unknown",
                 "error_class": "http" if snap.get("http_status") else "unavailable"}
+    if not _quota_evidence(snap):
+        return {"measured": False, "state": "unknown",
+                "error_class": "no_quota_evidence"}
 
     def win(w):
         if not isinstance(w, dict):
@@ -1287,13 +1337,48 @@ def _exec_gate(harness, allow_refresh):
     # ONE bounded refresh through the canonical adapter. refresh_profile
     # records refresh_invalid on a typed rejection; there is no retry loop.
     fresh = refresh_profile(harness, slug, record)
-    atomic_write_json(HARNESSES[harness]["auth_file"](harness), fresh)
-    atomic_write_json(os.path.join(store_dir(harness), slug + ".json"), fresh)
-    stamp_provenance(harness, slug, record=fresh, source="exec-preflight-refresh",
-                     writer_updated_at=time.time())
-    record = live_record(harness, required=True)
-    gate.update(record_hash=record_hash(record), expired=False, refreshed_once=True,
-                health_state="unknown")
+    pre_refresh_hash = gate["record_hash"]
+    # fresh-P3: the fleet lock cannot serialize a NATIVE writer. Re-read the
+    # live file before persisting: if a native owner rewrote the grant while
+    # we were refreshing, their newer grant is authoritative — never overwrite
+    # it with our older minted response. The minted response is preserved as
+    # lineage (its refresh token may still be live), never activated.
+    current_native = live_record(harness, required=True)
+    raced = record_hash(current_native) != pre_refresh_hash
+    if raced:
+        atomic_write_json(os.path.join(store_dir(harness), f".refresh-lineage-{slug}.json"),
+                          {"schema_version": SCHEMA_VERSION, "reason": "refresh_race_preserved",
+                           "slug": slug, "pre_refresh_hash": pre_refresh_hash,
+                           "minted_response_hash": record_hash(fresh),
+                           "native_record_hash": record_hash(current_native),
+                           "minted": fresh})
+        stamp_provenance(harness, slug, record=current_native,
+                         source="exec-preflight-refresh-race-preserved",
+                         writer_updated_at=time.time())
+        record = current_native
+    else:
+        atomic_write_json(HARNESSES[harness]["auth_file"](harness), fresh)
+        atomic_write_json(os.path.join(store_dir(harness), slug + ".json"), fresh)
+        stamp_provenance(harness, slug, record=fresh, source="exec-preflight-refresh",
+                         writer_updated_at=time.time())
+        record = fresh
+    gate.update(record_hash=record_hash(record), refreshed_once=True,
+                health_state="unknown", refresh_persisted=not raced)
+    # fresh-P5: recompute expiry with the canonical identity rules on the
+    # record that will actually be launched — a hardcoded expired=False would
+    # admit a dead grant. A grant still expired after its one refresh is held.
+    gate["expired"] = bool(identity_of(record, harness).get("expired"))
+    if gate["expired"]:
+        raise AuthError(5, "refreshed grant remains expired by the canonical identity "
+                           "rules; holding the launch",
+                        {"reason": "refresh_still_expired", **gate})
+    if raced:
+        rebound = bound_slug_by_digest(harness, record)
+        if rebound is None:
+            raise AuthError(5, "native grant rewritten during refresh matches no vault "
+                               "profile; capture it before launch",
+                            {"reason": "grant_unproven", **gate})
+        gate["active_binding"] = rebound
     return gate, record, gate["record_hash"], "refresh_once"
 
 
@@ -1313,6 +1398,18 @@ def cmd_exec(args):
     if bool(args.typed_failure) != bool(args.event_id) or \
             (args.typed_failure and not args.observed_active_hash):
         raise AuthError(6, "--typed-failure needs --event-id and --observed-active-hash together")
+    if args.preflight_only and args.typed_failure:
+        # fresh-P1: a typed fallback is a mutating activation — it switches the
+        # binding, cools or fails the old profile, captures, and journals an
+        # event. Preflight-only is a read-only receipt, so the mutating
+        # combination is rejected BEFORE any effect can happen.
+        raise AuthError(6, "--preflight-only is read-only and cannot execute a typed "
+                           "fallback; run the fallback without it",
+                        {"reason": "preflight_read_only"})
+    # fresh-P2: policy and every required metadata file are validated BEFORE
+    # any refresh, activation, metering or state write — an invalid policy
+    # must have zero side effects.
+    policy = rotation_policy(harness)
     fallback_result = None
     if args.typed_failure:
         # ONE policy-authorized fallback for the adapter's typed pre-turn
@@ -1334,7 +1431,6 @@ def cmd_exec(args):
         raise AuthError(5, "native auth changed between verification and launch; refusing to spawn",
                         {"reason": "concurrent_change", "decided_hash": decided_hash,
                          "observed_hash": record_hash(current)})
-    policy = rotation_policy(harness)
     receipt = {
         "schema_version": SCHEMA_VERSION,
         "verb": "exec",
@@ -1348,8 +1444,7 @@ def cmd_exec(args):
                           "health_state": gate["health_state"]},
         "activation": {"performed": action == "refresh_once",
                        "kind": action or "none_required",
-                       "fallback": bool(fallback_result)},
-        "policy": {"mode": policy["mode"], "automatic_fallback": policy["automatic_fallback"],
+                       "fallback": bool(fallback_result)},        "policy": {"mode": policy["mode"], "automatic_fallback": policy["automatic_fallback"],
                    "source_authority": policy["source_authority"]},
         "meter": meter,
         "native_health": "unknown",
@@ -1357,6 +1452,10 @@ def cmd_exec(args):
         "session_action": "child_native_auth_proof_required",
         "native_exec": {"spawned": not args.preflight_only, "argv_len": len(native_argv)},
     }
+    if action == "refresh_once":
+        # Truthful receipt (fresh-P1/fresh-P3): report whether the minted
+        # grant was actually persisted, or preserved-as-lineage after a race.
+        receipt["activation"]["minted_grant_persisted"] = bool(gate.get("refresh_persisted"))
     if fallback_result:
         receipt["fallback_event_id"] = args.event_id
         receipt["fallback_switched_to"] = fallback_result.get("switched_to")
@@ -1712,7 +1811,7 @@ def usage_snapshot(record):
     # the windows). Paid plans only; free accounts have no reset credits.
     gift = ((payload.get("rate_limit_reset_credits") or {}).get("available_count")) or 0
     banked = gift > 0 and (payload.get("plan_type") or "") not in ("", "free")
-    return {"ok": True,
+    quota = {"ok": True,
             "email": payload.get("email"),
             "plan_type": payload.get("plan_type"),
             "limit_reached": rl.get("limit_reached") if type(rl.get("limit_reached")) is bool else None,
@@ -1723,6 +1822,8 @@ def usage_snapshot(record):
             "banked_weekly_left": (round(max(0, 100 - sw["used_percent"]))
                                    if sw and type(sw.get("used_percent")) in (int, float) else None),
             "reset_credits": payload.get("rate_limit_reset_credits")}
+    quota["evidence"] = "quota" if _quota_evidence(quota) else "none"
+    return quota
 
 
 def load_assignments():
@@ -1870,13 +1971,24 @@ def refresh_grant(record):
         raise AuthError(5, "refresh response missing access_token")
     new = json.loads(json.dumps(record))  # deep copy, verbatim shape preserved
     container = new["tokens"] if "tokens" in new else new
-    container["access_token"] = got["access_token"]
+    container["access_token"] = got.get("access_token")
     if got.get("refresh_token"):  # rotation: the old one is dead the moment this returns
         container["refresh_token"] = got["refresh_token"]
     if got.get("id_token"):
         container["id_token"] = got["id_token"]
     if "last_refresh" in new:
         new["last_refresh"] = now_rfc3339_nanos()
+    # fresh-P5: the minted grant defines the new expiry — reconcile the
+    # persisted top-level expires_at from the response. Retaining the dead
+    # token's expiry made the refreshed record read as expired forever.
+    if "expires_at" in new:
+        got_in = got.get("expires_in")
+        if type(got_in) in (int, float) and got_in > 0 and math.isfinite(got_in):
+            new["expires_at"] = time.time() + got_in
+        else:
+            claims = decode_jwt_claims(container.get("access_token") or "")
+            if claims.get("exp"):
+                new["expires_at"] = claims["exp"]
     return new
 
 

@@ -6,6 +6,7 @@ concurrent-change refusal before activation, argv/exit passthrough and secret
 hygiene. All auth paths are isolated fixtures; `--preflight-only` is a pure
 read, and spawn is asserted through the _exec_spawn seam or real child exits.
 """
+import base64
 import importlib.util
 import json
 import os
@@ -142,7 +143,8 @@ class AuthExecTests(unittest.TestCase):
         m.cmd_exec(self.args())
         receipt = self.spawn_receipts[-1]
         self.assertEqual(len(calls), 1)
-        self.assertEqual(receipt['activation'], {'performed': True, 'kind': 'refresh_once', 'fallback': False})
+        self.assertEqual(receipt['activation'], {'performed': True, 'kind': 'refresh_once',
+                                                 'fallback': False, 'minted_grant_persisted': True})
         live = m.live_record('codex')
         self.assertEqual(live['tokens']['access_token'], 'fixture-refreshed-access')
         self.assertEqual(live['tokens']['refresh_token'], 'fixture-rotated-refresh')
@@ -298,6 +300,207 @@ class AuthExecTests(unittest.TestCase):
         blob = json.dumps(out)
         self.assertNotIn('someone@example.test', blob)
         self.assertNotIn(SECRET, blob)
+
+    def test_preflight_only_rejects_typed_fallback_before_any_effect(self):
+        # fresh-P1: preflight-only is a read-only receipt — the mutating
+        # typed-fallback combination is refused before any binding switch,
+        # cooldown, capture, provenance stamp or event journal write.
+        m = self.m
+        old = self.profile('a', live=True)
+        self.profile('b')
+        self.policy()
+        with self.assertRaises(m.AuthError) as ctx:
+            m.cmd_exec(self.args(preflight_only=True, typed_failure='rate_limited',
+                                 event_id='e-preflight',
+                                 observed_active_hash=m.record_hash(old)))
+        self.assertEqual(ctx.exception.details['reason'], 'preflight_read_only')
+        self.assertEqual(m.record_hash(m.live_record('codex')), m.record_hash(old))
+        self.assertIsNone(m.cooling_until('codex', 'a'))
+        self.assertFalse(os.path.exists(str(Path(m.store_dir('codex')) / '.fallback-events.json')))
+        self.assertFalse(os.path.exists(m.provenance_path('codex')))
+        self.assertFalse(self.spawns)
+
+    def test_invalid_policy_blocks_before_refresh_or_writes(self):
+        # fresh-P2: an invalid policy has ZERO side effects — no refresh, no
+        # live/vault mutation, no metering — because validation is hoisted to
+        # the top of the exec path.
+        m = self.m
+        old = self.profile('a', expired=True, live=True)
+        self.policy(version=2)
+
+        def forbidden_refresh(record):
+            raise AssertionError('refresh must never run before policy validation')
+
+        m.refresh_grant = forbidden_refresh
+        with self.assertRaises(m.AuthError) as ctx:
+            m.cmd_exec(self.args())
+        self.assertEqual(ctx.exception.details['reason'], 'invalid_policy')
+        self.assertEqual(m.record_hash(m.live_record('codex')), m.record_hash(old))
+        self.assertFalse(self.spawns)
+
+    def test_refresh_race_preserves_native_grant_and_captures_lineage(self):
+        # fresh-P3: a native writer is not serialized by the fleet lock. When
+        # the live grant changes under us during the refresh, the minted
+        # response must never overwrite it; it is preserved as lineage and the
+        # launch is refused (an unproven native grant cannot launch).
+        m = self.m
+        old = self.profile('a', expired=True, live=True)
+        concurrent = json.loads(json.dumps(old))
+        concurrent['tokens']['refresh_token'] = 'fixture-native-rotation'
+        concurrent['expires_at'] = time.time() + 20000
+        fresh = json.loads(json.dumps(old))
+        fresh['tokens']['access_token'] = 'fixture-older-minted'
+        fresh['expires_at'] = time.time() + 10000
+
+        def racing_refresh(record):
+            m.atomic_write_json(m.HARNESSES['codex']['auth_file']('codex'), concurrent)
+            return fresh
+
+        m.refresh_grant = racing_refresh
+        with self.assertRaises(m.AuthError) as ctx:
+            m.cmd_exec(self.args())
+        self.assertEqual(ctx.exception.details['reason'], 'grant_unproven')
+        self.assertEqual(m.live_record('codex'), concurrent)
+        lineage = m.read_json(str(Path(m.store_dir('codex')) / '.refresh-lineage-a.json'))
+        self.assertEqual(lineage['reason'], 'refresh_race_preserved')
+        self.assertEqual(lineage['minted'], fresh)
+        self.assertEqual(lineage['native_record_hash'], m.record_hash(concurrent))
+        self.assertFalse(self.spawns)
+
+    def test_refresh_race_bound_native_grant_wins_and_receipt_is_truthful(self):
+        # fresh-P3 companion: when the raced native grant IS vault-bound (a
+        # native writer mirrors its own grant into the vault too), the launch
+        # proceeds on THEIR grant (expiry recomputed), and the receipt
+        # truthfully reports the minted grant was not persisted.
+        m = self.m
+        old = self.profile('a', expired=True, live=True)
+        concurrent = json.loads(json.dumps(old))
+        concurrent['tokens']['refresh_token'] = 'fixture-native-rotation'
+        concurrent['expires_at'] = time.time() + 20000
+        fresh = json.loads(json.dumps(old))
+        fresh['tokens']['access_token'] = 'fixture-older-minted'
+        fresh['expires_at'] = time.time() + 10000
+
+        def racing_refresh(record):
+            m.atomic_write_json(m.HARNESSES['codex']['auth_file']('codex'), concurrent)
+            m.atomic_write_json(str(Path(m.store_dir('codex')) / 'a.json'), concurrent)
+            return fresh
+
+        m.refresh_grant = racing_refresh
+        m.cmd_exec(self.args())
+        receipt = self.spawn_receipts[-1]
+        self.assertEqual(m.live_record('codex'), concurrent)
+        self.assertEqual(receipt['active_binding'], 'a')
+        self.assertEqual(receipt['grant_binding']['record_hash'], m.record_hash(concurrent))
+        self.assertFalse(receipt['activation']['minted_grant_persisted'])
+        self.assertEqual(self.spawns, [['fixture-native']])
+
+    def test_refreshed_expiry_recomputed_from_real_response(self):
+        # fresh-P5: the canonical refresher reconciles the persisted expiry
+        # from the minted response; the gate revalidates with identity_of, so
+        # the receipt never asserts a stale expired=False.
+        m = self.m
+        self.profile('a', expired=True, live=True)
+        spec = importlib.util.spec_from_file_location('real_refresh_fixture', SCRIPT)
+        real = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(real)
+
+        def token(claims):
+            b = base64.urlsafe_b64encode(json.dumps(claims).encode()).rstrip(b'=').decode()
+            return 'fixture.' + b + '.sig'
+
+        payload = {'access_token': token({'exp': int(time.time()) + 10000}),
+                   'refresh_token': 'fixture-new-refresh', 'expires_in': 10000}
+
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self):
+                return json.dumps(payload).encode()
+
+        with patch.object(real.urllib.request, 'urlopen', return_value=Response()):
+            m.refresh_grant = real.refresh_grant
+            m.cmd_exec(self.args())
+        live = m.live_record('codex')
+        receipt = self.spawn_receipts[-1]
+        self.assertFalse(m.identity_of(live)['expired'])
+        self.assertAlmostEqual(live['expires_at'], time.time() + 10000, delta=30)
+        self.assertEqual(live['tokens']['refresh_token'], 'fixture-new-refresh')
+        self.assertFalse(receipt['grant_binding']['expired'])
+        self.assertEqual(self.spawns, [['fixture-native']])
+
+    def test_still_expired_after_refresh_holds_launch(self):
+        # fresh-P5 fail path: a minted grant that is STILL expired under the
+        # canonical identity rules is held — no ready receipt, no spawn.
+        m = self.m
+        old = self.profile('a', expired=True, live=True)
+        calls = []
+
+        def stale_refresh(record):
+            calls.append(record)
+            return json.loads(json.dumps(old))
+
+        m.refresh_grant = stale_refresh
+        with self.assertRaises(m.AuthError) as ctx:
+            m.cmd_exec(self.args())
+        self.assertEqual(ctx.exception.details['reason'], 'refresh_still_expired')
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(m.live_record('codex'), old)
+        self.assertFalse(self.spawns)
+
+    def test_corrupt_provenance_holds_refresh_before_grant(self):
+        # fresh-P4-lineage: corrupt EXISTING lineage fails closed before the
+        # refresh path — it never degrades to 'no writer' and refreshes a
+        # held foreign grant. Missing lineage is a different state (next test).
+        m = self.m
+        old = self.profile('a', expired=True, live=True)
+        m.stamp_provenance('codex', 'a', writer='other-host')
+        Path(m.provenance_path('codex')).write_text('{')
+
+        def forbidden_refresh(record):
+            raise AssertionError('refresh must never run on corrupt lineage')
+
+        m.refresh_grant = forbidden_refresh
+        with self.assertRaises(m.AuthError) as ctx:
+            m.cmd_exec(self.args())
+        self.assertEqual(ctx.exception.details['reason'], 'invalid_metadata')
+        self.assertEqual(m.live_record('codex'), old)
+        self.assertFalse(self.spawns)
+
+    def test_missing_provenance_does_not_block_own_writer_refresh(self):
+        # fresh-P4 companion: ABSENT lineage is absence, not corruption — an
+        # unclaimed profile still refreshes on the owning host.
+        m = self.m
+        old = self.profile('a', expired=True, live=True)
+        self.assertEqual(m.get_writer('codex', 'a'), None)
+
+        def own_refresh(record):
+            fresh = json.loads(json.dumps(old))
+            fresh['expires_at'] = time.time() + 10000
+            return fresh
+
+        m.refresh_grant = own_refresh
+        m.cmd_exec(self.args())
+        self.assertEqual(self.spawns, [['fixture-native']])
+
+    def test_meter_requires_quota_evidence(self):
+        # fresh-P6: HTTP success with an evidence-free payload stays unmeasured
+        # — never labeled measured with all-null windows. An explicit boolean
+        # limit verdict IS evidence even without windows.
+        m = self.m
+        self.profile('a', live=True)
+        m.usage_snapshot = lambda rec: {'ok': True}
+        out = m.cmd_exec(self.args(preflight_only=True, measure=True))
+        self.assertEqual(out['meter'], {'measured': False, 'state': 'unknown',
+                                        'error_class': 'no_quota_evidence'})
+        m.usage_snapshot = lambda rec: {'ok': True, 'limit_reached': False}
+        out = m.cmd_exec(self.args(preflight_only=True, measure=True))
+        self.assertTrue(out['meter']['measured'])
+        self.assertIsNone(out['meter']['primary'])
 
     def test_cli_preflight_receipt_exit_codes_and_secret_hygiene(self):
         self.cli_live(self.profile('a'))

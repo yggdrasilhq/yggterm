@@ -238,6 +238,33 @@ class AuthPolicyTests(unittest.TestCase):
             out = m.switch('claude', 'b', lock_held=True)
         self.assertEqual(m.read_json(out['captured_before_leaving']['path']), opaque)
 
+    def test_corrupt_cooldown_blocks_rotation_fail_closed(self):
+        # fresh-P4-cooldown: a PRESENT but corrupt cooldown sidecar fails
+        # closed — it must never degrade to 'no cooldown' and re-activate a
+        # cooling account. Status refuses to lie about it, too.
+        m = self.m
+        self.profile('a', live=True)
+        self.profile('b')
+        m.mark_cooldown('codex', 'b', 30)
+        Path(m.cooldown_path('codex')).write_text('{')
+        with self.assertRaises(m.AuthError) as ctx:
+            m.cmd_rotate(self.args())
+        self.assertEqual(ctx.exception.details['reason'], 'invalid_metadata')
+        self.assertEqual(m.live_record('codex')['tokens']['account_id'], 'a')
+        with self.assertRaises(m.AuthError) as ctx:
+            m.cmd_status(types.SimpleNamespace(harness='codex'))
+        self.assertEqual(ctx.exception.details['reason'], 'invalid_metadata')
+
+    def test_missing_cooldown_is_not_corrupt(self):
+        # fresh-P4 companion: ABSENT metadata is absence, not corruption — a
+        # clean store still rotates normally (off the current profile).
+        m = self.m
+        self.profile('a', live=True)
+        self.profile('b')
+        self.assertFalse(os.path.exists(m.cooldown_path('codex')))
+        self.assertEqual(m.load_cooldowns('codex'), {})
+        self.assertEqual(m.cmd_rotate(self.args())['switched_to'], 'b')
+
     def test_cli_harness_positions_inventory_and_machine_error(self):
         import subprocess
         import sys

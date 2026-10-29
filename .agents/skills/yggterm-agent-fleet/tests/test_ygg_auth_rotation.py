@@ -397,6 +397,31 @@ def s_fleet_doctor_offline():
     assert findings.get("a_x.io") == "writer-litellm", findings
 
 
+@screen("corrupt sidecar metadata fails closed at the CLI (cooldown, lineage)")
+def s_corrupt_metadata_fail_closed():
+    S.reset()
+    S.write_live(make_record("a@x.io", "acct-a"))
+    assert S.run("capture").returncode == 0
+    S.write_live(make_record("b@x.io", "acct-b"))
+    assert S.run("capture").returncode == 0
+    with open(os.path.join(S.store, "codex", ".cooldown.json"), "w") as f:
+        f.write("{")
+    r = S.run("rotate", "--fast", "--json")
+    assert r.returncode == 5, f"rotate with corrupt cooldown exit {r.returncode}, want 5"
+    assert json.loads(r.stdout)["error"]["reason"] == "invalid_metadata", \
+        f"rotation did not name the metadata refusal: {r.stdout}"
+    assert S.read_live()["tokens"]["account_id"] == "acct-b", \
+        "rotation mutated the live file despite corrupt metadata"
+    # lineage: corrupt provenance refuses a refresh BEFORE any grant call —
+    # corruption never reads as 'no writer'.
+    with open(os.path.join(S.store, "codex", ".provenance.json"), "w") as f:
+        f.write("{")
+    r = S.run("refresh", "--json")
+    assert r.returncode == 5, f"refresh with corrupt provenance exit {r.returncode}, want 5"
+    assert json.loads(r.stdout)["error"]["reason"] == "invalid_metadata", \
+        f"refresh did not name the metadata refusal: {r.stdout}"
+
+
 @screen("usage errors: unknown slug exit 6; capture without live file exit 3")
 def s_usage_errors():
     r = S.run("switch", "nosuch@x.io")
@@ -431,6 +456,7 @@ def main():
     s_provenance()
     s_unit_rank_and_convert()
     s_fleet_doctor_offline()
+    s_corrupt_metadata_fail_closed()
     s_usage_errors()
 
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
