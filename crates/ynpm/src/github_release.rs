@@ -226,6 +226,171 @@ fn unzip_listing(archive: &Path) -> Result<Vec<ArchiveEntry>> {
     Ok(entries)
 }
 
+// ===== native Windows zip access =====
+// Windows has no Info-ZIP `unzip`; Windows PowerShell (5.1, inbox on every
+// supported Windows) carries .NET's System.IO.Compression. Both helpers are
+// compiled on every platform and selected at RUNTIME (cfg!) so the Windows
+// code stays type-checked by the unix CI build; only execution is
+// windows-only. The listing feeds the SAME Rust structural guards the tar
+// path uses; the extractor re-validates every entry name at extract time so
+// a guard pass and a swap of the archive file between list and extract can
+// never agree on a traversal name.
+
+/// The listing script: one JSON object per zip entry on stdout. UTF-8
+/// console encoding is forced because entry names are untrusted input and
+/// a codepage-mangled name must fail the guards, not pass mangled.
+const POWERSHELL_ZIP_LISTING_PS1: &str = r#"param([Parameter(Mandatory=$true)][string]$Archive)
+$ErrorActionPreference = "Stop"
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+Add-Type -AssemblyName System.IO.Compression.FileSystem | Out-Null
+$zip = [System.IO.Compression.ZipFile]::OpenRead($Archive)
+try {
+  foreach ($entry in $zip.Entries) {
+    @{ name = $entry.FullName; size = $entry.Length; dir = $entry.FullName.EndsWith("/") } | ConvertTo-Json -Compress
+  }
+} finally { $zip.Dispose() }
+"#;
+
+/// The extraction script: per-entry name validation (the same classes the
+/// Rust guard enforces), directory creation, streamed entry extraction.
+const POWERSHELL_ZIP_EXTRACT_PS1: &str = r#"param(
+  [Parameter(Mandatory=$true)][string]$Archive,
+  [Parameter(Mandatory=$true)][string]$Dest
+)
+$ErrorActionPreference = "Stop"
+Add-Type -AssemblyName System.IO.Compression.FileSystem | Out-Null
+
+function Assert-EntryName([string]$Name) {
+  if ([string]::IsNullOrWhiteSpace($Name)) { throw "zip entry has an empty name" }
+  $trimmed = $Name.TrimEnd('/')
+  if ($trimmed -eq "") { throw "zip entry has an empty name" }
+  if ($trimmed.StartsWith("/") -or $trimmed.StartsWith("\\")) { throw "zip entry '$Name' is an absolute path" }
+  if ($trimmed.Contains('\')) { throw "zip entry '$Name' contains a backslash" }
+  if ($trimmed -match '^[A-Za-z]:') { throw "zip entry '$Name' names a Windows drive path" }
+  if ($trimmed.IndexOfAny([System.IO.Path]::GetInvalidPathChars()) -ge 0) { throw "zip entry '$Name' contains control characters" }
+  foreach ($part in $trimmed.Split('/')) {
+    if ($part -eq "..") { throw "zip entry '$Name' contains a '..' traversal component" }
+  }
+}
+
+$zip = [System.IO.Compression.ZipFile]::OpenRead($Archive)
+try {
+  foreach ($entry in $zip.Entries) {
+    Assert-EntryName $entry.FullName
+    if ($entry.FullName.EndsWith('/')) { continue }
+    $target = Join-Path $Dest ($entry.FullName -replace '/', '\')
+    $dir = Split-Path -Parent $target
+    if ($dir) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+    $stream = $entry.Open()
+    try {
+      $file = [System.IO.File]::Open($target, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write)
+      try { $stream.CopyTo($file) } finally { $file.Dispose() }
+    } finally { $stream.Dispose() }
+  }
+} finally { $zip.Dispose() }
+"#;
+
+fn write_powershell_script(dir: &Path, name: &str, body: &str) -> Result<PathBuf> {
+    let path = dir.join(name);
+    std::fs::write(&path, body)
+        .with_context(|| format!("writing {}", path.display()))?;
+    Ok(path)
+}
+
+fn powershell_zip_listing(archive: &Path, work_dir: &Path) -> Result<Vec<ArchiveEntry>> {
+    let script = write_powershell_script(
+        work_dir,
+        "zip-listing.ps1",
+        POWERSHELL_ZIP_LISTING_PS1,
+    )?;
+    let output = Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File"])
+        .arg(&script)
+        .arg("-Archive")
+        .arg(archive)
+        .output()
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "native Windows zip listing needs Windows PowerShell (powershell): {error}"
+            )
+        })?;
+    let _ = std::fs::remove_file(&script);
+    if !output.status.success() {
+        bail!(
+            "powershell zip listing of {} failed: {}",
+            archive.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut entries = Vec::new();
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let doc: serde_json::Value = serde_json::from_str(line.trim()).with_context(|| {
+            format!(
+                "powershell zip listing line is not one JSON object: {:?}",
+                trace_safe_text(line)
+            )
+        })?;
+        let name = doc
+            .get("name")
+            .and_then(|value| value.as_str())
+            .context("powershell zip listing entry carries no name")?
+            .to_string();
+        let dir = doc
+            .get("dir")
+            .and_then(|value| value.as_bool())
+            .unwrap_or_else(|| name.ends_with('/'));
+        let size = doc.get("size").and_then(|value| value.as_u64());
+        entries.push(ArchiveEntry {
+            name,
+            size,
+            kind: if dir {
+                ArchiveEntryKind::Dir
+            } else {
+                ArchiveEntryKind::File
+            },
+        });
+    }
+    Ok(entries)
+}
+
+/// Extract with the guards closed at extract time: the script re-validates
+/// every entry name (traversal, absolute, backslash, drive, control chars)
+/// against the REAL archive, so swapping the archive between the listing
+/// guard and extraction cannot smuggle a traversal name through.
+fn powershell_zip_extract(archive: &Path, into: &Path, work_dir: &Path) -> Result<()> {
+    let script = write_powershell_script(
+        work_dir,
+        "zip-extract.ps1",
+        POWERSHELL_ZIP_EXTRACT_PS1,
+    )?;
+    let output = Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File"])
+        .arg(&script)
+        .arg("-Archive")
+        .arg(archive)
+        .arg("-Dest")
+        .arg(into)
+        .output()
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "native Windows zip extraction needs Windows PowerShell (powershell): {error}"
+            )
+        })?;
+    let _ = std::fs::remove_file(&script);
+    if !output.status.success() {
+        bail!(
+            "powershell zip extraction of {} failed: {}",
+            archive.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
 fn extract_with_guards(
     archive: &Path,
     format: ReleaseArtifactFormat,
@@ -247,24 +412,43 @@ fn extract_with_guards(
             extract_tarball(archive, into)?;
         }
         ReleaseArtifactFormat::Zip => {
-            let entries = unzip_listing(archive)?;
+            // Windows has no `unzip`; the native PowerShell (.NET) pair
+            // feeds the SAME guard and extracts per-entry re-validated.
+            let work_dir = into
+                .parent()
+                .with_context(|| {
+                    format!(
+                        "extraction target {} has no parent directory",
+                        into.display()
+                    )
+                })?
+                .to_path_buf();
+            let entries = if cfg!(windows) {
+                powershell_zip_listing(archive, &work_dir)?
+            } else {
+                unzip_listing(archive)?
+            };
             guard_archive_entries(&entries)?;
-            let output = Command::new("unzip")
-                .args(["-q"])
-                .arg(archive)
-                .arg("-d")
-                .arg(into)
-                .stdout(Stdio::null())
-                .output()
-                .map_err(|error| {
-                    anyhow::anyhow!("zip artifacts need `unzip` ({error}) to extract")
-                })?;
-            if !output.status.success() {
-                bail!(
-                    "unzip {} failed: {}",
-                    archive.display(),
-                    String::from_utf8_lossy(&output.stderr).trim()
-                );
+            if cfg!(windows) {
+                powershell_zip_extract(archive, into, &work_dir)?;
+            } else {
+                let output = Command::new("unzip")
+                    .args(["-q"])
+                    .arg(archive)
+                    .arg("-d")
+                    .arg(into)
+                    .stdout(Stdio::null())
+                    .output()
+                    .map_err(|error| {
+                        anyhow::anyhow!("zip artifacts need `unzip` ({error}) to extract")
+                    })?;
+                if !output.status.success() {
+                    bail!(
+                        "unzip {} failed: {}",
+                        archive.display(),
+                        String::from_utf8_lossy(&output.stderr).trim()
+                    );
+                }
             }
             // unzip -l cannot name symlinks; the post-extraction sweep is
             // the guard for zip-carried links.
@@ -715,7 +899,7 @@ fn verify_release_content(
 ) -> Result<()> {
     let version = &manifest.release.version;
     for bin in &artifact.bins {
-        let bin_path = root.join(bin);
+        let bin_path = root.join(bin_file_name(bin));
         if !bin_path.is_file() {
             bail!(
                 "package {} artifact declares bin {bin:?}, absent from the archive",
@@ -808,13 +992,16 @@ fn publish_release_generation(
         .map(PathBuf::from)
         .unwrap_or_else(|| paths.dest());
     if artifact.bundle.is_some() && !cfg!(unix) {
-        // publish_link copies on Windows; a bundle directory cannot be
-        // published that way. Windows desktop packaging stays DECLARED
-        // (the schema validates it) and honestly unshipped here.
+        // publish_link copies on Windows, and a bundle directory is not a
+        // file it can stage. Windows desktop releases ship as FLAT-EXE bins
+        // (bins declared, no bundle) — the same generation path this
+        // function already runs; a bundle-carrying artifact stays declared
+        // in the schema and honestly unshipped here rather than published
+        // by a copy that could corrupt directory ownership.
         bail!(
-            "desktop bundle publication needs symlink support; windows desktop \
-             packaging is declared in the release schema but not shipped by \
-             this transaction"
+            "desktop bundle publication needs symlink support; a windows \
+             desktop release must ship flat-exe bins (declared bins, no \
+             bundle), which this transaction publishes natively"
         );
     }
     let generation = paths.generation_dir(key, version);
@@ -827,11 +1014,12 @@ fn publish_release_generation(
     let stage_result = (|| -> Result<()> {
         copy_dir_all(root, &staging)?;
         for bin in &artifact.bins {
-            let source = staging.join(bin);
+            let bin_file = bin_file_name(bin);
+            let source = staging.join(&bin_file);
             if !source.is_file() {
-                bail!("staged generation lost bin {bin:?}");
+                bail!("staged generation lost bin {bin_file:?}");
             }
-            let target = staging.join("bin").join(bin);
+            let target = staging.join("bin").join(&bin_file);
             std::fs::create_dir_all(staging.join("bin"))?;
             std::fs::rename(&source, &target)
                 .with_context(|| format!("moving bin {bin} into the generation bin table"))?;
@@ -847,7 +1035,7 @@ fn publish_release_generation(
     // incomplete one is replaced wholesale.
     if generation.exists() {
         let complete = artifact.bins.iter().all(|bin| {
-            generation.join("bin").join(bin).is_file()
+            generation.join("bin").join(bin_file_name(bin)).is_file()
         }) && artifact
             .bundle
             .as_ref()
@@ -885,7 +1073,7 @@ fn publish_release_generation(
     let bins_map: BTreeMap<String, String> = artifact
         .bins
         .iter()
-        .map(|bin| (bin.clone(), format!("bin/{bin}")))
+        .map(|bin| (bin_program_key(bin).to_string(), format!("bin/{}", bin_file_name(bin))))
         .collect();
     let entry = state
         .packages
@@ -922,7 +1110,10 @@ fn publish_release_generation(
     entry.integration = integration.clone();
     std::fs::create_dir_all(&destination)?;
     for bin in artifact.bins.iter() {
-        publish_link(&generation.join("bin").join(bin), &destination.join(bin))?;
+        publish_link(
+            &generation.join("bin").join(bin_file_name(bin)),
+            &destination.join(bin_file_name(bin)),
+        )?;
     }
     if let Some(bundle) = &artifact.bundle {
         publish_link(&generation.join(bundle), &destination.join(bundle))?;
@@ -1057,15 +1248,102 @@ pub fn install_github_release(
 
 // ===== seed activation (single transaction owner) =====
 
+/// The file name a declared bin carries in an archive and in a generation's
+/// `bin/` table. Bins are declared as BARE program names on every platform
+/// (the launcher contract keys the active.json pointer by bare name and
+/// appends `.exe` itself); `.exe` is a file-name detail of the Windows
+/// archives, never part of the program identity.
+fn bin_file_name(bin: &str) -> String {
+    bin_file_name_for(cfg!(windows), bin)
+}
+
+fn bin_file_name_for(windows: bool, bin: &str) -> String {
+    if windows && !bin.to_ascii_lowercase().ends_with(".exe") {
+        format!("{bin}.exe")
+    } else {
+        bin.to_string()
+    }
+}
+
+/// The active.json bins-table key: the bare program stem, normalized from
+/// either declared spelling so the pointer contract stays launcher-exact
+/// (`bins.get("ygg")`, never `bins.get("ygg.exe")`).
+fn bin_program_key(bin: &str) -> &str {
+    match bin.strip_suffix(".exe") {
+        Some(stem) if !stem.is_empty() => stem,
+        _ => bin,
+    }
+}
+
+/// The seed-root marker: a byte-stable identity file a stable alias
+/// frontend records (by sha256) at install time and re-verifies before
+/// every forwarding, so an alias whose seed root was moved, replaced or
+/// re-rooted refuses instead of launching a foreign tree.
+const SEED_ROOT_MARKER_BODY: &str = "{\"kind\":\"yggterm-seed-root\",\"schema\":1}\n";
+
+fn write_seed_root_marker(seed_root: &Path) -> Result<()> {
+    let marker = seed_root.join("seed-root.json");
+    match std::fs::read(&marker) {
+        Ok(existing) => {
+            if existing != SEED_ROOT_MARKER_BODY.as_bytes() {
+                bail!(
+                    "{} exists with foreign content; refusing to overwrite a \
+                     seed root marker this ynpm does not own",
+                    marker.display()
+                );
+            }
+        }
+        Err(_) => {
+            std::fs::write(&marker, SEED_ROOT_MARKER_BODY)
+                .with_context(|| format!("writing {}", marker.display()))?;
+        }
+    }
+    Ok(())
+}
+
+/// Read the generation name the platform pointer selects. Unix prefers the
+/// `current` symlink (kept for compatibility); Windows has no symlink and
+/// reads active.json — the launcher's own contract.
+fn read_pointer_generation_name(seed_root: &Path) -> Option<String> {
+    if cfg!(windows) {
+        let text = std::fs::read_to_string(seed_root.join("active.json")).ok()?;
+        let doc: serde_json::Value = serde_json::from_str(&text).ok()?;
+        doc.get("generation")
+            .and_then(|value| value.as_str())
+            .map(str::to_string)
+    } else {
+        let link = std::fs::read_link(seed_root.join("current")).ok()?;
+        link.file_name().and_then(|name| name.to_str()).map(str::to_string)
+    }
+}
+
+/// The already-active no-op gate: the platform pointer names this exact
+/// generation AND every declared bin is present in it. A pointer over an
+/// emptied generation is a crashed activation and is replaced wholesale by
+/// the staging path, never honored.
+fn pointer_names_complete_generation(
+    seed_root: &Path,
+    generation_name: &str,
+    generation_dir: &Path,
+    bins: &[String],
+) -> bool {
+    if read_pointer_generation_name(seed_root).as_deref() != Some(generation_name) {
+        return false;
+    }
+    bins.iter()
+        .all(|bin| generation_dir.join("bin").join(bin_file_name(bin)).is_file())
+}
+
 /// `ynpm seed-activate --archive PATH --manifest PATH [--seed-root DIR]
 /// [--expect-version V] [--package ID] [--json]`
 ///
 /// The seed-activation transaction an installer calls ONCE: verify the
 /// local seed archive against the manifest, gate its bins, publish
-/// `<seed-root>/generations/<version>-<digest12>/`, then atomically flip
-/// `<seed-root>/current`. Alias/PATH wiring stays with the installer; this
-/// verb owns the generation policy so shell/PowerShell installers never
-/// reimplement it.
+/// `<seed-root>/generations/<version>-<digest12>/`, then flip the launch
+/// pointer — the `current` symlink on unix, the active.json document on
+/// Windows (the launcher's contract on every platform). Alias/PATH wiring
+/// stays with the installer; this verb owns the generation policy so
+/// shell/PowerShell installers never reimplement it.
 pub fn verb_seed_activate(paths: &Paths, args: &[String]) -> Result<()> {
     let mut archive: Option<PathBuf> = None;
     let mut manifest: Option<PathBuf> = None;
@@ -1118,18 +1396,12 @@ pub fn verb_seed_activate(paths: &Paths, args: &[String]) -> Result<()> {
     }
     let archive = archive.context("seed-activate wants --archive PATH")?;
     let manifest_path = manifest.context("seed-activate wants --manifest PATH")?;
-    if cfg!(windows) {
-        // The unix flip is a staged-symlink rename over `current`. On
-        // Windows publish_link copies instead of linking, and the source
-        // here is a whole generation directory - a copy the pointer needs
-        // but cannot become. Until a native junction-based current flip is
-        // qualified, refuse BEFORE any byte moves.
-        bail!(
-            "seed activation is declared in the release schema but the windows \
-             generation pointer (a junction-based `current` flip) is not yet \
-             qualified; refusing before any bytes move"
-        );
-    }
+    // The platform pointer contract: unix keeps the `current` symlink flip
+    // AND active.json; Windows publishes active.json alone (the launcher's
+    // contract on every platform) — no junction, no `current`, no symlink
+    // capability required. Both paths stage the generation fully before any
+    // pointer moves, and a refusal anywhere below leaves the previous
+    // pointer and every previous generation in charge.
     if !archive.is_file() {
         bail!("seed archive {} is not a file", archive.display());
     }
@@ -1192,29 +1464,24 @@ pub fn verb_seed_activate(paths: &Paths, args: &[String]) -> Result<()> {
         .join("generations")
         .join(format!("{}-{}", manifest.release.version, digest12));
     // Idempotent: the same version+digest already active is a no-op — but
-    // only while the generation it names is actually complete. A pointer
-    // over an emptied directory is a crashed activation and is replaced
-    // wholesale by the staging path below, never honored.
-    if let Ok(link) = std::fs::read_link(seed_root.join("current")) {
-        if link.file_name().and_then(|name| name.to_str())
-            == Some(&format!("{}-{}", manifest.release.version, digest12))
-            && artifact
-                .bins
-                .iter()
-                .all(|bin| generation_dir.join("bin").join(bin).is_file())
-        {
-            report_seed_activation(
-                paths,
-                &seed_root,
-                &generation_dir,
-                &manifest,
-                &package.id,
-                digest12,
-                "already-active",
-                json,
-            )?;
-            return Ok(());
-        }
+    // only while the generation it names is actually complete.
+    if pointer_names_complete_generation(
+        &seed_root,
+        &format!("{}-{}", manifest.release.version, digest12),
+        &generation_dir,
+        &artifact.bins,
+    ) {
+        report_seed_activation(
+            paths,
+            &seed_root,
+            &generation_dir,
+            &manifest,
+            &package.id,
+            digest12,
+            "already-active",
+            json,
+        )?;
+        return Ok(());
     }
     let scratch = paths
         .scratch()
@@ -1246,11 +1513,12 @@ pub fn verb_seed_activate(paths: &Paths, args: &[String]) -> Result<()> {
         std::fs::create_dir_all(seed_root.join("generations"))?;
         copy_dir_all(&root, &staging)?;
         for bin in &artifact.bins {
-            let source = staging.join(bin);
+            let bin_file = bin_file_name(bin);
+            let source = staging.join(&bin_file);
             if !source.is_file() {
-                bail!("staged seed lost bin {bin:?}");
+                bail!("staged seed lost bin {bin_file:?}");
             }
-            let target = staging.join("bin").join(bin);
+            let target = staging.join("bin").join(&bin_file);
             std::fs::create_dir_all(staging.join("bin"))?;
             std::fs::rename(&source, &target)?;
             set_executable(&target)?;
@@ -1265,11 +1533,11 @@ pub fn verb_seed_activate(paths: &Paths, args: &[String]) -> Result<()> {
     if generation_dir.exists() {
         // Keep a COMPLETE generation (idempotent repoint); an incomplete or
         // corrupt one - a crashed earlier activation, an emptied directory -
-        // is replaced wholesale, never trusted and flipped onto `current`.
+        // is replaced wholesale, never trusted and flipped onto the pointer.
         let complete = artifact
             .bins
             .iter()
-            .all(|bin| generation_dir.join("bin").join(bin).is_file());
+            .all(|bin| generation_dir.join("bin").join(bin_file_name(bin)).is_file());
         if complete {
             let _ = std::fs::remove_dir_all(&staging);
         } else {
@@ -1287,16 +1555,25 @@ pub fn verb_seed_activate(paths: &Paths, args: &[String]) -> Result<()> {
             .with_context(|| format!("publishing {}", generation_dir.display()))?;
     }
     let _ = std::fs::remove_dir_all(&scratch);
-    // The flip is the last write: a staged-symlink rename swaps current
-    // atomically, and any earlier failure left the previous generation in
-    // charge. The pointer is a RELATIVE link (`generations/<name>`): a seed
-    // root that moves between mounts stays valid, and every reader joins it
-    // under the seed root.
+    // The seed-root marker is written BEFORE any pointer moves: a marker
+    // failure (disk, foreign root) must leave the previous pointer fully in
+    // charge, and no alias frontend can be created against this root
+    // before the identity it records exists.
+    write_seed_root_marker(&seed_root)?;
+    // The unix flip is the last unix write: a staged-symlink rename swaps
+    // current atomically, and any earlier failure left the previous
+    // generation in charge. The pointer is a RELATIVE link
+    // (`generations/<name>`): a seed root that moves between mounts stays
+    // valid, and every reader joins it under the seed root. Windows keeps
+    // NO symlink and NO junction: its pointer is active.json alone, written
+    // below, so a running Windows launcher is never a lock on this
+    // transaction and the previous active.json stays in charge until the
+    // new pointer is published whole.
     let relative_generation = std::path::Path::new("generations")
         .join(format!("{}-{}", manifest.release.version, digest12));
-    let current_link = seed_root.join("current");
     #[cfg(unix)]
     {
+        let current_link = seed_root.join("current");
         let staged = seed_root.join(format!(".current.ynpm-publish-{}", std::process::id()));
         let _ = std::fs::remove_file(&staged);
         std::os::unix::fs::symlink(&relative_generation, &staged)
@@ -1306,25 +1583,25 @@ pub fn verb_seed_activate(paths: &Paths, args: &[String]) -> Result<()> {
     }
     #[cfg(not(unix))]
     {
-        // Windows activation refuses earlier (no qualified junction flip);
-        // this arm keeps the non-unix pointer contract explicit.
-        bail!(
-            "seed activation on this platform has no qualified generation \
-             pointer flip; refusing before any bytes move"
-        );
+        // Windows publishes no symlink; the active.json pointer below is
+        // the whole activation. `relative_generation` documents the same
+        // shape the unix link and the pointer's `generation` field carry.
+        let _ = &relative_generation;
     }
     // Native ynpm is the ONLY writer of the versioned launch pointer
     // (`<seed-root>/active.json`, schema 1): the front launchers read this
     // pointer plus the exact bin digests, so it is published whole. The
-    // temp+rename keeps every reader on one complete pointer; a
-    // rename-over-existing refusal on Windows stays an explicit error -
-    // its atomic replace semantics are a native-CI proof obligation, not
-    // an assumption to paper over with a delete-then-rename.
+    // bins table keys are BARE program names (the launcher resolves the
+    // `.exe` file name itself); values are the digests of the real files.
+    // The temp+rename keeps every reader on one complete pointer;
+    // std::fs::rename replaces an existing FILE on Windows, so the flip
+    // needs no delete-then-rename — and a failed rename is still refused
+    // explicitly, never papered over.
     let mut bins = BTreeMap::new();
     for bin in &artifact.bins {
         bins.insert(
-            bin.clone(),
-            sha256_file(&generation_dir.join("bin").join(bin))
+            bin_program_key(bin).to_string(),
+            sha256_file(&generation_dir.join("bin").join(bin_file_name(bin)))
                 .with_context(|| format!("hashing activated bin {bin}"))?,
         );
     }
@@ -1388,27 +1665,36 @@ fn report_seed_activation(
         }),
     );
     if json {
-        println!(
-            "{}",
-            serde_json::json!({
-                "outcome": outcome,
-                "version": manifest.release.version,
-                "tag": manifest.release.tag,
-                "digest12": digest12,
-                "current": seed_root.join("current").display().to_string(),
-                "generation": generation_dir.display().to_string(),
-            })
-        );
+        let mut report = serde_json::json!({
+            "outcome": outcome,
+            "version": manifest.release.version,
+            "tag": manifest.release.tag,
+            "digest12": digest12,
+            "generation": generation_dir.display().to_string(),
+        });
+        if cfg!(windows) {
+            report["pointer"] = serde_json::json!(seed_root.join("active.json").display().to_string());
+        } else {
+            report["current"] = serde_json::json!(seed_root.join("current").display().to_string());
+        }
+        println!("{report}");
     } else {
         println!(
             "ynpm: seed {} ({outcome}) at {}",
             manifest.release.version,
             generation_dir.display()
         );
-        println!(
-            "  current -> {}",
-            seed_root.join("current").display()
-        );
+        if cfg!(windows) {
+            println!(
+                "  pointer: {}",
+                seed_root.join("active.json").display()
+            );
+        } else {
+            println!(
+                "  current -> {}",
+                seed_root.join("current").display()
+            );
+        }
     }
     Ok(())
 }
@@ -2190,6 +2476,84 @@ mod tests {
         assert!(verb_seed_activate(&sandbox.paths(), &bad).is_err());
         let current3 = std::fs::read_link(seed_root.join("current")).unwrap();
         assert_eq!(current, current3);
+    }
+
+    #[test]
+    fn the_seed_root_marker_is_frozen_idempotent_and_foreign_refused() {
+        let sandbox = Sandbox::new("marker");
+        let seed_root = sandbox.home.join("seed");
+        fs::create_dir_all(&seed_root).unwrap();
+        write_seed_root_marker(&seed_root).unwrap();
+        let marker = seed_root.join("seed-root.json");
+        assert_eq!(
+            fs::read(&marker).unwrap(),
+            SEED_ROOT_MARKER_BODY.as_bytes()
+        );
+        // The body is FROZEN: every installed alias records this digest at
+        // install time and refuses a moved or replaced root by it. Any body
+        // change is a breaking pointer-contract change and must fail here,
+        // not silently strand aliases.
+        assert_eq!(
+            sha256_file(&marker).unwrap(),
+            "ad24eff23135fe91f968e5a538e93b70e340586b6e7d2998bf823a3daf2757d7"
+        );
+        write_seed_root_marker(&seed_root).unwrap();
+        assert_eq!(
+            fs::read(&marker).unwrap(),
+            SEED_ROOT_MARKER_BODY.as_bytes()
+        );
+        fs::write(&marker, "{\"kind\":\"something-else\",\"schema\":1}\n").unwrap();
+        assert!(write_seed_root_marker(&seed_root).is_err());
+    }
+
+    #[test]
+    fn bin_names_map_onto_the_bare_program_launcher_contract() {
+        // Bins are declared as bare program names on every platform; the
+        // `.exe` suffix is a file-name detail of Windows archives, never
+        // part of the program identity the launcher keys.
+        assert_eq!(bin_file_name_for(true, "ygg"), "ygg.exe");
+        assert_eq!(bin_file_name_for(false, "ygg"), "ygg");
+        assert_eq!(bin_file_name_for(true, "ygg.exe"), "ygg.exe");
+        assert_eq!(bin_program_key("ygg"), "ygg");
+        assert_eq!(bin_program_key("ygg.exe"), "ygg");
+        assert_eq!(bin_program_key(".exe"), ".exe");
+    }
+
+    #[test]
+    fn seed_activate_normalizes_suffixed_bins_onto_the_bare_pointer_contract() {
+        // Even a manifest that declares Windows-spelled bins activates
+        // under the launcher's bare-key contract: the pointer table is
+        // keyed `ygg`, never `ygg.exe`, whatever the declared spelling.
+        let sandbox = Sandbox::new("seed-suffix");
+        let (archive, digest) = fixture_archive(&sandbox, "seed", "4.0.0", &["ygg"], None);
+        let mut doc = manifest_doc(
+            "4.0.0", "v4.0.0", "ygg-seed", "seed", "seed.tar.gz", &digest,
+            serde_json::json!({}),
+        );
+        doc["packages"][0]["artifacts"][0]["bins"] = serde_json::json!(["ygg.exe"]);
+        let manifest_path = sandbox.home.join("manifest.json");
+        fs::write(&manifest_path, serde_json::to_string(&doc).unwrap()).unwrap();
+        let seed_root = sandbox.home.join("seed");
+        let args = vec![
+            "--archive".to_string(),
+            archive.display().to_string(),
+            "--manifest".to_string(),
+            manifest_path.display().to_string(),
+            "--seed-root".to_string(),
+            seed_root.display().to_string(),
+        ];
+        verb_seed_activate(&sandbox.paths(), &args).unwrap();
+        let pointer: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(seed_root.join("active.json")).unwrap())
+                .unwrap();
+        let keys: Vec<&str> = pointer["bins"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(keys, vec!["ygg"]);
+        assert!(seed_root.join("seed-root.json").is_file());
     }
 
     #[test]
