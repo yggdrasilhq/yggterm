@@ -39418,7 +39418,64 @@ pub(crate) fn configured_extra_args_for_kind(kind: SessionKind) -> String {
 /// read or the key is absent. The managed-auth gate reads its mode and script
 /// through here so the composition path carries one settings answer, and a
 /// store failure reads as "not configured" rather than enforcement.
+/// THE TEST SEAM for settings-string readers: staged key/value overrides
+/// consulted by [`settings_string_field`] before the store read (the DECLARED
+/// gate made the env route undeclarable), so a fixture can stage gate
+/// settings without mutating the process. cfg(test) only — production
+/// callers see the single store read path.
+#[cfg(test)]
+pub(crate) fn with_settings_string_overrides<R>(
+    overrides: &[(String, String)],
+    body: impl FnOnce() -> R,
+) -> R {
+    test_settings_string_overrides::OVERRIDES.with(|cell| {
+        let previous = cell.borrow_mut().replace(overrides.to_vec());
+        let _restore = test_settings_string_overrides::Restore(previous);
+        body()
+    })
+}
+
+/// The lookup behind [`with_settings_string_overrides`]: the value staged for
+/// `key` on the CALLING thread, or `None` to fall through to the real store
+/// read. Thread-local on purpose: the composer runs synchronously on the
+/// staging thread, so sibling tests reading real settings in parallel never
+/// see another test's staged values.
+#[cfg(test)]
+fn settings_string_override_lookup(key: &str) -> Option<String> {
+    test_settings_string_overrides::OVERRIDES.with(|cell| {
+        cell.borrow()
+            .as_ref()?
+            .iter()
+            .find(|(staged_key, _)| staged_key == key)
+            .map(|(_, value)| value.clone())
+    })
+}
+
+#[cfg(test)]
+mod test_settings_string_overrides {
+    use std::cell::RefCell;
+
+    thread_local! {
+        pub(crate) static OVERRIDES: RefCell<Option<Vec<(String, String)>>> =
+            const { RefCell::new(None) };
+    }
+
+    /// Panic-safe restore: a fixture body that panics still unwinds the
+    /// staged set back to the previous value on the same thread.
+    pub(crate) struct Restore(Option<Vec<(String, String)>>);
+
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            OVERRIDES.with(|cell| *cell.borrow_mut() = self.0.take());
+        }
+    }
+}
+
 pub(crate) fn settings_string_field(key: &str) -> Option<String> {
+    #[cfg(test)]
+    if let Some(staged) = settings_string_override_lookup(key) {
+        return Some(staged);
+    }
     let settings = SessionStore::open_or_init()
         .and_then(|store| store.load_settings())
         .ok()?;
@@ -40886,30 +40943,37 @@ mod tests {
         );
     }
 
-    /// Run `body` with `YGGTERM_HOME` pointed at a throwaway store configured
-    /// for managed-auth Enforce with a script path that does not exist — the
-    /// state an Enforce host is in before its operator provisions ygg-auth.py.
+    /// Run `body` with the managed-auth gate reading Enforce settings whose
+    /// script path does not exist — the state an Enforce host is in before
+    /// its operator provisions ygg-auth.py. THE TEST SEAM: keyed settings
+    /// overrides ([`with_settings_string_overrides`]) instead of a process
+    /// `YGGTERM_HOME` mutation — that mutation is undeclared in the
+    /// process-global inventory gate, and the declared-env direction of
+    /// travel threads homes through birth fields, not through the process.
+    /// The staged set is thread-local (sibling tests are unaffected) and
+    /// panic-safe (restored on unwind).
     fn with_enforce_missing_script<R>(
         body: impl FnOnce() -> R,
     ) -> R {
-        let home = std::env::temp_dir().join(format!(
-            "ygg-mauth-enforce-{}-{}",
+        let absent = std::env::temp_dir().join(format!(
+            "ygg-mauth-enforce-absent-{}-{}",
             std::process::id(),
             std::time::UNIX_EPOCH.elapsed().unwrap().as_nanos()
         ));
-        std::fs::create_dir_all(&home).unwrap();
-        let previous = std::env::var_os("YGGTERM_HOME");
-        unsafe { std::env::set_var("YGGTERM_HOME", &home) };
-        let store = SessionStore::open_or_init().unwrap();
-        let mut settings = store.load_settings().unwrap();
-        settings.managed_auth_mode = "enforce".to_owned();
-        settings.managed_auth_script = home.join("absent-ygg-auth.py").display().to_string();
-        assert!(!std::path::Path::new(&settings.managed_auth_script).exists());
-        store.save_settings(&settings).unwrap();
-        let result = body();
-        unsafe { restore_env_var("YGGTERM_HOME", previous) };
-        std::fs::remove_dir_all(&home).ok();
-        result
+        assert!(!absent.exists(), "the staged script path must not exist");
+        with_settings_string_overrides(
+            &[
+                (
+                    managed_auth::MANAGED_AUTH_MODE_SETTINGS_KEY.to_owned(),
+                    "enforce".to_owned(),
+                ),
+                (
+                    managed_auth::MANAGED_AUTH_SCRIPT_SETTINGS_KEY.to_owned(),
+                    absent.display().to_string(),
+                ),
+            ],
+            body,
+        )
     }
 
     /// Y4-MAUTH-002 (editor round r2): a helper that prints its receipt and

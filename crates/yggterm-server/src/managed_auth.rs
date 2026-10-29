@@ -17,7 +17,10 @@
 //!   layout-resolution fallback, and every call site degrades an `Err` to
 //!   `legacy_agent_launch_command`. An `Err` refusal would therefore
 //!   downgrade to exactly the unauthenticated launch enforce exists to
-//!   prevent; a composed refusal line launches nothing and shows why.
+//!   prevent; a composed refusal line launches nothing and shows why. The
+//!   same law covers composition errors that fire BEFORE the gate: each of
+//!   the three fallback sites runs [`guard_legacy_downgrade`], which refuses
+//!   visibly under Enforce and keeps the legacy command for off/observe.
 //!
 //! ⛔ **No policy activation lives here.** The mode is read from the settings
 //! store (`managed_auth_mode`), whose default is `off`; nothing in this module
@@ -249,8 +252,12 @@ pub fn run_preflight(script: &Path, harness: &str) -> PreflightProbe {
         // exit: a descendant that inherits the pipe (the helper spawned a
         // child of its own) holds the write end open, and an unbounded
         // `read_to_end` would block the daemon launch path past the deadline.
-        // The reader thread is abandoned, never killed — dropping its pipe end
-        // closes our descriptor and the reaper owns the descendant.
+        // On timeout the caller drops only the RECEIVER: the reader thread and
+        // its pipe end stay detached — the thread owns and reads the pipe
+        // until the helper/descendant closes stdout (EOF or read failure),
+        // and the child is abandoned, never killed. A repeated-timeout host
+        // therefore retains one thread plus one descriptor per wedged
+        // preflight until that EOF; the no-kill stipulation is the trade.
         let (sender, receiver) = mpsc::channel();
         std::thread::spawn(move || {
             let mut pipe = pipe;

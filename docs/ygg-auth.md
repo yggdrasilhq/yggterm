@@ -221,14 +221,20 @@ ygg-auth.py path; empty ⇒ the dispersed `~/.yggterm/bin/ygg/ygg-auth.py`).
 
 ⛔ The refusal is a composed shell line, not a composer error, on purpose:
 the composer's error channel is the layout-resolution fallback, and every
-call site degrades an error to the legacy unauthenticated command. An error
-refusal would therefore downgrade to exactly the launch enforce exists to
-prevent. A CLI with no auth plane (pi, opencode, qwen, kimi, muse,
-antigravity, grok, devin, mimo) is never gated in any mode. A configured
-script path that does not exist is a refusal under enforce and
-`unavailable` under observe — never a guessed fallback script. The daemon
-never activates a policy, refreshes a grant, or mutates a live account:
-this wiring is a launch gate over the seam's own verbs, nothing more.
+call site degrades an error to the legacy unauthenticated command — so a
+refusal returns `Ok` and carries its specific reason (the mode and the
+receipt outcome) in the line itself. Composition errors that fire BEFORE the
+gate (an invalid launch option, an unresolvable layout) are covered by
+`guard_legacy_downgrade` at each of the three fallback sites: under enforce
+it refuses visibly instead of downgrading, so the legacy command is
+unreachable under enforce; under off and observe the fallback stays the
+legacy command (byte-identical composition / launch untouched). A CLI with
+no auth plane (pi, opencode, qwen, kimi, muse, antigravity, grok, devin,
+mimo) is never gated in any mode. A configured script path that does not
+exist is a refusal under enforce and `unavailable` under observe — never a
+guessed fallback script. The daemon never activates a policy, refreshes a
+grant, or mutates a live account: this wiring is a launch gate over the
+seam's own verbs, nothing more.
 
 ## Offline verification
 
