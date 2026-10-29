@@ -1,12 +1,31 @@
 # AGENTS.md
 
+## Operating layer and repository completion
+
+Yggterm is the distributed swarm operating layer. The `ygg` CLI is its
+shared human and agent entry point; the desktop GUI is an optional
+porcelain over the same services. Existing terminal handoff contracts below
+remain requirements of that GUI component. Architectural intent does not
+certify that every operating-layer feature has shipped: qualification must
+name the installed subject and the observed behavior.
+
+Repository ownership determines publication. For operator-owned repositories,
+complete the normal review and integration checks, merge into the default
+branch and push it. For repositories owned by others, submit a pull request.
+An explicit repository or owner instruction overrides this default. A pushed
+lane is an intermediate state, never completion. Follow
+[repository completion](docs/repository-completion.md), including the remote
+audit and removal of completed, unused local and remote lanes.
+
 ## Design system
 
 **UX guidelines route through [DESIGN.md](DESIGN.md)** — the pointer page; decisions live in `design/`. The layout contract is ydesign 1.0.0 (`yggdrasilhq/ydesign`, docs/design-layout.md).
 
 ## Mission & Core Value Proposition
 
-Build **Yggdrasil Terminal**: a Rust-first, cross-platform, remote-first terminal workspace with a Dioxus desktop shell shaped like Zed, a daemon-owned PTY core, and an embedded xterm.js terminal surface.
+Build the **Yggterm operating layer** and its optional **Yggdrasil Terminal**
+GUI: shared swarm services and CLI operations, with a cross-platform desktop
+client, daemon-owned PTYs and an embedded xterm.js terminal surface.
 
 ### The product yggterm replaces
 The user's pre-yggterm workflow: VSCode terminal panes → tmux inside them (for persistence) → ssh to N different machines → `codex resume` / `claude -r` on each. When VSCode dies, manually reattach to tmux, re-find sessions, re-orient across machines. **yggterm exists to make this workflow disappear.**
