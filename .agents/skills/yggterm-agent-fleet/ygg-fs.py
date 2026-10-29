@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """One location contract; root aliases preserve legacy data and lock inodes.
 
 This tranche never moves existing data or deletes/quarantines objects. Owner

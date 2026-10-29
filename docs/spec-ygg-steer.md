@@ -16,10 +16,12 @@ plans and readback. A separate revision namespace holds private material;
 public seed upgrades cannot overwrite it or silently acquire new authority.
 
 The first generator implements a common private suffix in
-`steer/overlays/policy.json` and known local target plans. Per-harness private
-compilation graphs, legacy import, shared publication authority, fleet push
-and repository deletion are later migration operations, not implicit effects
-of this first local seed. No existing private repository is overwritten.
+`steer/overlays/policy.json` and known local target plans. The separately qualified
+[private-source compiler](spec-ygg-steer-private-source.md) can render sealed
+per-harness literal/guarded source graphs as read-only proposals. Legacy
+import, shared publication authority, fleet push and repository deletion
+remain later migration operations, not implicit effects of the local seed
+or read-only compiler. No existing private repository is overwritten.
 
 Fresh onboarding can initialize the organization and plan/stamp known local
 harness roots using only the installed seed. It never clones the legacy

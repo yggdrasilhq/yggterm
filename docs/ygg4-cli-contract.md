@@ -229,3 +229,16 @@ examples, completion, payload inspection and remote operator routing remain
 native. SSH remote operations use one quoted POSIX command so spaces and
 shell metacharacters remain literal operands. This requires a POSIX shell
 on the remote node; it does not claim support for every SSH server shell.
+
+## Human output and scripts
+
+CI and auth commands print readable text by default. `ygg ci status`, `list`,
+`config`, `cache`, `events`, `why`, and `tick` show state, ages, and useful
+next commands. Future source timestamps remain visible as clock skew.
+`ygg auth status --harness all` groups the registered adapters; metadata
+commands use labeled text. Existing unknown, held, failed, and unavailable
+states retain their meaning and exit status.
+
+Use `--json` when a script needs structured results, for example
+`ygg ci status --json` or `ygg auth status --harness all --json`. Diagnostics
+belong on stderr; readable text never prefixes a JSON payload.
