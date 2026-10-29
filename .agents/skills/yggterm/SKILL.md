@@ -44,6 +44,7 @@ blocked gate; they cannot declare recall fresh by bypassing it.
 |---|---|
 | Discover a skill or assumed context | `ygg ynpm skills list`, then `ygg ynpm skills info <name>`; load only the selected skill |
 | New host / seed / node readiness | `ygg init`, `ygg doctor`; [onboarding](../yggterm-onboarding/SKILL.md) |
+| Root steering / private policy | `ygg steer init`, `plan`, `check`, `stamp`; [steering contract](../../../docs/spec-ygg-steer.md) |
 | Memory/provenance/conflicts | `ygg memory ...`; [memory contract](../../../docs/spec-unified-fleet-memory.md) |
 | Package/generation ownership | `ygg ynpm ...`; [package contract](../../../docs/ynpm.md) |
 | Auth vault and account rotation | `ygg auth status --harness all --json`, `ygg auth rotate --harness codex --fast --json`; inspect eligibility and policy before inferring native recovery |

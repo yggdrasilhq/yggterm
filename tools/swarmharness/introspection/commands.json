@@ -2058,6 +2058,37 @@
       ],
       "strict": false,
       "component": "fs"
+    },
+    {
+      "path": [
+        "steer"
+      ],
+      "summary": "Initialize portable steering, inspect local drift, and apply an exact reviewed plan.",
+      "effect": "legacy",
+      "handler": "legacy",
+      "options": [],
+      "examples": [
+        {
+          "title": "Initialize the local seed and preserve private policy",
+          "command": "ygg steer init",
+          "tags": "steer onboarding"
+        },
+        {
+          "title": "Plan and save the exact local harness change",
+          "command": "ygg steer plan codex --save",
+          "tags": "steer plan"
+        },
+        {
+          "title": "Check local harness drift",
+          "command": "ygg steer check codex",
+          "tags": "steer drift"
+        }
+      ],
+      "legacy": [
+        "ygg-steer.py"
+      ],
+      "strict": false,
+      "component": "steer"
     }
   ],
   "contract": "ygg4-cli",
@@ -2301,6 +2332,21 @@
         "root identity and compatibility aliases",
         "versioned filesystem location contract",
         "non-destructive garbage collection plans"
+      ]
+    },
+    "steer": {
+      "runner": "ygg-steer.py",
+      "aliases": [
+        "ygg-steer.py"
+      ],
+      "resolution": [
+        "env_dir:YGG_BIN_DIR",
+        "payload:ygg-steer.py"
+      ],
+      "interpreter": "python3",
+      "owns": [
+        "portable generic steering seeds",
+        "private deployment policy and exact local target plans"
       ]
     }
   }

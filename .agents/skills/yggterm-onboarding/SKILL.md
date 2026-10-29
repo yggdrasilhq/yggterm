@@ -86,19 +86,28 @@ then execs the real binary) — no prefix to remember. The root-steer law says
 the same thing: **launch agents under the yggterm observability plane**; if
 you must launch bare, say so in the seat's handoff so supervision knows.
 
-## Your own yggsteer (root-steer system)
+## Portable root steering
 
-Onboarding gives every user the owner's steer pattern, sanitized:
+The public seed ships with the Ygg components. The local organization lives
+under the selected Ygg root at `steer/`; private policy is deployment data,
+never a required private source repository:
 
 ```sh
-ygg-steer-init ~/git/yggsteer   # scaffold: core/<harness>.md SSOT + sections/ + stamp tool
-./steer stamp <harness>          # render the SSOT into each harness root file
-./steer check                    # drift instrument — run after any SSOT edit
-./steer push <harness> --yes     # ship to your hosts
+ygg fs init
+ygg steer init
+ygg steer plan codex --save
+ygg steer check codex
+ygg steer stamp codex --plan <saved-plan-path>
 ```
 
-Your steer carries YOUR laws (campaign routers, memory discipline, consult
-doctrine) — generated from templates, never hand-editing stamped files.
+Initialization preserves private policy and writes no harness target. A plan
+binds the current target, seed and policy; stamping refuses stale plans and
+preserves memory-owned guards. The initial implementation is local/POSIX;
+Windows mutation and fleet activation need their own qualification. The
+[steering specification](../../../docs/spec-ygg-steer.md) records migration
+and deletion of any legacy steering repository. That retirement is not
+implied by seed initialization. Shared app profiles and configuration follow
+the [sync contract](../../../docs/spec-ygg-sync.md), not a recursive file mirror.
 
 ## Skills registry
 

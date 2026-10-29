@@ -57,6 +57,16 @@ else
   bad "ygg-memory runner missing — bootstrap.sh installs it"
 fi
 
+# Portable private steering is seeded only in explicit fix mode. This does
+# not stamp a harness, arm automation or import a legacy private repository.
+if [ "$FIX" = 1 ] && [ -f "$YGGBIN/ygg-fs.py" ] && [ -f "$YGGBIN/ygg-steer.py" ]; then
+  if python3 "$YGGBIN/ygg-fs.py" init && python3 "$YGGBIN/ygg-steer.py" init; then
+    ok "portable steering organization initialized; inspect with ygg steer plan"
+  else
+    bad "portable steering held; inspect ygg fs status and ygg steer init"
+  fi
+fi
+
 # ---- tier 2: observability --------------------------------------------------
 echo "tier 2 — observability"
 [ -f "$YGGBIN/ygg_row.py" ] && ok "row registry shipped" || bad "ygg_row.py missing (gui tier)"
