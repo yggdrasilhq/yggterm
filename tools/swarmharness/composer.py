@@ -101,15 +101,23 @@ chance within len(cohort) consecutive passes when the budget is at least
 one page. The scheduler is order-only state; losing it reorders, never
 loses evidence.
 
-Crash-gap reconciliation (CSR-03 repair, 2026-10-29): the cursor commits
-per page, the anchor once per pass; a crash between the two can leave
-the cursor AHEAD of the anchored frontier. Recovery detects the mismatch
-and re-reads the gap from the anchored frontier with FRESH detector
-state before trusting anything — prior evidence survives via the v2
-dedupe, chunk hashes come from re-read RAW bytes, and the reconciled
-cursor persists even when the pass has no budget left, so the reconcile
-is one-time and crash-replay idempotent. Bytes that changed while
-unobserved stay distinct evidence at their own offsets.
+Crash-gap reconciliation (CSR-03 repair, 2026-10-29; frontier checkpoint
+per the editor round-1 finding CSR-03-EDITOR-01): the cursor commits per
+page, the anchor once per pass; a crash between the two can leave the
+cursor AHEAD of the anchored frontier. Recovery detects the mismatch and
+re-reads the gap from the anchored frontier carrying the FRONTIER
+DETECTOR CHECKPOINT — the valid detector state AS OF the frontier, saved
+inside the anchor entry in the SAME atomic write, so it is always
+consistent with the frontier and never contaminated by already-read gap
+bytes (prefix context survives: retained evidence pairs and hunt windows
+still close recurrence after recovery, exactly as in an uncrashed run).
+A legacy anchor without a checkpoint degrades EXPLICITLY to fresh state
+(typed note), never a silent reuse of possibly-contaminated state. Prior
+evidence survives via the v2 dedupe, chunk hashes come from re-read RAW
+bytes, and the reconciled cursor persists even when the pass has no
+budget left, so the reconcile is one-time and crash-replay idempotent.
+Bytes that changed while unobserved stay distinct evidence at their own
+offsets.
 
 Observation identity v2 (F2 repair, 2026-10-29): the dedupe identity is
 (source_kind, lineage, span, detector, detector_version, fingerprint) —
@@ -847,6 +855,25 @@ def commit_batch(state_dir, entry, observations, cursor, stats):
     return {"appended": len(to_append)}
 
 
+def _valid_det_state(fps, pfps, aos):
+    """Shared detector-state validation (cursor entries and anchor
+    checkpoints): fingerprints are nonempty strings with nonnegative int
+    counts; hunts carry the protocol-bounded window; retained offsets are
+    nonnegative ints (F31.5)."""
+    return (isinstance(fps, dict) and all(
+        isinstance(fp, str) and type(n) is int and n >= 0
+        for fp, n in fps.items())
+        and isinstance(pfps, list) and all(
+        isinstance(p, dict) and isinstance(p.get("fp"), str)
+        and type(p.get("window")) is int
+        and 1 <= p["window"] <= 3  # protocol bounds (F31.5)
+        and type(p.get("byte_off")) is int and p["byte_off"] >= 0
+        for p in pfps)
+        and isinstance(aos, dict) and all(
+        isinstance(a, str) and type(w) is int and w >= 0
+        for a, w in aos.items()))
+
+
 def _load_cursors(state):
     """Cursor validation (sol t25 #10): structure, types, bounds checked by
     the caller against file size; structurally invalid entries dropped with
@@ -878,18 +905,7 @@ def _load_cursors(state):
         fps = v.get("cmd_fps", {})
         pfps = v.get("pending_fps", [])
         aos = v.get("att_offs", {})
-        if (not isinstance(fps, dict) or any(
-                not isinstance(fp, str) or type(n) is not int or n < 0
-                for fp, n in fps.items())
-                or not isinstance(pfps, list) or any(
-                not isinstance(p, dict) or not isinstance(p.get("fp"), str)
-                or type(p.get("window")) is not int
-                or not 1 <= p["window"] <= 3  # protocol bounds (F31.5)
-                or type(p.get("byte_off")) is not int or p["byte_off"] < 0
-                for p in pfps)
-                or not isinstance(aos, dict) or any(
-                not isinstance(a, str) or type(w) is not int or w < 0
-                for a, w in aos.items())):
+        if not _valid_det_state(fps, pfps, aos):
             notes.append(f"cursor entry {k[:40]}: invalid detector state — "
                          "reset")
             continue
@@ -964,11 +980,29 @@ def _load_anchors(state):
         if type(pos) is not int or pos < 0:
             notes.append(_bad_entry(k))
             continue
+        # frontier detector checkpoint (CSR-03): the valid detector state
+        # AS OF the anchored frontier, saved in the SAME atomic write as
+        # the frontier so the two can never diverge. None = legacy anchor
+        # (typed absence — the gap reconcile degrades explicitly).
+        det = v.get("det")
+        if det is not None:
+            if not isinstance(det, dict) or not _valid_det_state(
+                    det.get("cmd_fps", {}), det.get("pending_fps", []),
+                    det.get("att_offs", {})):
+                notes.append(_bad_entry(k))
+                continue
         clean[k] = {"size": v["size"], "head_sha": v["head_sha"],
                     "tail_sha": v["tail_sha"], "chunks": [
                         {"start": c["start"], "len": c["len"],
                          "sha": c["sha"]} for c in chunks],
-                    "verify_pos": pos}
+                    "verify_pos": pos,
+                    "det": None if det is None else {
+                        "cmd_fps": dict(det.get("cmd_fps", {})),
+                        "pending_fps": [
+                            {"fp": p["fp"], "window": p["window"],
+                             "byte_off": p["byte_off"]}
+                            for p in det.get("pending_fps", [])],
+                        "att_offs": dict(det.get("att_offs", {}))}}
     return clean, notes
 
 
@@ -1319,6 +1353,7 @@ def tick(sources, state_dir=None, max_bytes_per_source=262144,
             anchors_dirty = False
             reset_occurred = False
             gap_reconciled = False
+            gap_checkpoint = None
 
             def _reset(note):
                 nonlocal cur, fresh, anchor, anchors_dirty, reset_occurred
@@ -1376,12 +1411,23 @@ def tick(sources, state_dir=None, max_bytes_per_source=262144,
                     gap_lo, gap_hi = anchor["size"], cur
                     cur = anchor["size"]
                     gap_reconciled = True
+                    gap_checkpoint = anchor.get("det")
                     report["notes"].append(
                         f"cursor ahead of anchored prefix on "
                         f"{entry['path']} (crash gap "
                         f"[{gap_lo},{gap_hi})) — reconciling: gap re-read "
-                        "from the anchored frontier with FRESH detector "
-                        "state; dedupe keeps prior evidence")
+                        "from the anchored frontier with detector state "
+                        "checkpointed AT the frontier (the frontier and "
+                        "its checkpoint save in one atomic write, so it "
+                        "is never contaminated by gap bytes); dedupe "
+                        "keeps prior evidence")
+                    if gap_checkpoint is None:
+                        report["notes"].append(
+                            f"frontier detector checkpoint absent on "
+                            f"{entry['path']} (legacy anchor) — prefix "
+                            "adjacency state unrecoverable, gap re-read "
+                            "uses FRESH detector state (typed degraded "
+                            "reconcile, never a silent reuse)")
                 elif cur < anchor["size"]:
                     # safe direction (evidence commits before the cursor):
                     # trim chunks past the cursor so the re-read rebuilds
@@ -1432,8 +1478,20 @@ def tick(sources, state_dir=None, max_bytes_per_source=262144,
                                     f"{coverage}); {size - anchor['size']} "
                                     "tail bytes to read")
 
-            cmd_fps, pending_fps, att_offs = _page_state(
-                cstate, fresh or gap_reconciled)
+            if gap_reconciled and gap_checkpoint is not None:
+                # the frontier checkpoint IS the valid detector state at
+                # the re-read start: prefix context (retained evidence
+                # pairs, hunt windows, counts) survives the crash, and
+                # the gap pages replay their transitions exactly once
+                # from the same base the uncrashed run used (CSR-03
+                # EDITOR-01 repair — fresh-state wiped valid prefix
+                # context and permanently missed recurrence evidence)
+                cmd_fps = dict(gap_checkpoint.get("cmd_fps", {}))
+                pending_fps = list(gap_checkpoint.get("pending_fps", []))
+                att_offs = dict(gap_checkpoint.get("att_offs", {}))
+            else:
+                cmd_fps, pending_fps, att_offs = _page_state(
+                    cstate, fresh or gap_reconciled)
             local_chunks = [] if fresh else \
                 [dict(c) for c in (anchor or {}).get("chunks", [])]
             prev_pos = 0 if fresh else (anchor or {}).get("verify_pos", 0)
@@ -1492,10 +1550,19 @@ def tick(sources, state_dir=None, max_bytes_per_source=262144,
                 # source) still persists its cursor so the reconcile is
                 # ONE-TIME, never a per-pass note loop; the next pass
                 # reads it as a plain fresh start (reset: cursor 0) or
-                # from the anchored frontier (gap reconcile)
-                commit_batch(state, entry, [], cur,
-                             {"cmd_fps": {}, "pending_fps": [],
-                              "att_offs": {}})
+                # from the anchored frontier (gap reconcile — carrying
+                # the frontier checkpoint so the delayed reconcile never
+                # downgrades to contaminated or empty state)
+                gap_state = ({"cmd_fps": dict(gap_checkpoint.get("cmd_fps",
+                                                                   {})),
+                              "pending_fps": list(gap_checkpoint.get(
+                                  "pending_fps", [])),
+                              "att_offs": dict(gap_checkpoint.get(
+                                  "att_offs", {}))}
+                             if gap_reconciled and gap_checkpoint is not None
+                             else {"cmd_fps": {}, "pending_fps": [],
+                                   "att_offs": {}})
+                commit_batch(state, entry, [], cur, gap_state)
             if deferred:
                 backlog += 1
                 report["gaps"] += 1
@@ -1516,6 +1583,14 @@ def tick(sources, state_dir=None, max_bytes_per_source=262144,
                 anchors[key] = {"size": cur, "head_sha": head_sha,
                                 "tail_sha": tail_sha,
                                 "chunks": local_chunks, "verify_pos": prev_pos,
+                                # frontier detector checkpoint: the state
+                                # as-of this frontier, saved in the SAME
+                                # atomic write — crash recovery replays a
+                                # gap from here instead of wiping valid
+                                # prefix context (CSR-03 EDITOR-01)
+                                "det": {"cmd_fps": cmd_fps,
+                                        "pending_fps": pending_fps,
+                                        "att_offs": att_offs},
                                 "at": _now()}
                 anchors_dirty = True
             if anchors_dirty:

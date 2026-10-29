@@ -737,7 +737,72 @@ def t_csr03_crash_gap_reconciled():
           and cursor_of(state, "board::" + str(src))["cursor"]
           == src.stat().st_size,
           json.dumps({"gap_notes": gap_notes, "rows": len(rows3)})[:200])
-    shutil.rmtree(w)
+
+    # CSR-03 EDITOR-01 (round-1 editor finding): the ANCHORED PREFIX's
+    # detector context must survive recovery. A count-1 command at 65408
+    # retains an adjacent error offset (65472) inside the anchored prefix;
+    # a crash leaves the cursor ahead; the recurring command in the gap
+    # re-read must still close the loop at the retained offset —
+    # identically to an uncrashed control. The frontier detector
+    # checkpoint (saved inside the anchor's atomic write) is the
+    # mechanism; fresh-state wiping was the round-1 defect.
+    rec = ("x" * 63 + "\n").encode()                   # clean 64B record
+    cmd = ("$ retry-cmd".ljust(63) + "\n").encode()
+    err = ("NameError: name 'widget' is not defined".ljust(63)
+           + "\n").encode()
+
+    def boundary_fixture(path):
+        recs = [rec] * (196608 // 64)
+        recs[65408 // 64] = cmd                        # count-1 command
+        recs[65472 // 64] = err                        # adjacent error
+        recs[131072 // 64] = cmd                       # recurrence in gap
+        path.write_bytes(b"".join(recs))
+
+    w_ctrl, w_crash = fresh("csr03ctrl"), fresh("csr03crash")
+    boundary_fixture(w_ctrl / "b.jsonl")
+    boundary_fixture(w_crash / "b.jsonl")
+    for _ in range(3):                                 # uncrashed control
+        cp.tick({"board": [str(w_ctrl / "b.jsonl")]}, state_dir=w_ctrl / "st",
+                max_bytes_per_source=65536, max_pages=1)
+    ctrl = [o for o in cp.load_observations(w_ctrl / "st")
+            if o["detector_id"] == "cmd-failure-loop"]
+    cp.tick({"board": [str(w_crash / "b.jsonl")]}, state_dir=w_crash / "st",
+            max_bytes_per_source=65536, max_pages=1)
+    with patch.object(cp, "_save_anchors",
+                      side_effect=OSError("injected anchor write crash")):
+        try:
+            cp.tick({"board": [str(w_crash / "b.jsonl")]},
+                    state_dir=w_crash / "st",
+                    max_bytes_per_source=65536, max_pages=1)
+        except OSError:
+            pass
+    for _ in range(3):                                 # recovery passes
+        repc = cp.tick({"board": [str(w_crash / "b.jsonl")]},
+                       state_dir=w_crash / "st",
+                       max_bytes_per_source=65536, max_pages=16)
+    crash_rows = cp.load_observations(w_crash / "st")
+    loops_crash = [o for o in crash_rows
+                   if o["detector_id"] == "cmd-failure-loop"]
+    check("C3-6 frontier checkpoint preserves anchored-prefix detector "
+          "context across a crash-gap recovery: the loop observation is "
+          "IDENTICAL to the uncrashed control (same retained span and "
+          "command fingerprint; distinct fixture inodes give distinct "
+          "lineages, so dedupe keys differ by construction)",
+          len(ctrl) == 1 and len(loops_crash) == 1
+          and ctrl[0]["span"] == loops_crash[0]["span"] == "bytes@65472"
+          and ctrl[0]["fingerprint"] == loops_crash[0]["fingerprint"],
+          json.dumps({"ctrl": [(o["span"], o["fingerprint"]) for o in ctrl],
+                      "crash": [(o["span"], o["fingerprint"])
+                                for o in loops_crash],
+                      "notes": [n[:70] for n in repc["notes"][:2]]})[:300])
+    check("C3-7 no duplicated evidence across the crash boundary "
+          "(dedupe keeps the signature row once)",
+          len([o for o in crash_rows
+               if o["detector_id"] == "sig-nameerror-typo"]) == 1
+          and len(crash_rows) == len(cp.load_observations(w_ctrl / "st")),
+          json.dumps({"crash_rows": len(crash_rows)})[:120])
+    for d in (w, w_ctrl, w_crash):
+        shutil.rmtree(d)
 
 
 def t_csr10_control_strength():
