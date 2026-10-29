@@ -12,20 +12,30 @@ Truth laws (owner ygg4 repair unit, 2026-10-29):
 - Identity is content-bound. Every proposal id is the hash of its canonical
   JSON bytes (every field covered — no '?' fallback), and the batch id
   additionally covers the review protocol version. A same-count outbox with
-  changed content is a NEW batch; an unchanged replay is idempotent.
+  changed content is a NEW batch; an unchanged replay is idempotent. A row
+  whose keys collide after Unicode normalization has no unambiguous field
+  set and is a typed non-canonical hold, never an identity that silently
+  drops a field.
 - The reviewer output must bind to the exact batch: one typed verdict line
   per proposal id (accept|rebut|defer + a reason) and a footer echoing THIS
-  batch id with counts matching the real proposal distribution. A bare
-  "BATCH" substring, a fabricated or wrong batch id, wrong/duplicate/
-  missing ids or counts, a partial or malformed response, a nonzero exit,
-  a timeout, an absent transport, or a storage failure NEVER advance the
-  success marker. Review debt is retained and retried under a bounded
-  cooldown instead of being hidden.
+  batch id with counts matching the real proposal distribution. VERDICT-
+  shaped lines are validated across the WHOLE response — trailing commentary
+  can never conceal an unknown, duplicate, contradictory or malformed
+  verdict. A bare "BATCH" substring, a fabricated or wrong batch id, wrong/
+  duplicate/missing ids or counts, a partial or malformed response, a
+  nonzero exit, a timeout, an absent transport, or a storage failure NEVER
+  advance the success marker. Review debt is retained and retried under a
+  bounded cooldown instead of being hidden; storage faults AFTER the
+  reviewer ran enter the same retry accounting, so a persistent write fault
+  cannot re-invoke the paid transport on every tick.
 - A malformed/partial outbox is a typed observable hold: the last marker is
   never clobbered, prior verdict records are preserved, and the hold is
   appended to review-holds.jsonl. Concurrent dispatches serialize on a
   state lock; a stale outbox basis (changed while the review ran) is
   rejected without applying its verdict.
+- The checkpoint brief carries the proposals' evidence inline (bounded)
+  and points at the staged snapshot (outbox-snapshot.jsonl) as the
+  authoritative bytes, so the reviewer can always read the full record.
 - The verdicts are ADVISORY brain-pair triage only — proposed to the owning
   campaign boards. The marker is NOT independent worker-completion
   acceptance, NOT a canonical completion receipt, and executes no repairs.
@@ -85,25 +95,36 @@ def _now():
 
 def _nfc(v):
     """Unicode-normalize recursively so two encodings of the SAME string
-    (NFC vs NFD) carry one identity, not two."""
+    (NFC vs NFD) carry one identity, not two. A dict whose keys collide
+    after normalization raises ValueError: silently dropping a field would
+    change the row's content while identity claimed to cover every field."""
     if isinstance(v, str):
         return unicodedata.normalize("NFC", v)
     if isinstance(v, list):
         return [_nfc(x) for x in v]
     if isinstance(v, dict):
-        return {_nfc(k): _nfc(x) for k, x in v.items()}
+        out = {}
+        for k, x in v.items():
+            nk = _nfc(k)
+            if nk in out:
+                raise ValueError(
+                    f"key-normalization collision: two keys normalize to "
+                    f"{nk!r} — the row has no unambiguous field set")
+            out[nk] = _nfc(x)
+        return out
     return v
 
 
 def _canonical(row):
     """Deterministic serialization — the bytes identity is bound to. NFC-
     normalized, true UTF-8 (no \\u escaping of non-ASCII, RFC 8785 style);
-    NaN/Infinity are refused (ValueError): they have no canonical form.
-    The encode/decode round-trip is lossless AND makes lone Unicode
-    surrogates raise (UnicodeEncodeError, a ValueError) HERE — at the
-    canonical check the loader types them non-canonical — instead of
-    crashing identity computation later: identity bytes must be UTF-8-
-    encodable by construction."""
+    NaN/Infinity are refused (ValueError): they have no canonical form; a
+    key-normalization collision is refused for the same reason (F-1). The
+    encode/decode round-trip is lossless AND makes lone Unicode surrogates
+    raise (UnicodeEncodeError, a ValueError) HERE — at the canonical check
+    the loader types them non-canonical — instead of crashing identity
+    computation later: identity bytes must be UTF-8-encodable by
+    construction."""
     text = json.dumps(_nfc(row), sort_keys=True, separators=(",", ":"),
                       allow_nan=False, ensure_ascii=False)
     return text.encode("utf-8").decode("utf-8")
@@ -157,10 +178,10 @@ def load_outbox_bytes(data):
             continue
         try:
             _canonical(row)
-        except ValueError:
+        except ValueError as e:
             faults.append({"line": ln, "fault": "non-canonical-row",
-                           "detail": "NaN/Infinity have no canonical JSON "
-                                     "form"})
+                           "detail": str(e)[:120] or
+                           "row has no canonical JSON form"})
             continue
         rows.append(row)
     return rows, faults
@@ -292,11 +313,33 @@ def stage_snapshot(batch_dir, entries):
     return digest
 
 
+def _evidence_lines(ev):
+    """Bounded inline evidence for one proposal: the first rows verbatim,
+    the rest pointed at the staged snapshot. A non-list evidence field is
+    still shown, never silently counted away."""
+    if not isinstance(ev, list):
+        ev = [ev]
+    out = []
+    for i, row in enumerate(ev[:3]):
+        try:
+            text = json.dumps(row, sort_keys=True, ensure_ascii=False)
+        except (TypeError, ValueError):
+            text = repr(row)
+        out.append(f"    [{i}] {text[:400]}")
+    if len(ev) > 3:
+        out.append(f"    ... {len(ev) - 3} more evidence row(s) — read the "
+                   f"full bytes from {SNAPSHOT_NAME}")
+    return out
+
+
 def stage_brief(batch_dir, batch, entries):
     """Criterion-bound checkpoint brief: baseline, evidence, falsifier,
     missingness and the native read bound — then the exact output contract.
-    Returns the brief text (written by the caller, so write errors stay
-    typed at the dispatch site)."""
+    The evidence is shown inline (bounded) and the staged snapshot is
+    explicitly pointed at: the reviewer can always reach the complete
+    canonical proposal bytes, so the count-only summary can never be the
+    whole story. Returns the brief text (written by the caller, so write
+    errors stay typed at the dispatch site)."""
     blocks = []
     for e in entries:
         r = e["row"]
@@ -311,7 +354,8 @@ def stage_brief(batch_dir, batch, entries):
             f"  evidence rows: {len(ev)}"
             + ("" if ev else "  [MISSINGNESS: no machine-checkable "
                              "evidence rows attached — treat as defer "
-                             "candidate]"))
+                             "candidate]")
+            + ("\n" + "\n".join(_evidence_lines(ev)) if ev else ""))
     bound = resource_bound()
     needs = needs_state()
     needs_line = (f"needs snapshot: available"
@@ -332,6 +376,12 @@ owning campaign boards.
 - miner read bound reached: {bound["bytes_cursor_total"]} cursor bytes over
   {bound["sources_tracked"]} tracked source(s)
 
+## Proposal snapshot (authoritative bytes)
+The complete canonical proposal bytes for THIS batch — every field,
+including the full evidence rows summarized above — are staged in THIS
+directory as {SNAPSHOT_NAME}. Read it before deciding: the summaries below
+are bounded, the snapshot is the record.
+
 ## Proposals (evidence + falsifier + missingness)
 {chr(10).join(blocks)}
 
@@ -348,7 +398,10 @@ VERDICT <proposal-id> accept|rebut|defer — <one-paragraph basis>
 BATCH {batch} reviewed={n} accepts=<a> rebut=<r> defers=<d>
 
 - The counts must match your own verdict lines exactly. Any other batch id,
-  id set, or count makes the whole review invalid.
+  id set, or count makes the whole review invalid. EVERY VERDICT-shaped
+  line anywhere in your output is validated against these rules — place
+  all verdict lines before the footer, never repeat one, and keep any
+  trailing commentary free of verdict-shaped text.
 """
 
 
@@ -369,9 +422,12 @@ def resolve_transport():
 def parse_verdict(stdout, expected_ids, expected_batch):
     """Strict typed validation of the reviewer output. Returns
     (verdicts, counts); raises ValueError with the exact rejection reason.
-    Prose, trailing markdown fences and structural case/plural variants are
+    Prose, markdown fences and structural case/plural variants are
     tolerated; every binding property (batch id, id set, counts, dedupe,
-    reason length) is not."""
+    reason length) is not. VERDICT-shaped lines are validated across the
+    WHOLE response, not only above the footer: permitted trailing
+    commentary must never conceal an unknown, duplicate, contradictory or
+    malformed verdict line."""
     raw = [l.strip() for l in (stdout or "").splitlines() if l.strip()]
     # markdown fence lines (``` or ```lang) are wrapping, never content
     lines = [l for l in raw if not l.startswith("```")]
@@ -383,12 +439,12 @@ def parse_verdict(stdout, expected_ids, expected_batch):
         raise ValueError("no valid BATCH footer found")
     if len(footers) > 1:
         raise ValueError("multiple BATCH footers")
-    fidx, footer = footers[0]
+    _, footer = footers[0]
     if footer.group(1).lower() != expected_batch:
         raise ValueError(f"footer batch {footer.group(1)} != expected "
                          f"{expected_batch}")
     verdicts = {}
-    for l in lines[:fidx]:
+    for l in lines:
         if not l.upper().startswith("VERDICT"):
             continue
         m = VERDICT_RE.match(l)
@@ -588,7 +644,16 @@ def _dispatch(host):
             pass
         return _hold_exit("review-rejected:verdict-schema", str(e), batch)
 
-    if hashlib.sha256(OUTBOX.read_bytes()).hexdigest() != outbox_bytes_digest:
+    try:
+        changed = (hashlib.sha256(OUTBOX.read_bytes()).hexdigest()
+                   != outbox_bytes_digest)
+    except OSError as e:
+        # post-invocation storage fault: typed hold AND retry accounting,
+        # so a persistent write fault cannot trigger repeated paid calls
+        record_failure(f"basis-re-read: {e}", batch)
+        return _hold_exit("hold:storage-failure",
+                          f"basis re-read failed after review: {e}", batch)
+    if changed:
         try:
             (batch_dir / "verdict-stale.txt").write_text(
                 stdout, encoding="utf-8")
@@ -620,6 +685,11 @@ def _dispatch(host):
                              "completion receipt, no repairs executed",
             "dispatched_at": _now(), "review_dir": str(batch_dir)})
     except (OSError, UnicodeError) as e:
+        # post-invocation storage fault: the paid transport call already
+        # happened, so this failure MUST enter the retry accounting — a
+        # persistent write fault otherwise re-invokes the reviewer every
+        # tick with no cooldown (editor finding F-3, round-3 review).
+        record_failure(f"storage-write: {e}", batch)
         return _hold_exit("hold:storage-failure",
                           f"verdict/marker write failed: {e}", batch)
     record_success()

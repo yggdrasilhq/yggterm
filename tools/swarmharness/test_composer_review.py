@@ -152,6 +152,25 @@ elif mode == "exit1":
 elif mode == "sleep-forever":
     time.sleep(30)
     sys.exit(0)
+elif mode in ("post-footer-unknown", "post-footer-malformed",
+              "post-footer-dup"):
+    for l in verdicts(ids):
+        print(l)
+    print(f"BATCH {batch} reviewed={len(ids)} accepts=0 rebut=0 "
+          f"defers={len(ids)}")
+    if mode == "post-footer-unknown":
+        print("VERDICT 0123456789abcdef accept -- unknown id after footer")
+    elif mode == "post-footer-malformed":
+        print("VERDICT malformed")
+    else:
+        print(f"VERDICT {ids[0]} accept -- contradictory duplicate after "
+              f"footer")
+elif mode == "post-footer-prose":
+    for l in verdicts(ids):
+        print(l)
+    print(f"BATCH {batch} reviewed={len(ids)} accepts=0 rebut=0 "
+          f"defers={len(ids)}")
+    print("Summary: every proposal deferred pending a second lineage.")
 else:
     print(f"fake transport: unknown mode {mode}", file=sys.stderr)
     sys.exit(1)
@@ -671,6 +690,126 @@ def main():
               and "non-canonical-row" in r.stdout
               and "UnicodeEncodeError" not in r.stderr and sb.marker() is None,
               r.stdout.strip()[:200] + r.stderr[-120:])
+    finally:
+        sb.cleanup()
+
+    # ---- R30 NFC key-normalization collision -> typed hold (F-1) ----
+    sb = Sandbox()
+    try:
+        fake = sb.install_fake()
+        colliding = ('{"kind": "claim_proposal", "\\u00e9": "first-value", '
+                     '"e\\u0301": "second-value"}')
+        row = json.loads(colliding)
+        try:
+            cr._canonical(row)
+            raised = False
+        except ValueError as e:
+            raised = "collision" in str(e)
+        check("R30a collision row refused at the canonical check",
+              raised, "expected ValueError naming the collision")
+        sb.outbox_write([a])
+        r0 = sb.run_review(COMPOSER_REVIEW_BIN=fake, COMPOSER_FAKE_MODE="valid")
+        good_marker = sb.marker()
+        sb.outbox_write(json.dumps(a) + "\n" + colliding + "\n")
+        r = sb.run_review(COMPOSER_REVIEW_BIN=fake, COMPOSER_FAKE_MODE="valid")
+        holds = sb.holds()
+        check("R30 key-normalization collision -> typed outbox hold, "
+              "marker preserved, transport never invoked",
+              r.returncode == 2 and "hold:outbox-malformed" in r.stdout
+              and "non-canonical-row" in r.stdout
+              and "collision" in r.stdout
+              and sb.marker() == good_marker
+              and not (sb.count).exists()
+              and any("collision" in h.get("detail", "") for h in holds)
+              and "Traceback" not in r.stderr,
+              r.stdout.strip()[:200] + r.stderr[-120:])
+    finally:
+        sb.cleanup()
+
+    # ---- R31 verdict-shaped content AFTER the footer is validated (F-2) ----
+    for mode, label in (
+            ("post-footer-unknown", "unknown id"),
+            ("post-footer-malformed", "malformed line"),
+            ("post-footer-dup", "contradictory duplicate")):
+        sb = Sandbox()
+        try:
+            fake = sb.install_fake()
+            sb.outbox_write([a])
+            r = sb.run_review(COMPOSER_REVIEW_BIN=fake,
+                              COMPOSER_FAKE_MODE=mode)
+            check(f"R31 post-footer {label} -> review rejected, no marker",
+                  r.returncode == 2 and "review-rejected" in r.stdout
+                  and sb.marker() is None,
+                  r.stdout.strip()[:200] + r.stderr[-120:])
+        finally:
+            sb.cleanup()
+    sb = Sandbox()
+    try:
+        fake = sb.install_fake()
+        sb.outbox_write([a])
+        r = sb.run_review(COMPOSER_REVIEW_BIN=fake,
+                          COMPOSER_FAKE_MODE="post-footer-prose")
+        check("R31b prose (non-verdict) after footer is still tolerated",
+              r.returncode == 0 and sb.marker() is not None
+              and sb.marker().get("status") == "advisory-ok",
+              r.stdout.strip()[:200] + r.stderr[-120:])
+    finally:
+        sb.cleanup()
+
+    # ---- R32 post-invocation storage fault enters retry accounting (F-3) ----
+    sb = Sandbox()
+    try:
+        fake = sb.install_fake()
+        sb.outbox_write([a])
+        batch, _entries = cr.build_batch([a])
+        bdir = sb.state / "reviews" / f"batch-{batch}"
+        bdir.mkdir(parents=True, exist_ok=True)
+        (bdir / "verdict.md").mkdir()  # persistent write fault after review
+        statuses = []
+        for _ in range(4):
+            r = sb.run_review(COMPOSER_REVIEW_BIN=fake,
+                              COMPOSER_FAKE_MODE="valid",
+                              COMPOSER_FAKE_COUNT=str(sb.count))
+            statuses.append(r.stdout.strip())
+        invocations = sum(1 for _ in
+                          (sb.count).read_text().splitlines()) \
+            if sb.count.exists() else 0
+        attempts = json.loads((sb.state / "review-attempts.json").read_text()) \
+            if (sb.state / "review-attempts.json").exists() else {}
+        check("R32 storage faults after invocation: bounded paid calls, "
+              "cooldown gates the rest, attempts recorded",
+              sum("hold:storage-failure" in s for s in statuses) == 3
+              and "hold:cooldown-backoff" in statuses[3]
+              and invocations == 3
+              and attempts.get("consecutive_failures") == 3
+              and "storage-write" in attempts.get("last_failure_reason", ""),
+              "statuses=" + repr(statuses) + f" invocations={invocations}")
+    finally:
+        sb.cleanup()
+
+    # ---- R33 brief carries evidence content + snapshot pointer (F-4) ----
+    sb = Sandbox()
+    try:
+        fake = sb.install_fake()
+        ev_rows = [{"line": i, "src": f"invented-distinctive-{i}.log"}
+                   for i in range(5)]
+        a_ev = dict(a, evidence=ev_rows)
+        sb.outbox_write([a_ev])
+        r = sb.run_review(COMPOSER_REVIEW_BIN=fake, COMPOSER_FAKE_MODE="valid")
+        batch = sb.marker()["batch"]
+        brief = (sb.state / "reviews" / f"batch-{batch}"
+                 / "brief.md").read_text(encoding="utf-8")
+        snap = (sb.state / "reviews" / f"batch-{batch}"
+                / "outbox-snapshot.jsonl").read_text(encoding="utf-8")
+        check("R33 brief shows evidence inline, points at the snapshot",
+              r.returncode == 0
+              and "invented-distinctive-0.log" in brief
+              and "invented-distinctive-2.log" in brief
+              and "outbox-snapshot.jsonl" in brief
+              and "more evidence row(s)" in brief
+              and "invented-distinctive-4.log" not in brief
+              and "invented-distinctive-4.log" in snap,
+              brief[-300:])
     finally:
         sb.cleanup()
 
