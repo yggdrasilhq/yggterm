@@ -370,6 +370,23 @@ fn validate_release_package(package: &ReleasePackage) -> Result<()> {
         for bin in &artifact.bins {
             safe_artifact_filename(bin)
                 .with_context(|| format!("package {:?} bin name", package.id))?;
+            // A bin is a bare program identity: a stemless spelling
+            // (".exe") would key a pointer table with an empty program.
+            let stem = bin
+                .len()
+                .checked_sub(4)
+                .and_then(|cut| bin.get(..cut))
+                .filter(|_| {
+                    bin.get(bin.len() - 4..)
+                        .is_some_and(|suffix| suffix.eq_ignore_ascii_case(".exe"))
+                })
+                .unwrap_or(bin.as_str());
+            if stem.is_empty() || stem == "." || stem == ".." {
+                bail!(
+                    "package {:?} bin name {bin:?} carries no program stem",
+                    package.id
+                );
+            }
         }
         if let Some(bundle) = &artifact.bundle {
             safe_content_relpath(bundle)

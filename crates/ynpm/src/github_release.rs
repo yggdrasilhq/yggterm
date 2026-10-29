@@ -268,6 +268,9 @@ function Assert-EntryName([string]$Name) {
   if ($trimmed.Contains('\')) { throw "zip entry '$Name' contains a backslash" }
   if ($trimmed -match '^[A-Za-z]:') { throw "zip entry '$Name' names a Windows drive path" }
   if ($trimmed.IndexOfAny([System.IO.Path]::GetInvalidPathChars()) -ge 0) { throw "zip entry '$Name' contains control characters" }
+  foreach ($ch in $trimmed.ToCharArray()) {
+    if ([int]$ch -lt 0x20 -or [int]$ch -eq 0x7F) { throw "zip entry '$Name' contains control characters" }
+  }
   foreach ($part in $trimmed.Split('/')) {
     if ($part -eq "..") { throw "zip entry '$Name' contains a '..' traversal component" }
   }
@@ -1265,14 +1268,24 @@ fn bin_file_name_for(windows: bool, bin: &str) -> String {
     }
 }
 
-/// The active.json bins-table key: the bare program stem, normalized from
-/// either declared spelling so the pointer contract stays launcher-exact
-/// (`bins.get("ygg")`, never `bins.get("ygg.exe")`).
+/// The active.json bins-table key: on Windows the bare program stem,
+/// normalized from either declared spelling (`.exe` is case-insensitive
+/// there because the launcher appends the file name itself); on unix the
+/// declared spelling is kept verbatim — a suffixed name is a legitimate
+/// unix binary name and unix behavior does not change.
 fn bin_program_key(bin: &str) -> &str {
-    match bin.strip_suffix(".exe") {
-        Some(stem) if !stem.is_empty() => stem,
-        _ => bin,
+    bin_program_key_for(cfg!(windows), bin)
+}
+
+fn bin_program_key_for(windows: bool, bin: &str) -> &str {
+    if windows && bin.len() >= 4 {
+        if let Some(stem) = bin.get(..bin.len() - 4) {
+            if bin[bin.len() - 4..].eq_ignore_ascii_case(".exe") && !stem.is_empty() {
+                return stem;
+            }
+        }
     }
+    bin
 }
 
 /// The seed-root marker: a byte-stable identity file a stable alias
@@ -1471,6 +1484,11 @@ pub fn verb_seed_activate(paths: &Paths, args: &[String]) -> Result<()> {
         &generation_dir,
         &artifact.bins,
     ) {
+        // The no-op still re-ensures the root marker: a deleted or
+        // replaced marker fails loudly here instead of an activation
+        // reporting success over an unmarked root (which alias creation
+        // would then refuse).
+        write_seed_root_marker(&seed_root)?;
         report_seed_activation(
             paths,
             &seed_root,
@@ -2508,24 +2526,27 @@ mod tests {
 
     #[test]
     fn bin_names_map_onto_the_bare_program_launcher_contract() {
-        // Bins are declared as bare program names on every platform; the
-        // `.exe` suffix is a file-name detail of Windows archives, never
-        // part of the program identity the launcher keys.
+        // Bins are declared as bare program names; on Windows the `.exe`
+        // suffix is a file-name detail (case-insensitive), while on unix a
+        // suffixed declared name is kept verbatim — a legitimate unix
+        // binary name whose behavior must not change.
         assert_eq!(bin_file_name_for(true, "ygg"), "ygg.exe");
         assert_eq!(bin_file_name_for(false, "ygg"), "ygg");
         assert_eq!(bin_file_name_for(true, "ygg.exe"), "ygg.exe");
-        assert_eq!(bin_program_key("ygg"), "ygg");
-        assert_eq!(bin_program_key("ygg.exe"), "ygg");
-        assert_eq!(bin_program_key(".exe"), ".exe");
+        assert_eq!(bin_program_key_for(true, "ygg"), "ygg");
+        assert_eq!(bin_program_key_for(true, "ygg.exe"), "ygg");
+        assert_eq!(bin_program_key_for(true, "ygg.EXE"), "ygg");
+        assert_eq!(bin_program_key_for(false, "ygg.exe"), "ygg.exe");
+        assert_eq!(bin_program_key_for(false, "ygg"), "ygg");
     }
 
     #[test]
-    fn seed_activate_normalizes_suffixed_bins_onto_the_bare_pointer_contract() {
-        // Even a manifest that declares Windows-spelled bins activates
-        // under the launcher's bare-key contract: the pointer table is
-        // keyed `ygg`, never `ygg.exe`, whatever the declared spelling.
-        let sandbox = Sandbox::new("seed-suffix");
-        let (archive, digest) = fixture_archive(&sandbox, "seed", "4.0.0", &["ygg"], None);
+    fn seed_activate_keeps_the_declared_bin_spelling_on_unix() {
+        // Unix regression: a manifest declaring a suffixed bin keeps that
+        // spelling in the pointer table and on disk — the Windows-only
+        // normalization never reaches unix behavior.
+        let sandbox = Sandbox::new("seed-suffix-unix");
+        let (archive, digest) = fixture_archive(&sandbox, "seed", "4.0.0", &["ygg.exe"], None);
         let mut doc = manifest_doc(
             "4.0.0", "v4.0.0", "ygg-seed", "seed", "seed.tar.gz", &digest,
             serde_json::json!({}),
@@ -2552,8 +2573,26 @@ mod tests {
             .keys()
             .map(String::as_str)
             .collect();
-        assert_eq!(keys, vec!["ygg"]);
+        assert_eq!(keys, vec!["ygg.exe"]);
         assert!(seed_root.join("seed-root.json").is_file());
+    }
+
+    #[test]
+    fn a_stemless_bin_name_is_refused_at_validation() {
+        let sandbox = Sandbox::new("seed-stemless");
+        let (_, digest) = fixture_archive(&sandbox, "seed", "4.0.0", &["ygg"], None);
+        for evil in [".exe", ".EXE"] {
+            let mut doc = manifest_doc(
+                "4.0.0", "v4.0.0", "ygg-seed", "seed", "seed.tar.gz", &digest,
+                serde_json::json!({}),
+            );
+            doc["packages"][0]["artifacts"][0]["bins"] = serde_json::json!([evil]);
+            let error = validate_release_manifest(&doc).unwrap_err();
+            assert!(
+                error.to_string().contains("no program stem"),
+                "{evil:?} was not refused as stemless: {error}"
+            );
+        }
     }
 
     #[test]

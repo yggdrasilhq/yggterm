@@ -303,12 +303,25 @@ pub fn alias_metadata_from_text(text: &str) -> Result<AliasMetadata, String> {
 }
 
 /// Resolve one alias frontend to its forwarding target. `None` means this
-/// executable carries no alias metadata (a plain binary — the caller runs
-/// its normal surface); `Some(Err)` means the alias is present but refuses
-/// (never a silent fallback into IR).
+/// executable carries NO alias metadata (a plain binary — the caller runs
+/// its normal surface); `Some(Err)` means alias metadata is present but
+/// refuses — unreadable, malformed, foreign marker, bad pointer — and
+/// never falls back into command IR on a broken alias.
 pub fn resolve_alias(exe: &Path) -> Option<Result<PathBuf, String>> {
     let meta_path = alias_metadata_path(exe)?;
-    let text = std::fs::read_to_string(&meta_path).ok()?;
+    if std::fs::symlink_metadata(&meta_path).is_err() {
+        return None;
+    }
+    let text = match std::fs::read_to_string(&meta_path) {
+        Ok(text) => text,
+        Err(error) => {
+            return Some(Err(format!(
+                "seed alias metadata {} unreadable: {error}; refusing to \
+                 fall back to command IR on a broken alias",
+                meta_path.display()
+            )));
+        }
+    };
     Some(alias_target(&text))
 }
 

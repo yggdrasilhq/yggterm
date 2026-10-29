@@ -4,8 +4,11 @@
 # active.json (schema 1, bare bin keys, real .exe files), the frozen
 # seed-root marker, the immutable alias frontends with their .seed-alias
 # metadata, a no-op re-run (idempotent, aliases untouched), and a refusal
-# that leaves the previous pointer in charge. No VM identities; everything
-# lives under -Scratch.
+# that leaves the previous pointer in charge. The seed ROOT is scoped under
+# -Scratch, but the PATH aliases live at the installer's fixed location
+# %LOCALAPPDATA%\ygg\bin — this probe runs the REAL installer, so it
+# exercises that real directory by design (run it on a scratch host).
+# No VM identities. Windows-only by purpose; it is never run on unix CI.
 #
 # Usage:  ./verify-windows-seed-install.ps1 -Dist <dir-with-seed-artifacts> -Scratch <dir>
 param(
@@ -19,8 +22,7 @@ $repoScript = Join-Path $PSScriptRoot "install.ps1"
 if (-not (Test-Path $repoScript)) { throw "install.ps1 not found beside this probe" }
 New-Item -ItemType Directory -Path $Scratch -Force | Out-Null
 $seedRoot = Join-Path $Scratch "seed"
-$home = Join-Path $Scratch "home"
-New-Item -ItemType Directory -Path $home -Force | Out-Null
+New-Item -ItemType Directory -Path $seedRoot -Force | Out-Null
 
 function Invoke-Installer([string]$Phase) {
   Write-Host "== $Phase"
@@ -119,8 +121,19 @@ $after = Get-Content $pointerPath -Raw
 if ($before -ne $after) { throw "FAIL: a refused install moved the active pointer" }
 Write-Host "PASS: refusal leaves pointer and generations in charge"
 
-# 7. A re-rooted seed refuses through the alias gate: move the marker and
-#    the alias must fail (run LAST; it corrupts the scratch seed root).
+# 7. Broken alias metadata refuses instead of falling back into command
+#    IR (the launcher copy would otherwise run as a plain frontend). The
+#    metadata is restored afterwards.
+$metaPath = Join-Path $binDir "ygg.exe.seed-alias"
+$metaBackup = Get-Content $metaPath -Raw
+Set-Content -Path $metaPath -Value "not json" -NoNewline
+& (Join-Path $binDir "ygg.exe") --version *> $null
+if ($LASTEXITCODE -eq 0) { throw "FAIL: broken alias metadata fell back to IR" }
+Set-Content -Path $metaPath -Value $metaBackup -NoNewline
+Write-Host "PASS: broken alias metadata refuses instead of loading IR"
+
+# 8. A re-rooted seed refuses through the alias gate: remove the marker
+#    and the alias must fail (run LAST; it corrupts the scratch seed root).
 Remove-Item $markerPath
 & (Join-Path $binDir "ygg.exe") --version *> $null
 if ($LASTEXITCODE -eq 0) { throw "FAIL: alias forwarded with its root marker gone" }
