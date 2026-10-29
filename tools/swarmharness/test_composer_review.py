@@ -990,6 +990,7 @@ def main():
                 {"consecutive_failures": True},
                 {"consecutive_failures": -1},
                 {"consecutive_failures": 3, "last_failure_epoch": float("nan")},
+                {"consecutive_failures": 3, "last_failure_epoch": 10 ** 500},
                 {"consecutive_failures": 3},
                 {"last_failure_reason": []}):
         sb = Sandbox()

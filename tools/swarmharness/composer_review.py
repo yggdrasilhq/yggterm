@@ -276,8 +276,12 @@ def load_attempts():
         raise ValueError("retry failure count must be a nonnegative integer")
     epoch = data.get("last_failure_epoch")
     if epoch is not None or count:
-        if (type(epoch) not in (int, float) or not math.isfinite(epoch)
-                or epoch < 0):
+        try:
+            valid_epoch = (type(epoch) in (int, float)
+                           and math.isfinite(epoch) and epoch >= 0)
+        except OverflowError:
+            valid_epoch = False
+        if not valid_epoch:
             raise ValueError("retry failure epoch must be finite and nonnegative")
     for key in ("last_failure_at", "last_failure_reason", "last_batch"):
         if key in data and not isinstance(data[key], str):
