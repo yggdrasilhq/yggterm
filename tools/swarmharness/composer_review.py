@@ -13,21 +13,25 @@ Truth laws (owner ygg4 repair unit, 2026-10-29):
   JSON bytes (every field covered — no '?' fallback), and the batch id
   additionally covers the review protocol version. A same-count outbox with
   changed content is a NEW batch; an unchanged replay is idempotent. A row
-  whose keys collide after Unicode normalization has no unambiguous field
-  set and is a typed non-canonical hold, never an identity that silently
-  drops a field.
+  with duplicate JSON keys (any nesting depth) or keys that collide after
+  Unicode normalization has no unambiguous field set and is a typed
+  non-canonical hold, never an identity that silently drops a field.
 - The reviewer output must bind to the exact batch: one typed verdict line
   per proposal id (accept|rebut|defer + a reason) and a footer echoing THIS
   batch id with counts matching the real proposal distribution. VERDICT-
-  shaped lines are validated across the WHOLE response — trailing commentary
-  can never conceal an unknown, duplicate, contradictory or malformed
-  verdict. A bare "BATCH" substring, a fabricated or wrong batch id, wrong/
-  duplicate/missing ids or counts, a partial or malformed response, a
-  nonzero exit, a timeout, an absent transport, or a storage failure NEVER
-  advance the success marker. Review debt is retained and retried under a
-  bounded cooldown instead of being hidden; storage faults AFTER the
-  reviewer ran enter the same retry accounting, so a persistent write fault
-  cannot re-invoke the paid transport on every tick.
+  shaped lines are validated across the WHOLE response, and BATCH is a
+  reserved line-leading token: any BATCH-shaped line that is not the one
+  valid footer — malformed, duplicate, or wrong-id with bogus counts —
+  rejects the whole response. Trailing commentary that is not verdict- or
+  BATCH-shaped stays tolerated. A bare "BATCH" substring, a fabricated or
+  wrong batch id, wrong/duplicate/missing ids or counts, a partial or
+  malformed response, a nonzero exit, a timeout, an absent transport, or a
+  storage failure NEVER advance the success marker. Review debt is retained
+  and retried under a bounded cooldown instead of being hidden; storage
+  faults AFTER the reviewer ran enter the same retry accounting, and the
+  retry ledger itself must be readable AND writable before any paid call —
+  a broken ledger blocks dispatch (fail-closed) rather than letting cooldown
+  be silently defeated.
 - A malformed/partial outbox is a typed observable hold: the last marker is
   never clobbered, prior verdict records are preserved, and the hold is
   appended to review-holds.jsonl. Concurrent dispatches serialize on a
@@ -154,6 +158,19 @@ def build_batch(rows):
     return batch_identity(ids), [{"id": i, "row": by_id[i]} for i in ids]
 
 
+def _no_duplicate_keys(pairs):
+    """json object_pairs_hook that refuses duplicate keys at ANY nesting
+    depth: json.loads otherwise silently keeps the last value and the
+    first key's evidence is discarded before the NFC collision check can
+    ever see it (editor finding F-5, round-4 review)."""
+    seen = set()
+    for k, _ in pairs:
+        if k in seen:
+            raise ValueError(f"duplicate JSON key {k!r} in one object")
+        seen.add(k)
+    return dict(pairs)
+
+
 def load_outbox_bytes(data):
     """-> (rows, faults) over ONE raw byte read (the same bytes the basis
     digest covers, so parse and basis can never disagree). Partial/
@@ -168,9 +185,13 @@ def load_outbox_bytes(data):
         if not line.strip():
             continue
         try:
-            row = json.loads(line)
+            row = json.loads(line, object_pairs_hook=_no_duplicate_keys)
         except json.JSONDecodeError as e:
             faults.append({"line": ln, "fault": "malformed-json",
+                           "detail": str(e)[:120]})
+            continue
+        except ValueError as e:
+            faults.append({"line": ln, "fault": "duplicate-key",
                            "detail": str(e)[:120]})
             continue
         if not isinstance(row, dict):
@@ -248,6 +269,12 @@ def load_attempts():
 
 
 def record_failure(reason, batch=None):
+    """Persist one failure into the retry ledger. A write failure here is
+    tolerated ONLY because the admission gate below refuses any paid
+    transport call while the ledger is unusable: at most one invocation
+    can run unaccounted per ledger-breakage event (the gate blocks every
+    subsequent dispatch until the ledger is repaired), so cooldown can
+    never be silently defeated (editor finding F-7, round-4 review)."""
     a = load_attempts()
     a["consecutive_failures"] = int(a.get("consecutive_failures", 0)) + 1
     a["last_failure_at"] = _now()
@@ -260,6 +287,25 @@ def record_failure(reason, batch=None):
     except (OSError, UnicodeError):
         pass
     return a
+
+
+def attempts_ledger_usable():
+    """Fail-closed admission gate, checked BEFORE any paid transport
+    invocation. The ledger must be readable AND writable, or bounded
+    retry accounting is unprovable: load_attempts would report an empty
+    history and cooldown would never engage. Returns None when usable,
+    else the typed fault string."""
+    if ATTEMPTS.exists():
+        try:
+            json.loads(ATTEMPTS.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, ValueError) as e:
+            return f"retry ledger unreadable: {str(e)[:120]}"
+    try:
+        with ATTEMPTS.open("a", encoding="utf-8"):
+            pass
+    except OSError as e:
+        return f"retry ledger unwritable: {str(e)[:120]}"
+    return None
 
 
 def record_success():
@@ -343,7 +389,16 @@ def stage_brief(batch_dir, batch, entries):
     blocks = []
     for e in entries:
         r = e["row"]
-        ev = r.get("evidence") or []
+        ev = r.get("evidence")
+        if isinstance(ev, list):
+            ev_rows = ev
+        elif ev is None:
+            ev_rows = []
+        else:
+            # a non-list evidence field is still evidence: shown as one
+            # row, never counted away and never a crash (editor finding
+            # F-8, round-4 review)
+            ev_rows = [ev]
         blocks.append(
             f"- {e['id']} pattern={r.get('pattern_id', '(none)')} "
             f"detector={r.get('detector_id', '(none)')}:"
@@ -351,11 +406,11 @@ def stage_brief(batch_dir, batch, entries):
             f"lane={r.get('lane', '(none)')}\n"
             f"  assertion: {str(r.get('assertion', '(missing)'))[:300]}\n"
             f"  falsifier: {str(r.get('disproof', '(missing)'))[:300]}\n"
-            f"  evidence rows: {len(ev)}"
-            + ("" if ev else "  [MISSINGNESS: no machine-checkable "
-                             "evidence rows attached — treat as defer "
-                             "candidate]")
-            + ("\n" + "\n".join(_evidence_lines(ev)) if ev else ""))
+            f"  evidence rows: {len(ev_rows)}"
+            + ("" if ev_rows else "  [MISSINGNESS: no machine-checkable "
+                                   "evidence rows attached — treat as defer "
+                                   "candidate]")
+            + ("\n" + "\n".join(_evidence_lines(ev_rows)) if ev_rows else ""))
     bound = resource_bound()
     needs = needs_state()
     needs_line = (f"needs snapshot: available"
@@ -440,9 +495,18 @@ def parse_verdict(stdout, expected_ids, expected_batch):
     if len(footers) > 1:
         raise ValueError("multiple BATCH footers")
     _, footer = footers[0]
+    footer_line = footer.group(0)
     if footer.group(1).lower() != expected_batch:
         raise ValueError(f"footer batch {footer.group(1)} != expected "
                          f"{expected_batch}")
+    # BATCH is a reserved line-leading token: any BATCH-shaped line that is
+    # not the ONE valid footer — a malformed footer, a second footer, a
+    # wrong-id footer with bogus counts — rejects the whole response.
+    # Ordinary commentary that merely mentions BATCH mid-line stays
+    # tolerated (editor finding F-6, round-4 review).
+    for l in lines:
+        if l.upper().startswith("BATCH") and l != footer_line:
+            raise ValueError(f"malformed or extra BATCH line: {l[:80]}")
     verdicts = {}
     for l in lines:
         if not l.upper().startswith("VERDICT"):
@@ -581,6 +645,11 @@ def _dispatch(host):
                           f" (last: {cd['last_failure_reason']})", batch)
 
     batch_dir = REVIEWS / f"batch-{batch}"
+    ledger_fault = attempts_ledger_usable()
+    if ledger_fault:
+        # fail-closed admission: no provable retry bound, no paid call
+        return _hold_exit("hold:retry-ledger-unavailable", ledger_fault,
+                          batch)
     try:
         digest = stage_snapshot(batch_dir, entries)
     except OSError as e:

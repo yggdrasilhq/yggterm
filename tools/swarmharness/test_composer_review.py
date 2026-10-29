@@ -171,6 +171,19 @@ elif mode == "post-footer-prose":
     print(f"BATCH {batch} reviewed={len(ids)} accepts=0 rebut=0 "
           f"defers={len(ids)}")
     print("Summary: every proposal deferred pending a second lineage.")
+elif mode == "extra-footer-malformed":
+    for l in verdicts(ids):
+        print(l)
+    print(f"BATCH {batch} reviewed={len(ids)} accepts=0 rebut=0 "
+          f"defers={len(ids)}")
+    print("BATCH malformed")
+elif mode == "extra-footer-wrong-bogus":
+    for l in verdicts(ids):
+        print(l)
+    print(f"BATCH {batch} reviewed={len(ids)} accepts=0 rebut=0 "
+          f"defers={len(ids)}")
+    print("BATCH cccccccccccccccc reviewed=bogus accepts=0 rebut=0 "
+          "defers=1")
 else:
     print(f"fake transport: unknown mode {mode}", file=sys.stderr)
     sys.exit(1)
@@ -812,6 +825,116 @@ def main():
               brief[-300:])
     finally:
         sb.cleanup()
+
+    # ---- R34 literal duplicate JSON keys -> typed hold (F-5) ----
+    sb = Sandbox()
+    try:
+        fake = sb.install_fake()
+        try:
+            cr._no_duplicate_keys([("evidence", "first"),
+                                   ("evidence", "second")])
+            raised = False
+        except ValueError as e:
+            raised = "duplicate JSON key" in str(e)
+        check("R34a duplicate-key hook refuses any repeated key",
+              raised, "expected ValueError naming the duplicate key")
+        sb.outbox_write([a])
+        r0 = sb.run_review(COMPOSER_REVIEW_BIN=fake, COMPOSER_FAKE_MODE="valid")
+        good_marker = sb.marker()
+        sb.outbox_write('{"kind": "claim_proposal", "evidence": "first '
+                        'evidence", "evidence": "second evidence"}\n')
+        r = sb.run_review(COMPOSER_REVIEW_BIN=fake, COMPOSER_FAKE_MODE="valid")
+        holds = sb.holds()
+        check("R34 literal duplicate keys -> typed hold before identity, "
+              "marker preserved, no silent field drop",
+              r.returncode == 2 and "hold:outbox-malformed" in r.stdout
+              and "duplicate-key" in r.stdout
+              and sb.marker() == good_marker
+              and not (sb.count).exists()
+              and any("duplicate" in h.get("detail", "") for h in holds)
+              and "Traceback" not in r.stderr,
+              r.stdout.strip()[:200] + r.stderr[-120:])
+    finally:
+        sb.cleanup()
+
+    # ---- R35 reserved BATCH token: malformed/extra footers rejected (F-6) --
+    for mode, label in (
+            ("extra-footer-malformed", "malformed footer after valid one"),
+            ("extra-footer-wrong-bogus",
+             "wrong-id footer with bogus counts after valid one")):
+        sb = Sandbox()
+        try:
+            fake = sb.install_fake()
+            sb.outbox_write([a])
+            r = sb.run_review(COMPOSER_REVIEW_BIN=fake,
+                              COMPOSER_FAKE_MODE=mode)
+            check(f"R35 {label} -> rejected, no marker",
+                  r.returncode == 2 and "review-rejected" in r.stdout
+                  and sb.marker() is None,
+                  r.stdout.strip()[:200] + r.stderr[-120:])
+        finally:
+            sb.cleanup()
+    sb = Sandbox()
+    try:
+        fake = sb.install_fake()
+        sb.outbox_write([a])
+        r = sb.run_review(COMPOSER_REVIEW_BIN=fake,
+                          COMPOSER_FAKE_MODE="post-footer-prose")
+        check("R35b commentary mentioning BATCH mid-line stays tolerated",
+              r.returncode == 0 and sb.marker() is not None
+              and sb.marker().get("status") == "advisory-ok",
+              r.stdout.strip()[:200] + r.stderr[-120:])
+    finally:
+        sb.cleanup()
+
+    # ---- R36 broken retry ledger blocks dispatch before any paid call (F-7) --
+    sb = Sandbox()
+    try:
+        fake = sb.install_fake()
+        sb.outbox_write([a])
+        (sb.state / "review-attempts.json").mkdir()  # ledger unreadable
+        statuses = []
+        for _ in range(5):
+            r = sb.run_review(COMPOSER_REVIEW_BIN=fake,
+                              COMPOSER_FAKE_MODE="valid",
+                              COMPOSER_FAKE_COUNT=str(sb.count))
+            statuses.append(r.stdout.strip())
+        invocations = len((sb.count).read_text().splitlines()) \
+            if sb.count.exists() else 0
+        check("R36 unreadable/unwritable ledger -> fail-closed hold, "
+              "zero transport invocations despite persistent write fault",
+              invocations == 0
+              and all("hold:retry-ledger-unavailable" in s
+                      for s in statuses)
+              and "Traceback" not in r.stderr,
+              f"invocations={invocations} statuses={statuses[:2]}")
+    finally:
+        sb.cleanup()
+
+    # ---- R37 non-list evidence shown, never a crash (F-8) ----
+    for ev_val, needle in ((7, "[0] 7"),
+                           ("singular invented note", "singular invented")):
+        sb = Sandbox()
+        try:
+            fake = sb.install_fake()
+            a_ev = dict(a, evidence=ev_val)
+            sb.outbox_write([a_ev])
+            r = sb.run_review(COMPOSER_REVIEW_BIN=fake,
+                              COMPOSER_FAKE_MODE="valid")
+            batch = sb.marker()["batch"] if sb.marker() else None
+            brief = ""
+            if batch:
+                brief = (sb.state / "reviews" / f"batch-{batch}"
+                         / "brief.md").read_text(encoding="utf-8")
+            check(f"R37 evidence={ev_val!r} -> brief shows it as one row, "
+                  "advisory-ok, no TypeError",
+                  r.returncode == 0 and sb.marker() is not None
+                  and sb.marker().get("status") == "advisory-ok"
+                  and needle in brief
+                  and "Traceback" not in r.stderr,
+                  r.stdout.strip()[:200] + r.stderr[-120:])
+        finally:
+            sb.cleanup()
 
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
     if FAIL:
