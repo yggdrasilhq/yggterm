@@ -7,6 +7,14 @@ No kernel logic lives here — this file only wires manifest -> tick().
 """
 import json
 import sys
+
+# Timer logs and review diagnostics use UTF-8 independently of the service's
+# locale. Even a review failure must remain visible under ASCII Python I/O.
+for stream in (sys.stdout, sys.stderr):
+    try:
+        stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
 import time
 from pathlib import Path
 

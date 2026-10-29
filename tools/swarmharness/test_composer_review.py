@@ -62,6 +62,10 @@ only a truthful brief can ever satisfy the contract. Mode via env."""
 import json, os, re, sys, time
 from pathlib import Path
 
+# This fixture models a UTF-8 emitting CLI even when its parent deliberately
+# forces ASCII I/O. The wrapper's UTF-8 decoder is the subject of R25.
+sys.stdout.reconfigure(encoding="utf-8")
+
 mode = os.environ.get("COMPOSER_FAKE_MODE", "valid")
 if os.environ.get("COMPOSER_FAKE_COUNT"):
     with open(os.environ["COMPOSER_FAKE_COUNT"], "a") as f:
@@ -933,6 +937,78 @@ def main():
                   and needle in brief
                   and "Traceback" not in r.stderr,
                   r.stdout.strip()[:200] + r.stderr[-120:])
+        finally:
+            sb.cleanup()
+
+    # ---- R38 stale then stable retry must remain usable (F-9) ----
+    sb = Sandbox()
+    try:
+        fake = sb.install_fake()
+        sb.outbox_write([a])
+        first = sb.run_review(COMPOSER_REVIEW_BIN=fake,
+                              COMPOSER_FAKE_MODE="stale",
+                              COMPOSER_FAKE_COUNT=str(sb.count))
+        ledger = sb.state / "review-attempts.json"
+        valid_between = (not ledger.exists()
+                         or isinstance(json.loads(ledger.read_text()), dict))
+        second = sb.run_review(COMPOSER_REVIEW_BIN=fake,
+                               COMPOSER_FAKE_MODE="valid",
+                               COMPOSER_FAKE_COUNT=str(sb.count))
+        check("R38 stale basis then stable retry succeeds without manual reset",
+              "stale-basis" in first.stdout and valid_between
+              and second.returncode == 0 and sb.marker() is not None
+              and len(sb.count.read_text().splitlines()) == 2,
+              first.stdout.strip() + second.stdout.strip())
+    finally:
+        sb.cleanup()
+
+    # ---- R39 a pre-invocation staging failure is retryable (F-9) ----
+    sb = Sandbox()
+    try:
+        fake = sb.install_fake()
+        sb.outbox_write([a])
+        reviews = sb.state / "reviews"
+        reviews.write_text("invented blocked directory")
+        first = sb.run_review(COMPOSER_REVIEW_BIN=fake,
+                              COMPOSER_FAKE_MODE="valid",
+                              COMPOSER_FAKE_COUNT=str(sb.count))
+        no_call = not sb.count.exists()
+        reviews.unlink()
+        second = sb.run_review(COMPOSER_REVIEW_BIN=fake,
+                               COMPOSER_FAKE_MODE="valid",
+                               COMPOSER_FAKE_COUNT=str(sb.count))
+        check("R39 staging fault then repaired storage permits healthy retry",
+              "hold:storage-failure" in first.stdout and no_call
+              and second.returncode == 0 and sb.marker() is not None
+              and len(sb.count.read_text().splitlines()) == 1,
+              first.stdout.strip() + second.stdout.strip())
+    finally:
+        sb.cleanup()
+
+    # ---- R40 invalid retry metadata holds before cooldown or transport ----
+    for bad in ([], {"consecutive_failures": "invalid"},
+                {"consecutive_failures": True},
+                {"consecutive_failures": -1},
+                {"consecutive_failures": 3, "last_failure_epoch": float("nan")},
+                {"consecutive_failures": 3},
+                {"last_failure_reason": []}):
+        sb = Sandbox()
+        try:
+            fake = sb.install_fake()
+            sb.outbox_write([a])
+            ledger = sb.state / "review-attempts.json"
+            original = json.dumps(bad)
+            ledger.write_text(original)
+            result = sb.run_review(COMPOSER_REVIEW_BIN=fake,
+                                   COMPOSER_FAKE_MODE="valid",
+                                   COMPOSER_FAKE_COUNT=str(sb.count))
+            check(f"R40 malformed retry metadata {bad!r} remains typed debt",
+                  result.returncode == 2 and not sb.count.exists()
+                  and "hold:retry-ledger-unavailable" in result.stdout
+                  and "Traceback" not in result.stderr
+                  and sb.holds()[-1]["status"] == "hold:retry-ledger-unavailable"
+                  and ledger.read_text() == original,
+                  result.stdout.strip() + result.stderr[-100:])
         finally:
             sb.cleanup()
 

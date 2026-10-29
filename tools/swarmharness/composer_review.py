@@ -50,10 +50,12 @@ All paths $HOME-relative: runs on any host with a composer install.
 import fcntl
 import hashlib
 import json
+import math
 import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
 import unicodedata
 from pathlib import Path
@@ -263,9 +265,24 @@ def record_hold(status, detail, batch=None):
 
 def load_attempts():
     try:
-        return json.loads(ATTEMPTS.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+        raw = ATTEMPTS.read_text(encoding="utf-8")
+    except FileNotFoundError:
         return {}
+    data = json.loads(raw)
+    if not isinstance(data, dict):
+        raise ValueError("retry ledger must be an object")
+    count = data.get("consecutive_failures", 0)
+    if type(count) is not int or count < 0:
+        raise ValueError("retry failure count must be a nonnegative integer")
+    epoch = data.get("last_failure_epoch")
+    if epoch is not None or count:
+        if (type(epoch) not in (int, float) or not math.isfinite(epoch)
+                or epoch < 0):
+            raise ValueError("retry failure epoch must be finite and nonnegative")
+    for key in ("last_failure_at", "last_failure_reason", "last_batch"):
+        if key in data and not isinstance(data[key], str):
+            raise ValueError(f"retry {key} must be text")
+    return data
 
 
 def record_failure(reason, batch=None):
@@ -275,7 +292,12 @@ def record_failure(reason, batch=None):
     can run unaccounted per ledger-breakage event (the gate blocks every
     subsequent dispatch until the ledger is repaired), so cooldown can
     never be silently defeated (editor finding F-7, round-4 review)."""
-    a = load_attempts()
+    try:
+        a = load_attempts()
+    except (OSError, UnicodeError, ValueError):
+        # Preserve corrupt or unavailable history. The next admission holds;
+        # never erase a broken retry bound by treating it as zero failures.
+        return None
     a["consecutive_failures"] = int(a.get("consecutive_failures", 0)) + 1
     a["last_failure_at"] = _now()
     a["last_failure_epoch"] = time.time()
@@ -295,15 +317,24 @@ def attempts_ledger_usable():
     retry accounting is unprovable: load_attempts would report an empty
     history and cooldown would never engage. Returns None when usable,
     else the typed fault string."""
-    if ATTEMPTS.exists():
-        try:
-            json.loads(ATTEMPTS.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, ValueError) as e:
-            return f"retry ledger unreadable: {str(e)[:120]}"
     try:
-        with ATTEMPTS.open("a", encoding="utf-8"):
-            pass
-    except OSError as e:
+        load_attempts()
+    except (OSError, UnicodeError, ValueError) as e:
+        return f"retry ledger invalid or unreadable: {str(e)[:120]}"
+    try:
+        if ATTEMPTS.exists():
+            with ATTEMPTS.open("a", encoding="utf-8"):
+                pass
+        else:
+            # An absent ledger means no failures. Probe writability in a
+            # separate file: stale-basis and staging holds must not leave an
+            # empty, invalid JSON ledger that prevents the next healthy retry.
+            with tempfile.NamedTemporaryFile(
+                    dir=ATTEMPTS.parent, prefix=".retry-probe-") as probe:
+                probe.write(b"{}\n")
+                probe.flush()
+                os.fsync(probe.fileno())
+    except (OSError, UnicodeError) as e:
         return f"retry ledger unwritable: {str(e)[:120]}"
     return None
 
@@ -637,7 +668,14 @@ def _dispatch(host):
         _emit({"review": "noop", "why": "already-reviewed", "batch": batch})
         return 0
 
-    cd = cooldown_active()
+    ledger_fault = attempts_ledger_usable()
+    if ledger_fault:
+        return _hold_exit("hold:retry-ledger-unavailable", ledger_fault,
+                          batch)
+    try:
+        cd = cooldown_active()
+    except (OSError, UnicodeError, ValueError) as e:
+        return _hold_exit("hold:retry-ledger-unavailable", str(e)[:200], batch)
     if cd:
         return _hold_exit("hold:cooldown-backoff",
                           f"consecutive review failures {cd['consecutive_failures']};"
@@ -645,11 +683,6 @@ def _dispatch(host):
                           f" (last: {cd['last_failure_reason']})", batch)
 
     batch_dir = REVIEWS / f"batch-{batch}"
-    ledger_fault = attempts_ledger_usable()
-    if ledger_fault:
-        # fail-closed admission: no provable retry bound, no paid call
-        return _hold_exit("hold:retry-ledger-unavailable", ledger_fault,
-                          batch)
     try:
         digest = stage_snapshot(batch_dir, entries)
     except OSError as e:
