@@ -7,6 +7,14 @@ No kernel logic lives here — this file only wires manifest -> tick().
 """
 import json
 import sys
+
+# Timer logs and review diagnostics use UTF-8 independently of the service's
+# locale. Even a review failure must remain visible under ASCII Python I/O.
+for stream in (sys.stdout, sys.stderr):
+    try:
+        stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
 import time
 from pathlib import Path
 
@@ -38,12 +46,23 @@ def main():
     for n in rep.get("notes", [])[:5]:
         print("  note:", n)
     # loop-closure trigger: if the outbox gained new proposals, the
-    # brain-pair review runs automatically (idempotent per batch)
+    # brain-pair review runs automatically (idempotent per batch). Its
+    # failure is review DEBT — reported distinctly, mining stays success.
+    # rc=3 means another dispatch holds the review lock: serialization,
+    # not debt.
+    review_rc = 0
     try:
         import composer_review
-        composer_review.main()  # prints its own noop/review line
-    except Exception as e:  # review failure never breaks the tick
-        print("  review-step skipped:", e)
+        review_rc = composer_review.main()  # prints its own noop/review line
+    except Exception as e:  # a broken review module never breaks mining
+        review_rc = 2
+        print("  review-step error:", e)
+    if review_rc == 3:
+        print("  review-busy: another dispatch holds the review lock — "
+              "serialization working, not debt")
+    elif review_rc:
+        print(f"  review-debt: proposal review did NOT complete "
+              f"(exit {review_rc}) — debt retained, mining unaffected")
     return 0
 
 
