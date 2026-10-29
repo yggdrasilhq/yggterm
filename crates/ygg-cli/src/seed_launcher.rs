@@ -309,8 +309,20 @@ pub fn alias_metadata_from_text(text: &str) -> Result<AliasMetadata, String> {
 /// never falls back into command IR on a broken alias.
 pub fn resolve_alias(exe: &Path) -> Option<Result<PathBuf, String>> {
     let meta_path = alias_metadata_path(exe)?;
-    if std::fs::symlink_metadata(&meta_path).is_err() {
-        return None;
+    match std::fs::symlink_metadata(&meta_path) {
+        Ok(_) => {}
+        // Metadata ABSENT: a plain binary, not an alias — the only
+        // outcome that falls through to the normal surface.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+        // Metadata present but unavailable (permissions, IO): refuse
+        // loudly instead of loading command IR on a broken alias.
+        Err(error) => {
+            return Some(Err(format!(
+                "seed alias metadata {} unavailable: {error}; refusing to \
+                 fall back to command IR on a broken alias",
+                meta_path.display()
+            )));
+        }
     }
     let text = match std::fs::read_to_string(&meta_path) {
         Ok(text) => text,

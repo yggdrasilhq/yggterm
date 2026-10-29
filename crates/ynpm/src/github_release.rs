@@ -269,7 +269,7 @@ function Assert-EntryName([string]$Name) {
   if ($trimmed -match '^[A-Za-z]:') { throw "zip entry '$Name' names a Windows drive path" }
   if ($trimmed.IndexOfAny([System.IO.Path]::GetInvalidPathChars()) -ge 0) { throw "zip entry '$Name' contains control characters" }
   foreach ($ch in $trimmed.ToCharArray()) {
-    if ([int]$ch -lt 0x20 -or [int]$ch -eq 0x7F) { throw "zip entry '$Name' contains control characters" }
+    if ([int]$ch -lt 0x20 -or ([int]$ch -ge 0x7F -and [int]$ch -le 0x9F)) { throw "zip entry '$Name' contains control characters" }
   }
   foreach ($part in $trimmed.Split('/')) {
     if ($part -eq "..") { throw "zip entry '$Name' contains a '..' traversal component" }
@@ -2578,20 +2578,35 @@ mod tests {
     }
 
     #[test]
-    fn a_stemless_bin_name_is_refused_at_validation() {
+    fn a_stemless_bin_name_is_refused_on_windows_scoped_only() {
         let sandbox = Sandbox::new("seed-stemless");
         let (_, digest) = fixture_archive(&sandbox, "seed", "4.0.0", &["ygg"], None);
-        for evil in [".exe", ".EXE"] {
-            let mut doc = manifest_doc(
-                "4.0.0", "v4.0.0", "ygg-seed", "seed", "seed.tar.gz", &digest,
-                serde_json::json!({}),
-            );
-            doc["packages"][0]["artifacts"][0]["bins"] = serde_json::json!([evil]);
-            let error = validate_release_manifest(&doc).unwrap_err();
-            assert!(
-                error.to_string().contains("no program stem"),
-                "{evil:?} was not refused as stemless: {error}"
-            );
+        for (platform, refused) in [("windows-x64", true), ("linux-x64", false)] {
+            for evil in [".exe", ".EXE"] {
+                let mut doc = manifest_doc(
+                    "4.0.0", "v4.0.0", "ygg-seed", "seed", "seed.tar.gz", &digest,
+                    serde_json::json!({}),
+                );
+                doc["packages"][0]["artifacts"][0]["platform"] =
+                    serde_json::json!(platform);
+                doc["packages"][0]["artifacts"][0]["bins"] = serde_json::json!([evil]);
+                let outcome = validate_release_manifest(&doc);
+                if refused {
+                    let error = outcome.unwrap_err();
+                    assert!(
+                        error.to_string().contains("no program stem"),
+                        "{evil:?} on {platform} was not refused as stemless: {error}"
+                    );
+                } else {
+                    // Unix manifests keep accepting the names they always
+                    // accepted — the guard never reaches unix validation.
+                    assert!(
+                        outcome.is_ok(),
+                        "{evil:?} on {platform} was newly refused: {:?}",
+                        outcome.unwrap_err()
+                    );
+                }
+            }
         }
     }
 

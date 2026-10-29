@@ -370,6 +370,13 @@ fn validate_release_package(package: &ReleasePackage) -> Result<()> {
         for bin in &artifact.bins {
             safe_artifact_filename(bin)
                 .with_context(|| format!("package {:?} bin name", package.id))?;
+            // The stem guard protects the WINDOWS pointer table (the
+            // launcher keys active.json by bare program stem there, so a
+            // stemless spelling would key an empty program). A unix
+            // manifest keeps accepting every name it always accepted.
+            if !artifact.platform.starts_with("windows") {
+                continue;
+            }
             // A bin is a bare program identity: a stemless spelling
             // (".exe") would key a pointer table with an empty program.
             let stem = bin
