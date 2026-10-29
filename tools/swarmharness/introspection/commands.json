@@ -99,7 +99,34 @@
     {
       "path": [],
       "summary": "Inspect and operate the swarm. Type a noun to learn the next word.",
-      "options": []
+      "options": [],
+      "examples": [
+        {
+          "title": "Scan the build watcher and latest outcome",
+          "command": "ygg ci status",
+          "tags": "human status"
+        },
+        {
+          "title": "Inspect supported auth vaults and unknown health",
+          "command": "ygg auth status --harness all",
+          "tags": "human auth"
+        },
+        {
+          "title": "Find complete failure lookup examples",
+          "command": "ygg help examples --query failure",
+          "tags": "discovery"
+        },
+        {
+          "title": "Install an optional desktop release",
+          "command": "ygg ynpm install https://github.com/yggdrasilhq/yggterm",
+          "tags": "desktop"
+        },
+        {
+          "title": "Read structured auth inventory in a script",
+          "command": "ygg auth status --harness all --json",
+          "tags": "json scripting"
+        }
+      ]
     },
     {
       "path": [
@@ -894,12 +921,12 @@
       "examples": [
         {
           "title": "Inspect supported harness vaults",
-          "command": "ygg auth status --harness all --json",
+          "command": "ygg auth status --harness all",
           "tags": "auth accounts vault"
         },
         {
           "title": "Rotate an eligible Codex profile",
-          "command": "ygg auth rotate --harness codex --fast --json",
+          "command": "ygg auth rotate --harness codex --fast",
           "tags": "auth rotate rate limit"
         }
       ],
@@ -1828,7 +1855,7 @@
       "examples": [
         {
           "title": "See vault state across supported harnesses",
-          "command": "ygg auth status --harness all --json",
+          "command": "ygg auth status --harness all",
           "tags": "auth vault account profile rotation"
         }
       ]
@@ -1849,7 +1876,7 @@
       "examples": [
         {
           "title": "List accounts before selecting a profile",
-          "command": "ygg auth list --harness codex --json",
+          "command": "ygg auth list --harness codex",
           "tags": "auth vault account profile rotation"
         }
       ]
@@ -1870,7 +1897,7 @@
       "examples": [
         {
           "title": "Rotate without a quota measurement request",
-          "command": "ygg auth rotate --harness codex --fast --json",
+          "command": "ygg auth rotate --harness codex --fast",
           "tags": "auth vault account profile rotation"
         }
       ]
@@ -1891,7 +1918,7 @@
       "examples": [
         {
           "title": "Explain the policy behind account selection",
-          "command": "ygg auth policy status --harness codex --json",
+          "command": "ygg auth policy status --harness codex",
           "tags": "auth vault account profile rotation"
         }
       ]
@@ -1933,7 +1960,7 @@
       "examples": [
         {
           "title": "Distinguish switching from native refresh support",
-          "command": "ygg auth harnesses --json",
+          "command": "ygg auth harnesses",
           "tags": "auth vault account profile rotation"
         }
       ]
@@ -1975,7 +2002,7 @@
       "examples": [
         {
           "title": "Check profile lineage and native cache state",
-          "command": "ygg auth doctor --json",
+          "command": "ygg auth doctor",
           "tags": "auth vault account profile rotation"
         }
       ]

@@ -15,6 +15,8 @@ config, subscriptions, builds, or hosts — all state runs under an isolated
 YGGTERM_HOME in ~/.yggterm/scratchpad.
 """
 import argparse
+import contextlib
+import io
 import importlib.util
 import json
 import os
@@ -183,6 +185,22 @@ def main():
             failures.append("future source timestamps must not render as fresh zero-age")
         if "2m ago" not in m._build_line({"at": NOW - 120, "status": "built"}, NOW):
             failures.append("normal timestamp age suffix")
+        for result in [
+            {"status": "push-failed", "pushed": False},
+            {"status": "build-failed", "reset_to": "a" * 40},
+            {"status": "deploy-failed", "pushed": None, "deploy_ok": False},
+        ]:
+            rendered = io.StringIO()
+            with contextlib.redirect_stdout(rendered):
+                m._tick_human_summary("fixture", result)
+            text = rendered.getvalue()
+            if "main was reset" in text or "main reset to" in text:
+                failures.append("tick must not claim an unverified reset completed")
+            if result["status"] == "deploy-failed":
+                if "push disabled" not in text or "fleet state unverified" not in text:
+                    failures.append("failed deploy must retain disabled push and unknown fleet state")
+                if "sha is upstream" in text:
+                    failures.append("disabled push cannot establish upstream landing")
         cases = [(m._age(None), "?"), (m._age(45), "45s"), (m._age(720), "12m"),
                  (m._age(11500), "3.2h"), (m._age(5 * 86400), "5.0d")]
         for got, want in cases:
@@ -347,8 +365,6 @@ def main():
             failures.append(f"disarm-expiry diagnostic lost from stderr:\n{r.stderr[-200:]!r}")
         # F1: the clean early-return carries conflicts as an int count; the
         # tick summary must render it without iterating it.
-        import contextlib
-        import io
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             m._tick_human_summary("yggterm", {"status": "clean", "merged": 0,

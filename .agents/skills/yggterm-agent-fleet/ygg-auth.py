@@ -2204,7 +2204,8 @@ def render_table(status):
     lines = []
     live = status["live"]
     if live:
-        state = "EXPIRED" if live["expired"] else "clock current"
+        state = ("EXPIRED" if live["expired"] else
+                 "clock current" if live.get("expires_at") else "expiry unknown")
         lines.append(f"live: {live['email']} ({live['plan']}) account {live['account_id']} — {state}")
     else:
         lines.append("live: (no auth file — run `login` or `switch`)")
@@ -2219,6 +2220,9 @@ def render_table(status):
                 marks.append(f"cooling {p['cooldown_minutes_left']}m")
             if p["expired"]:
                 marks.append("EXPIRED")
+            elif not p.get("expires_at"):
+                marks.append("expiry unknown")
+            marks.append("health " + ((p.get("auth_health") or {}).get("state") or "unknown"))
             suffix = ("  " + " ".join(marks)) if marks else ""
             lines.append(f"  {p['slug']:<40} {p.get('plan', 'unknown'):<10}{suffix}")
     else:

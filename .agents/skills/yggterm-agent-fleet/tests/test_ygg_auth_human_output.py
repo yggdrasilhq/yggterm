@@ -38,6 +38,22 @@ class HumanOutput(unittest.TestCase):
         machine = self.run_main("cmd_status", result, ["status", "--harness", "all", "--json"])
         self.assertEqual(json.loads(machine), result)
 
+    def test_unknown_expiry_never_claims_clock_current(self):
+        identity = auth.identity_of({"OPENAI_API_KEY": "fixture-noncredential"}, "codex")
+        self.assertFalse(identity.get("expires_at"))
+        text = auth.render_table(dict(STATUS, live=identity))
+        self.assertIn("expiry unknown", text)
+        self.assertNotIn("clock current", text)
+        self.assertIn("native auth health: unknown", text)
+
+    def test_profile_reauthorization_failure_stays_visible(self):
+        profile = {"slug": "example-profile", "plan": "example", "live": False,
+                   "expired": False, "expires_at": None,
+                   "auth_health": {"state": "reauthorization_required"}}
+        text = auth.render_table(dict(STATUS, profiles=[profile]))
+        self.assertIn("health reauthorization_required", text)
+        self.assertIn("expiry unknown", text)
+
     def test_metadata_has_labels_and_preserves_unknown_false_and_zero(self):
         result = {"schema_version": 1, "harness": "example", "policy": {
             "enabled": False, "attempts": 0, "quota": None, "routes": []}}

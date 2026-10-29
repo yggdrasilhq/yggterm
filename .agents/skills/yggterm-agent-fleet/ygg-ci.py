@@ -1905,7 +1905,7 @@ def _tick_human_summary(project, r):
         if lanes:
             print(f"  quarantined: {', '.join(lanes)} (fresh TTL — the next tick builds the rest)")
         if r.get("reset_to"):
-            print(f"  main reset to {str(r['reset_to'])[:12]} — nothing broken landed")
+            print(f"  reset target {str(r['reset_to'])[:12]} — inspect events and current main for the reset result")
         print("  next: ygg ci why — triage the failing lanes")
         return
     lanes = r.get("lanes") or []
@@ -1926,14 +1926,14 @@ def _tick_human_summary(project, r):
     if pushed is True:
         print(f"  pushed to {r.get('upstream') or 'upstream'}")
     elif pushed is False:
-        print("  ⛔ push FAILED — main was reset to the pre-tick state; the lanes stay subscribed")
-    elif pushed is None and st in ("built", "deployed"):
+        print("  ⛔ push FAILED — inspect current main and events for the reset result")
+    elif "pushed" in r and pushed is None:
         print("  push disabled for this project (tune --push true to enable)")
     dep = r.get("deploy_ok")
     if dep is True:
-        print("  deployed")
+        print("  deploy recipe passed — verify target state")
     elif dep is False:
-        print("  ⛔ deploy FAILED — the sha is upstream but not on the fleet")
+        print("  ⛔ deploy FAILED — fleet state unverified; inspect the deployment log")
     if st == "clean":
         print(f"  nothing new to integrate (merged {r.get('merged', 0)}, "
               f"conflicts {r.get('conflicts', 0)})")
