@@ -464,7 +464,15 @@ pub fn load() -> Result<Loaded, LoadError> {
             })?;
             return finish(raw, ContractSource::File(path));
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if std::env::var_os("YGG_BIN_DIR").is_none()
+                    && std::env::current_exe().ok().and_then(|exe| packaged_payload_dir(&exe)) == Some(dir.clone()) {
+                    return Err(LoadError::Refused(format!(
+                        "selected seed payload {} is missing its command contract; repair this generation",
+                        dir.display()
+                    )));
+                }
+            }
             Err(error) => return Err(LoadError::Refused(format!(
                 "installed command contract at {} is unreadable ({error}); repair the selected generation",
                 path.display()
@@ -508,17 +516,32 @@ pub(crate) fn finish(raw: String, source: ContractSource) -> Result<Loaded, Load
     })
 }
 
-/// The dispersed payload directory: `$YGG_BIN_DIR` or `~/.yggterm/bin/ygg`.
+/// Prefer the immutable payload beside the running seed generation, never
+/// a different host checkout or the previous dispersed installation.
+fn packaged_payload_dir(executable: &Path) -> Option<PathBuf> {
+    let bin = executable.parent()?;
+    if bin.file_name()?.to_str()? != "bin" {
+        return None;
+    }
+    let generation = bin.parent()?;
+    let payload = generation.join("share/ygg");
+    (payload.exists() || generation.join("seed-manifest.json").is_file()).then_some(payload)
+}
+
+/// Explicit payload override, immutable seed payload, then compatibility home.
 pub fn payload_dir() -> Option<PathBuf> {
     if let Ok(dir) = std::env::var("YGG_BIN_DIR") {
         if !dir.trim().is_empty() {
             return Some(PathBuf::from(dir));
         }
     }
-    std::env::var("HOME")
-        .ok()
-        .filter(|h| !h.trim().is_empty())
-        .map(|h| Path::new(&h).join(".yggterm/bin/ygg"))
+    if let Some(payload) = std::env::current_exe().ok().and_then(|exe| packaged_payload_dir(&exe)) {
+        return Some(payload);
+    }
+    ["HOME", "USERPROFILE"].into_iter().find_map(|name| {
+        std::env::var(name).ok().filter(|home| !home.trim().is_empty())
+            .map(|home| Path::new(&home).join(".yggterm/bin/ygg"))
+    })
 }
 
 /// The installed generation's declared layout under the payload root:
@@ -534,6 +557,20 @@ pub fn kernel_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn seed_payload_is_resolved_beside_the_running_generation() {
+        let root = std::env::temp_dir().join(format!("seed-payload-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("share/ygg")).unwrap();
+        assert_eq!(packaged_payload_dir(&root.join("bin/ygg.exe")), Some(root.join("share/ygg")));
+        std::fs::remove_dir_all(root.join("share")).unwrap();
+        std::fs::write(root.join("seed-manifest.json"), "{}").unwrap();
+        assert_eq!(packaged_payload_dir(&root.join("bin/ygg")), Some(root.join("share/ygg")));
+        std::fs::remove_file(root.join("seed-manifest.json")).unwrap();
+        assert!(packaged_payload_dir(&root.join("bin/ygg")).is_none());
+        let _ = std::fs::remove_dir_all(root);
+    }
 
     #[test]
     fn embedded_contract_validates_and_builds_a_parent_complete_tree() {
