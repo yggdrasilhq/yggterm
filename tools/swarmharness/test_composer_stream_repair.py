@@ -805,6 +805,68 @@ def t_csr03_crash_gap_reconciled():
         shutil.rmtree(d)
 
 
+def t_csr03_reset_invalidates_checkpoint():
+    """CSR-03 EDITOR-02 (round-2 editor finding): a frontier checkpoint
+    is valid only while its anchored prefix remains valid. Gap capture
+    happens BEFORE rotation verification, so a prefix mutation detected
+    after capture must invalidate the checkpoint — a stale checkpoint
+    surviving the reset would manufacture recurrence observations from
+    discarded-prefix context (the editor's falsifier geometry)."""
+    w = fresh("csr03rst")
+    rec = ("x" * 63 + "\n").encode()
+    cmd = ("$ retry-cmd".ljust(63) + "\n").encode()
+    err = ("NameError: name 'widget' is not defined".ljust(63)
+           + "\n").encode()
+    state = w / "st"
+    src = w / "b.jsonl"
+
+    def write(prefix_cmd=True):
+        recs = [rec] * (196608 // 64)
+        if prefix_cmd:
+            recs[65408 // 64] = cmd
+            recs[65472 // 64] = err
+        recs[131072 // 64] = cmd                # recurrence in the gap
+        src.write_bytes(b"".join(recs))
+
+    write(prefix_cmd=True)
+    cp.tick({"board": [str(src)]}, state_dir=state,
+            max_bytes_per_source=65536, max_pages=1)   # anchor + checkpoint
+    with patch.object(cp, "_save_anchors",
+                      side_effect=OSError("injected anchor write crash")):
+        try:
+            cp.tick({"board": [str(src)]}, state_dir=state,
+                    max_bytes_per_source=65536, max_pages=1)
+        except OSError:
+            pass
+    # replace the anchored prefix (same size) BEFORE recovery: the
+    # command/error pair is gone, only the gap command remains
+    write(prefix_cmd=False)
+    repc = cp.tick({"board": [str(src)]}, state_dir=state,
+                   max_bytes_per_source=65536, max_pages=1)
+    reset_notes_r = reset_notes(repc)
+    for _ in range(10):
+        cp.tick({"board": [str(src)]}, state_dir=state,
+                max_bytes_per_source=65536, max_pages=1)
+    rows = cp.load_observations(state)
+    loops = [o for o in rows if o["detector_id"] == "cmd-failure-loop"]
+    sigs = [o for o in rows if o["detector_id"] == "sig-nameerror-typo"]
+    check("C3-8 a reset after gap capture invalidates the checkpoint: "
+          "the replaced prefix's mutation is announced FRESH and no "
+          "recurrence evidence from the discarded prefix survives "
+          "(no fabricated loop; at most the ORIGINAL pre-crash "
+          "signature row is retained as history — never re-derived, "
+          "since the replacement bytes contain no error line)",
+          any("mutated" in n.lower() or "re-scanning" in n
+              for n in reset_notes_r)
+          and len(loops) == 0
+          and all(o["span"] == "bytes@65472" for o in sigs)
+          and len(sigs) <= 1,
+          json.dumps({"notes": [n[:80] for n in reset_notes_r],
+                      "loops": len(loops),
+                      "sig_spans": [o["span"] for o in sigs]})[:300])
+    shutil.rmtree(w)
+
+
 def t_csr10_control_strength():
     """CSR-10: the long-prefix same-size control must FAIL a wrong-
     rotation implementation. Proof by construction: under the historical
@@ -869,6 +931,7 @@ def main():
     t_a5_static_controls()
     t_csr02_fair_scheduling()
     t_csr03_crash_gap_reconciled()
+    t_csr03_reset_invalidates_checkpoint()
     t_csr10_control_strength()
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
     if FAIL:

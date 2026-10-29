@@ -1357,9 +1357,18 @@ def tick(sources, state_dir=None, max_bytes_per_source=262144,
 
             def _reset(note):
                 nonlocal cur, fresh, anchor, anchors_dirty, reset_occurred
+                nonlocal gap_reconciled, gap_checkpoint
                 report["notes"].append(note)
                 cur, fresh = 0, True
                 reset_occurred = True
+                # a reset invalidates EVERYTHING anchored: the captured
+                # gap checkpoint belonged to the discarded prefix and
+                # must never combine with replacement bytes (CSR-03
+                # EDITOR-02 — a stale checkpoint surviving the reset
+                # manufactured recurrence observations from evidence
+                # that was just proven invalid)
+                gap_reconciled = False
+                gap_checkpoint = None
                 if key in anchors:
                     anchors.pop(key)
                     anchors_dirty = True
