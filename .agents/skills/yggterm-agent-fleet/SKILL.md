@@ -48,6 +48,16 @@ agents are testing (see §3c).
 
 ---
 
+### Repository publication and completion
+
+Unless an explicit instruction overrides it, operator-owned repositories finish
+through review, normal CI integration, a pushed default branch and verification
+of its remote ref. External contributions finish with an upstream pull request.
+A pushed lane alone is intermediate work. Reclaim completed local and remote
+lanes only after integrated-content, clean-worktree, process/session/lease/pin
+and evidence-preservation checks. See `docs/repository-completion.md`; unknown
+ownership or cleanup visibility is retained and reported, never guessed.
+
 ### Local swarm CLI discovery
 
 `ygg`, `ygg dream`, `ygg service`, `ygg schedule` and `ygg swarm` show local
