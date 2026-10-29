@@ -49,20 +49,37 @@ ygg ynpm install https://github.com/yggdrasilhq/yggterm
   that disagrees with the requested release refuses the transaction.
 - **Staged before activation.** A generation is built under
   `~/.yggterm/seed/generations/<version>-<digest12>` and only then does the
-  `current` symlink flip atomically. A failure leaves the previous
-  generation in charge.
+  launch pointer move. A failure leaves the previous generation in charge.
 - **One launch pointer.** Native ynpm is the only writer of
   `~/.yggterm/seed/active.json` (schema 1: generation name plus exact bin
-  sha256 digests), published whole by temp+rename. The bootstrap launchers
-  (`ygg --seed-launch`, mirrors under `launchers/`) read that pointer,
-  enforce the hash gate and refuse self-recursion, and resolve BEFORE any
-  installed command IR — an older launcher forwards to a newer generation
-  it has never seen. See `crates/ygg-cli/src/seed_launcher.rs`.
+  sha256 digests, keyed by BARE program names), published whole by
+  temp+rename. Unix additionally keeps the `current` symlink for
+  compatibility; on Windows active.json is THE pointer — no junction, no
+  `current`, no symlink capability required. The bootstrap launchers
+  (`ygg --seed-launch`) read that pointer, enforce the hash gate and
+  refuse self-recursion, and resolve BEFORE any installed command IR — an
+  older launcher forwards to a newer generation it has never seen. See
+  `crates/ygg-cli/src/seed_launcher.rs`.
+- **Windows alias frontends.** The PATH commands under
+  `%LOCALAPPDATA%\ygg\bin` are stable launcher copies written ONCE with an
+  immutable `.seed-alias` metadata file beside each (schema, program, seed
+  root, and the sha256 of the seed-root marker the activation publishes).
+  Each alias re-verifies the marker and the pointer before forwarding, so
+  a moved or replaced seed root refuses instead of launching a foreign
+  tree, and an upgrade never rewrites a running alias — it flips
+  active.json only.
 - **Rollback.** Previous generations are never deleted; re-activate the
   previous seed archive (or `ynpm rollback`) to go back.
 - **Windows running binaries.** Publication copies are staged and swapped;
   a locked, running `ygg.exe` fails the copy loudly and the activated
-  generation is never touched — close the process and rerun.
+  generation is never touched — close the process and rerun. The seed
+  aliases themselves are immutable: an upgrade flips the pointer and never
+  rewrites a running alias.
+- **Windows desktop releases ship flat-exe bins** (declared `bins`, no
+  bundle directory): bundle publication needs symlinks, so a
+  bundle-carrying desktop artifact stays declared in the schema and
+  honestly unshipped on Windows, while a flat-exe desktop package installs
+  through the same native generation path as the seed.
 - **GUI and worker safety.** The seed never touches a 3.x direct/GUI
   install root, never runs `install integrate`, never starts a daemon, and
   never alters protected workers or native config under `~/.yggterm`.
@@ -70,11 +87,14 @@ ygg ynpm install https://github.com/yggdrasilhq/yggterm
 ## PATH ownership
 
 The seed owns exactly three links: `~/.local/bin/{ygg,ynpm,ynpx}` on Unix
-(`%LOCALAPPDATA%\ygg\bin` on Windows, added to the user PATH). If a
-non-seed `ygg` command already exists — for example a dispersed native
-tree — the installer leaves it in place and says so; takeover requires the
-explicit `YGG_MIGRATE_NATIVE=1` (Unix) rerun. Dispersal tooling must not
-overwrite the seed's links either: one owner per link.
+(`%LOCALAPPDATA%\ygg\bin` on Windows, added to the user PATH). Unix links
+are symlinks through `current`; Windows commands are stable alias
+frontends (launcher copy + `.seed-alias` metadata) that forward through
+active.json. If a non-seed `ygg` command already exists — for example a
+dispersed native tree — the installer leaves it in place and says so;
+takeover requires the explicit `YGG_MIGRATE_NATIVE=1` rerun (both
+platforms). Dispersal tooling must not overwrite the seed's links either:
+one owner per link.
 
 ## Remote operator vs local worker readiness
 
@@ -88,7 +108,10 @@ so (`worker_readiness: not implied by seed installation`).
 ## Release artifacts
 
 - `ygg-seed-<label>.tar.gz` / `.zip` — the seed archive (bins at the
-  archive root: `ygg`, `ynpm`, `ynpx`; payload under `share/ygg/`).
+  archive root: `ygg`, `ynpm`, `ynpx` on unix; `ygg.exe`, `ynpm.exe`,
+  `ynpx.exe` on Windows; payload under `share/ygg/`). The release
+  manifest's `bins` table declares the BARE names on every platform; the
+  launcher resolves the Windows `.exe` file names itself.
 - `ygg-seed-<label>.tar.gz.sha256` — mandatory digest sidecar.
 - `release-manifest.json` — the schema-1 manifest `ynpm seed-activate`
   trusts; the `ygg-seed` package (`role: "seed"`) is kept separate from the
