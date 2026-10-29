@@ -29,8 +29,12 @@ PLATFORMS = {
     "windows-aarch64": "windows-arm64",
 }
 
-SEED_BINS_UNIX = ["ygg", "ynpm", "ynpx"]
-SEED_BINS_WINDOWS = ["ygg.exe", "ynpm.exe", "ynpx.exe"]
+# Bin names are BARE program names on every platform: the seed launcher
+# keys the active.json pointer by bare name and resolves the `.exe`
+# suffix itself on Windows. The Windows ARCHIVE still carries
+# `ygg.exe`/`ynpm.exe`/`ynpx.exe` files (package-ygg-seed.py stages them
+# with the suffix); only the declared bins table is bare.
+SEED_BINS = ["ygg", "ynpm", "ynpx"]
 
 
 def release_version() -> str:
@@ -78,7 +82,7 @@ def seed_artifacts(dist: Path) -> list[dict]:
             "format": "zip" if windows else "tar.gz",
             "filename": archive.name,
             "sha256": actual,
-            "bins": SEED_BINS_WINDOWS if windows else SEED_BINS_UNIX,
+            "bins": SEED_BINS,
         })
     return artifacts
 

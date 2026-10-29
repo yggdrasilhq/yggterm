@@ -45,6 +45,20 @@ fn run(mut argv: Vec<String>) -> Result<u32, String> {
         return seed_launcher::launch(&argv[1..]);
     }
 
+    // A stable Windows alias frontend — a launcher copy with an immutable
+    // `.seed-alias` metadata file beside it — forwards to its recorded seed
+    // program under the SAME bootstrap guarantee: pointer, root marker and
+    // hash gate first, command IR never. Windows-only; unix installs carry
+    // no seed-alias files, so unix behavior is untouched.
+    #[cfg(windows)]
+    if let Ok(exe) = std::env::current_exe() {
+        match seed_launcher::resolve_alias(&exe) {
+            Some(Ok(target)) => return seed_launcher::forward_program(&target, &argv),
+            Some(Err(message)) => return Err(message),
+            None => {}
+        }
+    }
+
     let loaded = ir::load().map_err(|e| format!("{e}"))?;
 
     if argv.first().map(|s| s.as_str()) == Some("--version") {

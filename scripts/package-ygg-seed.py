@@ -51,15 +51,15 @@ def copy_source(path: Path, target: Path) -> None:
 
 
 def version_gate(path: Path, expected: str) -> None:
-    p = subprocess.run([str(path), "--version"], capture_output=True,
-                       text=True, timeout=20, check=True)
-    answer = p.stdout.strip()
-    exact = answer in (expected, f"ygg {expected}", f"ynpm {expected}", f"ynpx {expected}")
-    lines = answer.splitlines()
-    native_frontend = (path.stem == "ygg" and len(lines) == 2
-                       and lines[0] == "ygg command contract 1 (swarm introspection)"
-                       and lines[1].split()[:3] == ["ygg", "frontend", expected])
-    if not exact and not native_frontend:
+    args = [str(path), "version", "--json"] if path.stem == "ygg" else [str(path), "--version"]
+    result = subprocess.run(args, capture_output=True, text=True, timeout=20, check=True)
+    answer = result.stdout.strip()
+    if path.stem == "ygg":
+        doc = json.loads(answer)
+        frontend = doc.get("frontend", {})
+        if doc.get("schema_version") != 1 or frontend.get("name") != "ygg" or frontend.get("version") != expected:
+            raise ValueError(f"unexpected native frontend version from {path.name}: {answer!r}")
+    elif answer not in (expected, f"ynpm {expected}", f"ynpx {expected}"):
         raise ValueError(f"unexpected component version from {path.name}: {answer!r}")
 
 

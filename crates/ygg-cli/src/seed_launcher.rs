@@ -11,7 +11,12 @@
 //! bytes are gated by their recorded sha256; a target that is this very
 //! process's executable is refused instead of recursing. Unix additionally
 //! keeps the `<seed-root>/current` symlink for compatibility; the launcher
-//! reader contract is the active.json pointer on every platform.
+//! reader contract is the active.json pointer on every platform. A stable
+//! Windows alias frontend (a launcher copy plus an immutable
+//! `.seed-alias` metadata file beside it) resolves through this same
+//! contract — pointer, recorded seed-root marker digest, hash gate —
+//! BEFORE any IR, so an alias binary from an older generation keeps
+//! forwarding to whatever active.json names now.
 
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
@@ -197,7 +202,7 @@ pub fn launch(argv: &[String]) -> Result<u32, String> {
 
 /// Exit status and signal discipline travel to the forwarded program: unix
 /// replaces this process; windows spawns and mirrors the exit code.
-fn forward_program(target: &Path, forward: &[String]) -> Result<u32, String> {
+pub(crate) fn forward_program(target: &Path, forward: &[String]) -> Result<u32, String> {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -212,6 +217,147 @@ fn forward_program(target: &Path, forward: &[String]) -> Result<u32, String> {
             .map_err(|e| format!("spawning {} failed: {e}", target.display()))?;
         Ok(status.code().unwrap_or(1) as u32)
     }
+}
+
+// ===== stable alias frontends =====
+// A stable Windows alias (`%LOCALAPPDATA%\ygg\bin\ygg.exe`) is a COPY of a
+// launcher binary plus an immutable `.seed-alias` metadata file beside it.
+// The metadata names the program and the seed root and records the seed
+// root marker's sha256 at install time; the alias re-verifies that marker
+// and resolves its target through the SAME active.json pointer, exact hash
+// gate and self-recursion refusal as `--seed-launch`. The alias therefore
+// forwards BEFORE any command IR loads: an alias binary from an older
+// generation keeps forwarding to whatever generation active.json names,
+// and the installer never rewrites a running alias. The mechanism is
+// windows-only (`seed-alias` files do not exist on unix installs), so unix
+// behavior is untouched.
+
+/// The alias metadata document: schema 1, written once next to the alias
+/// copy, never rewritten by the launcher.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AliasMetadata {
+    pub program: String,
+    pub seed_root: PathBuf,
+    pub root_marker_sha256: String,
+}
+
+fn alias_metadata_path(exe: &Path) -> Option<PathBuf> {
+    if !cfg!(windows) {
+        return None;
+    }
+    let mut name = exe.file_name()?.to_os_string();
+    name.push(".seed-alias");
+    Some(exe.with_file_name(name))
+}
+
+/// Parse and validate alias metadata text: schema 1, a bare program name,
+/// a non-empty seed root, and a 64-hex root-marker digest.
+pub fn alias_metadata_from_text(text: &str) -> Result<AliasMetadata, String> {
+    let doc: serde_json::Value = serde_json::from_str(text)
+        .map_err(|e| format!("seed alias metadata is not valid JSON: {e}"))?;
+    let schema = doc
+        .get("schema")
+        .and_then(|v| v.as_u64())
+        .ok_or("seed alias metadata declares no integer schema")?;
+    if schema != ACTIVE_SCHEMA {
+        return Err(format!(
+            "seed alias metadata schema {schema} unsupported; this launcher speaks schema {ACTIVE_SCHEMA} only"
+        ));
+    }
+    let program = doc
+        .get("program")
+        .and_then(|v| v.as_str())
+        .ok_or("seed alias metadata declares no program")?;
+    if program.is_empty()
+        || program != program.trim()
+        || program.contains('/')
+        || program.contains('\\')
+    {
+        return Err(format!(
+            "seed alias metadata program {program:?} is not a bare program name"
+        ));
+    }
+    let seed_root = doc
+        .get("seed_root")
+        .and_then(|v| v.as_str())
+        .ok_or("seed alias metadata declares no seed_root")?;
+    if seed_root.is_empty() {
+        return Err("seed alias metadata seed_root is empty".into());
+    }
+    let root_marker_sha256 = doc
+        .get("root_marker_sha256")
+        .and_then(|v| v.as_str())
+        .ok_or("seed alias metadata declares no root_marker_sha256")?;
+    if root_marker_sha256.len() != 64
+        || !root_marker_sha256
+            .chars()
+            .all(|c| c.is_ascii_hexdigit())
+    {
+        return Err("seed alias metadata root_marker_sha256 is not a sha256 hex token".into());
+    }
+    Ok(AliasMetadata {
+        program: program.to_string(),
+        seed_root: PathBuf::from(seed_root),
+        root_marker_sha256: root_marker_sha256.to_ascii_lowercase(),
+    })
+}
+
+/// Resolve one alias frontend to its forwarding target. `None` means this
+/// executable carries NO alias metadata (a plain binary — the caller runs
+/// its normal surface); `Some(Err)` means alias metadata is present but
+/// refuses — unreadable, malformed, foreign marker, bad pointer — and
+/// never falls back into command IR on a broken alias.
+pub fn resolve_alias(exe: &Path) -> Option<Result<PathBuf, String>> {
+    let meta_path = alias_metadata_path(exe)?;
+    match std::fs::symlink_metadata(&meta_path) {
+        Ok(_) => {}
+        // Metadata ABSENT: a plain binary, not an alias — the only
+        // outcome that falls through to the normal surface.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+        // Metadata present but unavailable (permissions, IO): refuse
+        // loudly instead of loading command IR on a broken alias.
+        Err(error) => {
+            return Some(Err(format!(
+                "seed alias metadata {} unavailable: {error}; refusing to \
+                 fall back to command IR on a broken alias",
+                meta_path.display()
+            )));
+        }
+    }
+    let text = match std::fs::read_to_string(&meta_path) {
+        Ok(text) => text,
+        Err(error) => {
+            return Some(Err(format!(
+                "seed alias metadata {} unreadable: {error}; refusing to \
+                 fall back to command IR on a broken alias",
+                meta_path.display()
+            )));
+        }
+    };
+    Some(alias_target(&text))
+}
+
+fn alias_target(text: &str) -> Result<PathBuf, String> {
+    let metadata = alias_metadata_from_text(text)?;
+    let marker = metadata.seed_root.join("seed-root.json");
+    let actual = sha256_hex(&marker).map_err(|e| {
+        format!(
+            "seed root marker {} unreadable: {e}; the alias records its seed \
+             root identity and refuses a moved or foreign tree",
+            marker.display()
+        )
+    })?;
+    if actual != metadata.root_marker_sha256 {
+        return Err(format!(
+            "seed root marker {} sha256 mismatch: the alias expects {}, found {}; \
+             refusing to forward into a re-rooted or replaced seed",
+            marker.display(),
+            metadata.root_marker_sha256,
+            actual
+        ));
+    }
+    let target = resolve_program(&metadata.seed_root, &metadata.program)?;
+    Ok(target)
 }
 
 #[cfg(test)]
@@ -333,5 +479,76 @@ mod tests {
         let self_exe = std::env::current_exe().unwrap();
         assert!(refuses_self(&self_exe));
         assert!(!refuses_self(Path::new("/definitely/not/the/launcher")));
+    }
+
+    // ===== stable alias frontends =====
+
+    fn alias_marker(sandbox: &Sandbox) -> (String, String) {
+        let marker = sandbox.root().join("seed-root.json");
+        std::fs::write(&marker, "marker-bytes").unwrap();
+        let digest = sha256_hex(&marker).unwrap();
+        (marker.display().to_string(), digest)
+    }
+
+    #[test]
+    fn alias_metadata_schema_is_validated_before_any_path_is_built() {
+        let good = serde_json::json!({
+            "schema": 1, "program": "ygg", "seed_root": "C:/seed",
+            "root_marker_sha256": "a".repeat(64),
+        })
+        .to_string();
+        let metadata = alias_metadata_from_text(&good).unwrap();
+        assert_eq!(metadata.program, "ygg");
+        for (evil, needle) in [
+            (serde_json::json!({"schema": 2, "program": "ygg", "seed_root": "s", "root_marker_sha256": "a".repeat(64)}).to_string(), "schema 2 unsupported"),
+            (serde_json::json!({"schema": 1, "program": "a/b", "seed_root": "s", "root_marker_sha256": "a".repeat(64)}).to_string(), "bare program name"),
+            (serde_json::json!({"schema": 1, "program": "ygg", "seed_root": "", "root_marker_sha256": "a".repeat(64)}).to_string(), "seed_root is empty"),
+            (serde_json::json!({"schema": 1, "program": "ygg", "seed_root": "s", "root_marker_sha256": "nothex"}).to_string(), "sha256 hex token"),
+            ("not json".to_string(), "not valid JSON"),
+        ] {
+            let error = alias_metadata_from_text(&evil).unwrap_err();
+            assert!(error.contains(needle), "{evil} was not refused as {needle}: {error}");
+        }
+    }
+
+    #[test]
+    fn an_alias_forwards_to_the_pointer_target_and_refuses_a_foreign_marker() {
+        let sandbox = Sandbox::new("alias");
+        sandbox.install("4.0.0-abc123def456", &[("ygg", "generation bytes")]);
+        let (_, digest) = alias_marker(&sandbox);
+        let metadata = serde_json::json!({
+            "schema": 1, "program": "ygg",
+            "seed_root": sandbox.root().display().to_string(),
+            "root_marker_sha256": digest,
+        })
+        .to_string();
+        let target = alias_target(&metadata).unwrap();
+        assert!(target.starts_with(sandbox.root().join("generations/4.0.0-abc123def456/bin")));
+
+        // A moved, replaced or re-rooted seed: the recorded digest no
+        // longer matches the marker on disk, so the alias refuses instead
+        // of forwarding into a foreign tree.
+        std::fs::write(sandbox.root().join("seed-root.json"), "foreign").unwrap();
+        let error = alias_target(&metadata).unwrap_err();
+        assert!(error.contains("re-rooted or replaced seed"), "{error}");
+
+        // A deleted marker is the same refusal, not a fallback.
+        std::fs::remove_file(sandbox.root().join("seed-root.json")).unwrap();
+        assert!(alias_target(&metadata).unwrap_err().contains("seed root marker"));
+    }
+
+    #[test]
+    fn an_alias_whose_program_is_absent_from_the_pointer_refuses() {
+        let sandbox = Sandbox::new("alias-program");
+        sandbox.install("4.0.0-abc123def456", &[("ygg", "bytes")]);
+        let (_, digest) = alias_marker(&sandbox);
+        let metadata = serde_json::json!({
+            "schema": 1, "program": "ynpx",
+            "seed_root": sandbox.root().display().to_string(),
+            "root_marker_sha256": digest,
+        })
+        .to_string();
+        let error = alias_target(&metadata).unwrap_err();
+        assert!(error.contains("launch through a name"), "{error}");
     }
 }

@@ -2,7 +2,8 @@ param(
   [string]$Repo = $(if ($env:YGGTERM_REPO) { $env:YGGTERM_REPO } else { "yggdrasilhq/yggterm" }),
   [string]$InstallRoot = $(if ($env:YGGTERM_INSTALL_ROOT) { $env:YGGTERM_INSTALL_ROOT } else { Join-Path $env:LOCALAPPDATA "Yggterm" }),
   [switch]$Legacy,
-  [switch]$Seed
+  [switch]$Seed,
+  [switch]$Json
 )
 
 $ErrorActionPreference = "Stop"
@@ -16,6 +17,15 @@ $ProgressPreference = "SilentlyContinue"
 # daemon, needs no Python and no GUI, and delegates the staging/publication
 # transaction to `ynpm seed-activate` extracted from the verified archive
 # itself.
+#
+# Windows pointer contract: the seed root's active.json (schema 1) is THE
+# launch pointer — no junction, no `current`, no symlink capability. The
+# PATH commands are stable alias frontend copies written once with an
+# immutable `.seed-alias` metadata file beside each; they forward to the
+# active generation through active.json BEFORE any command IR loads, so an
+# upgrade never rewrites a running alias — it only flips the pointer, and
+# the old pointer plus every previous generation stay available until the
+# flip succeeds.
 if (-not ($Legacy -or $env:YGGTERM_LEGACY -eq "1")) {
   $seedRoot = if ($env:YGGTERM_SEED_ROOT) { $env:YGGTERM_SEED_ROOT } else { Join-Path $env:USERPROFILE ".yggterm\seed" }
   $seedDist = $env:YGGTERM_SEED_DIST
@@ -30,18 +40,12 @@ if (-not ($Legacy -or $env:YGGTERM_LEGACY -eq "1")) {
 
   try {
     $version = $env:YGGTERM_VERSION
-    if (-not $version) {
-      $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases/latest" -Headers @{ "User-Agent" = "yggterm-installer" }
-      $version = $release.tag_name.TrimStart("v")
-    }
-    $version = $version.TrimStart("v")
-    if (-not $version) { throw "could not resolve the seed version to install" }
-    $tag = "v$version"
-
     $archivePath = Join-Path $tempDir $archiveName
     $checksumPath = "$archivePath.sha256"
     $manifestPath = Join-Path $tempDir "release-manifest.json"
     if ($seedDist) {
+      # A local dist is self-describing: its release-manifest.json names the
+      # version, so no latest-release lookup runs unless VERSION was given.
       $archiveSource = Join-Path $seedDist $archiveName
       if (-not (Test-Path $archiveSource)) { throw "local seed dist has no $archiveName" }
       Copy-Item $archiveSource $archivePath
@@ -51,7 +55,21 @@ if (-not ($Legacy -or $env:YGGTERM_LEGACY -eq "1")) {
       $manifestSource = Join-Path $seedDist "release-manifest.json"
       if (-not (Test-Path $manifestSource)) { throw "local seed dist has no release-manifest.json" }
       Copy-Item $manifestSource $manifestPath
+      if (-not $version) {
+        $distManifest = Get-Content $manifestSource -Raw | ConvertFrom-Json
+        $version = $distManifest.release.version
+      }
+      if (-not $version) { throw "local seed dist manifest declares no release version" }
+      $version = $version.TrimStart("v")
     } else {
+      if (-not $version) {
+        $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases/latest" -Headers @{ "User-Agent" = "yggterm-installer" }
+        $version = $release.tag_name.TrimStart("v")
+      }
+      if (-not $version) { throw "could not resolve the seed version to install" }
+      $tag = "v$version"
+      $version = $version.TrimStart("v")
+
       $baseUrl = "https://github.com/$Repo/releases/download/$tag"
       Write-Host "downloading ygg4 seed $version for $targetLabel"
       Invoke-WebRequest -Uri "$baseUrl/$archiveName" -OutFile $archivePath
@@ -76,35 +94,77 @@ if (-not ($Legacy -or $env:YGGTERM_LEGACY -eq "1")) {
     if (-not (Test-Path $ynpmBootstrap)) { throw "seed archive did not carry a ynpm.exe bootstrap" }
 
     Write-Host "activating seed generation (staged by ynpm seed-activate)"
-    & $ynpmBootstrap seed-activate `
-      --archive $archivePath `
-      --manifest $manifestPath `
-      --package ygg-seed `
-      --expect-version $version `
-      --json
+    $activateArgs = @(
+      "seed-activate",
+      "--archive", $archivePath,
+      "--manifest", $manifestPath,
+      "--seed-root", $seedRoot,
+      "--package", "ygg-seed",
+      "--expect-version", $version
+    )
+    if ($Json) { $activateArgs += "--json" }
+    & $ynpmBootstrap @activateArgs
     if ($LASTEXITCODE -ne 0) { throw "seed-activate refused the transaction (exit $LASTEXITCODE)" }
 
-    # Command publication: %LOCALAPPDATA%\ygg\bin is seed-owned by
-    # construction, so refreshing these copies never races another owner.
-    # A file in use fails the copy loudly (Windows running-binary
-    # constraint); the activated generation itself is never touched, so
-    # re-running the installer after the process exits repairs publication.
+    # Command publication: the stable alias frontends under
+    # %LOCALAPPDATA%\ygg\bin. Each is a launcher COPY plus an immutable
+    # `.seed-alias` metadata file recording the program, the seed root and
+    # the seed-root marker digest. An existing OWNED alias is never
+    # rewritten — it forwards to whatever active.json names, so a running
+    # alias never blocks an upgrade. An existing command without our
+    # metadata belongs to someone else and is left in place; takeover
+    # requires the explicit YGG_MIGRATE_NATIVE=1 rerun.
     $binDir = Join-Path $env:LOCALAPPDATA "ygg\bin"
     New-Item -ItemType Directory -Path $binDir -Force | Out-Null
-    $generationBin = Join-Path $seedRoot "current\bin"
-    if (-not (Test-Path $generationBin)) { throw "activated seed has no $generationBin" }
-    foreach ($name in @("ygg.exe", "ynpm.exe", "ynpx.exe")) {
-      $source = Join-Path $generationBin $name
-      $dest = Join-Path $binDir $name
-      $staged = Join-Path $binDir ($name + ".seed-publish")
-      Copy-Item $source $staged -Force
-      if (Test-Path $dest) {
-        try { Remove-Item $dest -Force } catch {
-          Remove-Item $staged -Force -ErrorAction SilentlyContinue
-          throw "$dest is locked (running process); close it and rerun the installer"
+    $pointer = Get-Content (Join-Path $seedRoot "active.json") -Raw | ConvertFrom-Json
+    $generationBin = Join-Path $seedRoot ("generations\" + $pointer.generation + "\bin")
+    $launcherSource = Join-Path $generationBin "ygg.exe"
+    if (-not (Test-Path $launcherSource)) { throw "activated seed generation has no ygg.exe launcher" }
+    $markerPath = Join-Path $seedRoot "seed-root.json"
+    if (-not (Test-Path $markerPath)) { throw "activated seed root has no seed-root.json marker" }
+    $markerDigest = (Get-FileHash -Algorithm SHA256 $markerPath).Hash.ToLowerInvariant()
+    foreach ($name in @("ygg", "ynpm", "ynpx")) {
+      $alias = Join-Path $binDir "$name.exe"
+      $metaPath = "$alias.seed-alias"
+      $owned = $false
+      if ((Test-Path $alias) -and (Test-Path $metaPath)) {
+        try {
+          $meta = Get-Content $metaPath -Raw | ConvertFrom-Json
+          if ($meta.schema -eq 1 -and $meta.seed_root -eq $seedRoot -and $meta.root_marker_sha256 -eq $markerDigest) {
+            $owned = $true
+          }
+        } catch { $owned = $false }
+      }
+      if ($owned) {
+        # Immutable launcher: forward through the pointer, never rewrite.
+        continue
+      }
+      if (Test-Path $alias) {
+        if ($env:YGG_MIGRATE_NATIVE -eq "1") {
+          Write-Host "migrating existing $name command to the ygg4 seed (YGG_MIGRATE_NATIVE=1)"
+        } else {
+          Write-Host "existing non-seed $name at $alias left in place; set YGG_MIGRATE_NATIVE=1 to take it over"
+          continue
         }
       }
-      Move-Item $staged $dest -Force
+      $staged = Join-Path $binDir "$name.seed-publish"
+      Copy-Item $launcherSource $staged -Force
+      if (Test-Path $alias) {
+        # Takeover of a foreign command: the replace is one rename over the
+        # old file. A locked, running command fails loudly here and the
+        # activated generation is untouched — close it and rerun.
+        Move-Item $staged $alias -Force
+      } else {
+        Move-Item $staged $alias
+      }
+      $metaDoc = [ordered]@{
+        schema = 1
+        program = $name
+        seed_root = $seedRoot
+        root_marker_sha256 = $markerDigest
+      }
+      $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+      [System.IO.File]::WriteAllText($metaPath, ($metaDoc | ConvertTo-Json), $utf8NoBom)
     }
     $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
     $pathParts = @()
@@ -115,7 +175,7 @@ if (-not ($Legacy -or $env:YGGTERM_LEGACY -eq "1")) {
     $env:Path = "$binDir;$env:Path"
 
     Write-Host "installed ygg4 seed $version"
-    Write-Host "commands: $binDir\{ygg,ynpm,ynpx}.exe"
+    Write-Host "commands: $binDir\{ygg,ynpm,ynpx}.exe (aliases forward through $seedRoot\active.json)"
     Write-Host "this host can now be operated over ssh as a ygg system; that is a remote-operator capability, not local worker readiness"
     Write-Host "previous generations are preserved under $seedRoot\generations"
     exit 0

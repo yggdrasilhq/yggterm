@@ -7170,6 +7170,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7a5a4b21e1a62b67a2970e6831bc091d7b87e119e7f9791aef9702e3bef04448"
 
 [[package]]
+name = "ygg-cli"
+version = "3.2.120"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+]
+
+[[package]]
 name = "yggterm"
 version = "3.2.120"
 dependencies = [
@@ -7394,7 +7403,7 @@ dependencies = [
 [[package]]
 name = "ytrace"
 version = "0.2.3"
-source = "git+https://github.com/yggdrasilhq/ytrace?branch=main#4f272e8b438284b599a13c8c1168edf244815e8e"
+source = "git+https://github.com/yggdrasilhq/ytrace?rev=128bc1d#128bc1d1d94f79de9090b400ad189158dbe1aa7a"
 dependencies = [
  "anyhow",
  "chrono",

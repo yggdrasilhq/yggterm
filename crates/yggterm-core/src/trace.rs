@@ -8,6 +8,7 @@ use std::sync::{Mutex, OnceLock};
 use std::thread::sleep;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+#[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 
 use crate::trace_contract::{
@@ -174,6 +175,7 @@ struct TraceWriter {
     /// dev+ino of the inode this handle holds, captured at open. A foreign
     /// writer's rotation renames our inode away while the handle keeps it —
     /// the probe compares these against the live path's metadata.
+    #[cfg(unix)]
     inode: (u64, u64),
     /// Bytes threshold for the next foreign-rotation probe (bounded stat).
     next_probe_at: u64,
@@ -194,10 +196,12 @@ fn open_trace_writer(path: &Path) -> Option<TraceWriter> {
         .ok()?;
     let meta = file.metadata().ok()?;
     let bytes_written = meta.len();
+    #[cfg(unix)]
     let inode = (meta.dev(), meta.ino());
     Some(TraceWriter {
         file,
         bytes_written,
+        #[cfg(unix)]
         inode,
         next_probe_at: bytes_written + FOREIGN_ROTATION_CHECK_BYTES,
     })
@@ -333,10 +337,16 @@ fn write_trace_line(home: &Path, line: &[u8]) {
     if let Some(writer) = writers.get_mut(&path) {
         if writer.bytes_written >= writer.next_probe_at {
             writer.next_probe_at = writer.bytes_written + FOREIGN_ROTATION_CHECK_BYTES;
-            if let Ok(live) = fs::metadata(&path) {
-                if (live.dev(), live.ino()) != writer.inode {
-                    writers.remove(&path);
-                }
+            #[cfg(unix)]
+            let changed = fs::metadata(&path)
+                .map(|live| (live.dev(), live.ino()) != writer.inode)
+                .unwrap_or(true);
+            // Reopen at the same bounded interval when std exposes no stable
+            // file identity. Windows writers must rejoin the live file too.
+            #[cfg(not(unix))]
+            let changed = true;
+            if changed {
+                writers.remove(&path);
             }
         }
     }
