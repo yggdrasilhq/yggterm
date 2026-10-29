@@ -1245,11 +1245,13 @@ def tick(sources, state_dir=None, max_bytes_per_source=262144,
             lineage = entry["lineage_id"]
             fresh = False
             anchors_dirty = False
+            reset_occurred = False
 
             def _reset(note):
-                nonlocal cur, fresh, anchor, anchors_dirty
+                nonlocal cur, fresh, anchor, anchors_dirty, reset_occurred
                 report["notes"].append(note)
                 cur, fresh = 0, True
+                reset_occurred = True
                 if key in anchors:
                     anchors.pop(key)
                     anchors_dirty = True
@@ -1370,6 +1372,14 @@ def tick(sources, state_dir=None, max_bytes_per_source=262144,
             if read_any:
                 scanned.add(lineage)
                 report["new_tail_bytes"] += src_bytes
+            if reset_occurred and not read_any and not deferred:
+                # a reset that consumed no pages (budget starved behind an
+                # earlier source, or an empty source) still persists its
+                # cursor so the reset is ONE-TIME, never a per-pass note
+                # loop; the next pass reads it as a plain fresh start
+                commit_batch(state, entry, [], 0,
+                             {"cmd_fps": {}, "pending_fps": [],
+                              "att_offs": {}})
             if deferred:
                 backlog += 1
                 report["gaps"] += 1
