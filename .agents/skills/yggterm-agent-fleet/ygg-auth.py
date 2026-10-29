@@ -2204,10 +2204,11 @@ def render_table(status):
     lines = []
     live = status["live"]
     if live:
-        state = "EXPIRED" if live["expired"] else "active"
+        state = "EXPIRED" if live["expired"] else "clock current"
         lines.append(f"live: {live['email']} ({live['plan']}) account {live['account_id']} — {state}")
     else:
         lines.append("live: (no auth file — run `login` or `switch`)")
+    lines.append(f"native auth health: {status.get('native_health', 'unknown')}; quota: unmeasured")
     if status["profiles"]:
         lines.append("profiles:")
         for p in status["profiles"]:
@@ -2223,6 +2224,37 @@ def render_table(status):
     else:
         lines.append("profiles: (none stored — `capture` the current account or `login` a new one)")
     return "\n".join(lines)
+
+
+def render_fields(value, indent=0):
+    """Readable metadata, using the same sanitized result as --json."""
+    pad = " " * indent
+    def scalar(item):
+        if item is None:
+            return "unknown"
+        if isinstance(item, bool):
+            return "yes" if item else "no"
+        return str(item)
+    lines = []
+    if isinstance(value, dict):
+        for key, item in value.items():
+            label = str(key).replace("_", " ")
+            if isinstance(item, (dict, list)) and item:
+                lines.append(f"{pad}{label}:")
+                lines.extend(render_fields(item, indent + 2))
+            else:
+                text = "none" if isinstance(item, (dict, list)) else scalar(item)
+                lines.append(f"{pad}{label}: {text}")
+    elif isinstance(value, list):
+        for item in value:
+            if isinstance(item, (dict, list)):
+                lines.extend(render_fields(item, indent + 2))
+                lines.append("")
+            else:
+                lines.append(f"{pad}- {scalar(item)}")
+    else:
+        lines.append(pad + scalar(value))
+    return lines
 
 
 def main(argv=None):
@@ -2399,7 +2431,14 @@ def main(argv=None):
         print(json.dumps(out, indent=2))
     else:
         if args.verb == "status":
-            print(json.dumps(out, indent=2) if args.harness == "all" else render_table(out))
+            if args.harness == "all":
+                print("Auth status — registered adapters")
+                for name, status in out.get("harnesses", {}).items():
+                    print(f"\n{name}")
+                    print("\n".join("  " + line for line in render_table(status).splitlines()))
+                print(f"\nCoverage: {out.get('coverage', 'unknown')}")
+            else:
+                print(render_table(out))
         elif args.verb == "switch":
             idt = out["identity"]
             print(f"✅ switched to {idt['email']} ({idt['plan']})")
@@ -2490,7 +2529,8 @@ def main(argv=None):
             health = "healthy" if out["healthy"] else "⚠ health check did not clear — check the container"
             print(f"🛰  litellm now runs {out['litellm_switched']} ({health}); lineage lives in litellm — re-adopt after its refreshes")
         else:
-            print(json.dumps(out, indent=2))
+            print("Auth " + args.verb.replace("_", " "))
+            print("\n".join(render_fields(out)))
     return 0
 
 

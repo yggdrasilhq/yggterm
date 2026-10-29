@@ -919,9 +919,29 @@
       "options": [],
       "examples": [
         {
-          "title": "Use the existing owned tool",
+          "title": "See the build watcher and latest result",
+          "command": "ygg ci status",
+          "tags": "human status"
+        },
+        {
+          "title": "Find what prevents a build and the next action",
+          "command": "ygg ci why --project example",
+          "tags": "diagnose"
+        },
+        {
+          "title": "See recent failures in readable form",
+          "command": "ygg ci events --since 2h",
+          "tags": "history"
+        },
+        {
+          "title": "Rehearse integration without building",
+          "command": "ygg ci tick --project example --dry-run",
+          "tags": "preview"
+        },
+        {
+          "title": "Get structured data for a script",
           "command": "ygg ci status --json",
-          "tags": ""
+          "tags": "json scripting"
         }
       ],
       "legacy": [

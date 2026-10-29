@@ -84,6 +84,9 @@ DEFAULT_STEP_HEARTBEAT_SECS = 120
 _LAST_LOG_WRITE_TS = 0.0
 _WATCH_STARTED_TS = 0.0
 _STDOUT_IS_LOG = None
+# Diagnostics stream for log(): stdout for humans and the ci.log; stderr when
+# a verb runs under --json so the machine plane stays the only thing on stdout.
+_LOG_STREAM = None
 
 def _ci_default_config():
     return {
@@ -166,7 +169,7 @@ def _stdout_is_the_log():
 def log(m):
     global _LAST_LOG_WRITE_TS, _STDOUT_IS_LOG
     line = f"{time.strftime('%H:%M:%S')} ygg-ci {m}"
-    print(line, flush=True)
+    print(line, flush=True, file=_LOG_STREAM or sys.stdout)
     if _STDOUT_IS_LOG is None:
         _STDOUT_IS_LOG = _stdout_is_the_log()
     if _STDOUT_IS_LOG:
@@ -434,19 +437,41 @@ def _is_docs_scope(paths):
     return bool(paths) and all(p.endswith(".md") for p in paths)
 
 
+_CACHE_VERDICT_ICON = {"ok": "⭐", "idle": "◦", "bypassed": "⚠",
+                       "non-cacheable": "⚠", "absent": "⛔"}
+
+def _render_cache_human(report, tail):
+    hosts = report.get("hosts", {})
+    print(f"compile-cache health — {len(hosts)} host(s); per-build deltas are "
+          f"the truth, cumulative counters reset when the idle server restarts")
+    for h, st in hosts.items():
+        if st.get("verdict") == "absent" and "requests_executed" not in st:
+            print(f"  {h:<12} ⛔ sccache unreachable — wire it per docs/spec-ygg-ci.md §2.1")
+            continue
+        print(f"  {h:<12} requests={st.get('requests_executed')} hits={st.get('hits')} "
+              f"misses={st.get('misses')} rate={st.get('hit_rate')} "
+              f"size={st.get('max_size')} ({st.get('location')})")
+    recs = report.get("recent_builds") or []
+    print(f"recent build verdicts — last {tail}")
+    if not recs:
+        print("  none yet — a verdict lands with every build record (spec-ygg-ci.md §4)")
+    for b in recs:
+        c = b.get("sccache") or {}
+        v = c.get("verdict") or "?"
+        rate = c.get("hit_rate")
+        ratebit = f" rate={rate}%" if isinstance(rate, (int, float)) else ""
+        print(f"  {_CACHE_VERDICT_ICON.get(v, '·')} {b.get('id')}  {v} "
+              f"req={c.get('requests')}{ratebit}".rstrip())
+    print("next: ygg ci cache --host <host> --tail 20 to zoom one host · "
+          "verdict meanings in docs/spec-ygg-ci.md §4")
+
 def cmd_cache(a):
     """Per-host compile-cache health + the verdict digest of recent builds (§4)."""
     hosts = [h.strip() for h in (a.host.split(",") if a.host else _default_fleet_hosts())]
     report = {"hosts": {}, "recent_builds": []}
     for h in hosts:
         st = _sccache_stats(h)
-        if st is None:
-            report["hosts"][h] = {"verdict": "absent"}
-            print(f"{h:10s} ⛔ sccache unreachable — wire it per docs/spec-ygg-ci.md §2.1")
-        else:
-            report["hosts"][h] = st
-            print(f"{h:10s} requests={st['requests_executed']} hits={st['hits']} "
-                  f"misses={st['misses']} rate={st['hit_rate']} size={st['max_size']} ({st['location']})")
+        report["hosts"][h] = st if st is not None else {"verdict": "absent"}
     recs = sorted(BUILDS.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)[:max(0, a.tail)]
     for p in recs:
         try:
@@ -456,13 +481,10 @@ def cmd_cache(a):
         cc = rec.get("sccache")
         if cc:
             report["recent_builds"].append({"id": rec.get("id"), "sccache": cc})
-    if report["recent_builds"]:
-        print("recent builds (verdict / requests / hit rate):")
-        for b in report["recent_builds"]:
-            c = b["sccache"]
-            print(f"  {b['id']}: {c.get('verdict')} req={c.get('requests')} rate={c.get('hit_rate')}")
     if a.json:
         print(json.dumps(report, indent=2))
+        return 0
+    _render_cache_human(report, a.tail)
     return 0
 
 def _repo_for(project, explicit=None):
@@ -628,6 +650,166 @@ def hold_remaining(h):
         return "INDEFINITE"
     left = (h.get("until") or 0) - time.time()
     return f"{left/60:.0f}m left" if left < 5400 else f"{left/3600:.1f}h left"
+
+# ─── human-output rendering ──────────────────────────────────────────────────
+# Default output is for the operator's eyes: short headings, aligned rows,
+# statuses, ages, and the next useful verb. --json is the machine plane and
+# must be the only place structured data reaches stdout. ⛔ No dict or JSON
+# dumps in human output — every state renders as words; a failure stays loud.
+
+_BAD_STATUSES = ("build-failed", "push-failed", "deploy-failed")
+_GOOD_STATUSES = ("pushed", "deployed")
+
+def _age(secs):
+    """Compact human duration: 45s · 12m · 3.2h · 5d; None reads as '?', never 0."""
+    if secs is None:
+        return "?"
+    secs = max(0, int(secs))
+    if secs < 90:
+        return f"{secs}s"
+    if secs < 5400:
+        return f"{secs // 60}m"
+    if secs < 172800:
+        return f"{secs / 3600:.1f}h"
+    return f"{secs / 86400:.1f}d"
+
+def _age_of(ts, now=None):
+    if not ts:
+        return "?"
+    delta = (now if now is not None else time.time()) - ts
+    if delta < -2:
+        return f"clock ahead {_age(-delta)}"
+    return _age(delta)
+
+def _time_ago(ts, now=None):
+    age = _age_of(ts, now)
+    return age if age == "?" or age.startswith("clock ahead") else age + " ago"
+
+def _clip(s, n=80):
+    s = str(s or "").replace("\n", " ").strip()
+    return s if len(s) <= n else s[: max(1, n - 1)] + "…"
+
+def _status_icon(status):
+    if status in _BAD_STATUSES or status in ("blocked", "no-main", "no-repo",
+                                             "refused-diverged", "ff-failed"):
+        return "⛔"
+    if status in _GOOD_STATUSES:
+        return "⭐"
+    if status in ("held", "disarmed"):
+        return "⏸"
+    return "·"
+
+def _lane_names(items, cap=6):
+    names = [str(m.get("lane") if isinstance(m, dict) else m) or "?"
+             for m in (items or [])]
+    if not names:
+        return ""
+    shown = ", ".join(names[:cap])
+    return shown + (f" (+{len(names) - cap} more)" if len(names) > cap else "")
+
+def _quarantine_lines(qmap, now=None):
+    """Readable per-lane quarantine lines; qmap is the project's raw
+    quarantine dict (legacy plain-tip entries normalized in)."""
+    now = now if now is not None else time.time()
+    lines = []
+    for lane in sorted(qmap):
+        e = _quarantine_entry(qmap[lane], now, DEFAULT_QUARANTINE_TTL_SECS)
+        tip = (e.get("tip") or "?")[:12]
+        exp = float(e.get("expires") or 0)
+        if exp and exp >= now:
+            when = time.strftime("%H:%M", time.localtime(exp))
+            lines.append(f"  ⏳ {lane} — tip {tip} failed a build; quarantined "
+                         f"until {when} ({_age(exp - now)} left). A new tip or "
+                         f"the expiry re-arms it.")
+        else:
+            lines.append(f"  ⏳ {lane} — tip {tip} failed a build; quarantine "
+                         f"EXPIRED — probes on a coming tick (one expiry probe "
+                         f"per tick).")
+    return lines
+
+def _conflict_lines(conflicts):
+    lines = []
+    for c in conflicts or []:
+        lane = c.get("lane") or "?"
+        tip = (c.get("tip") or "")
+        tipbit = f" tip {tip[:12]}" if tip else ""
+        line = f"  ⛔ {lane}{tipbit} — {_clip(c.get('reason') or 'merge conflict', 60)}"
+        if c.get("stderr"):
+            line += f" ({_clip(c['stderr'], 110)})"
+        lines.append(line)
+    return lines
+
+def _build_line(rec, now=None):
+    """One build record as one readable line — never a raw dump."""
+    if not rec:
+        return "none yet — the first tick with dirty subs lands one"
+    st = rec.get("status") or "?"
+    bits = [f"{_status_icon(st)} {st}", _time_ago(rec.get("at"), now),
+            rec.get("id") or "record without id"]
+    lanes = rec.get("lanes") or []
+    bits.append(f"{len(lanes)} lane(s)" if lanes else "no lanes merged")
+    if rec.get("conflicts"):
+        bits.append(f"{len(rec['conflicts'])} conflict(s)")
+    if rec.get("pushed") is False:
+        bits.append("push FAILED")
+    if rec.get("deploy_ok") is False:
+        bits.append("deploy FAILED")
+    if rec.get("build_skipped") == "docs-scope":
+        bits.append("docs-only — build skipped")
+    return " · ".join(bits)
+
+_EVENT_WORDS = {
+    "merge_refused": "merge refused",
+    "build_failed": "build FAILED",
+    "gate_failed": "gate FAILED",
+    "lane_quarantined": "lane quarantined",
+    "ci_blocked_dirty_main": "blocked — main checkout dirty",
+    "ci_refused_diverged": "refused — local main diverged from upstream",
+    "ci_refused_not_main": "refused — checkout is not main",
+    "push_failed": "push FAILED",
+    "deploy_failed": "deploy FAILED",
+    "built_and_pushed": "built and pushed",
+    "sub_expired_abandoned": "subscription expired (abandoned lane)",
+    "cache_bypassed": "sccache BYPASSED — wire absent",
+    "cache_noncacheable": "sccache non-cacheable calls",
+    "ci_restored_build_dirt": "restored build-induced dirt",
+    "build_step_overrun": "build step overrun (watchdog killed)",
+    "gate_step_overrun": "gate step overrun (watchdog killed)",
+    "deploy_step_overrun": "deploy step overrun (watchdog killed)",
+}
+
+def _event_line(e):
+    """One event as one readable line — the kind in words, key fields in
+    words, at most one clipped free-text fragment (the full record stays in
+    events.jsonl and --json)."""
+    t = time.strftime("%m-%d %H:%M", time.localtime(e.get("at", 0)))
+    kind = e.get("kind") or "?"
+    words = _EVENT_WORDS.get(kind, kind.replace("_", " "))
+    mark = ("⛔" if kind in BOARD_FAILURE_KINDS
+            else "⭐" if kind == "built_and_pushed" else "·")
+    detail = []
+    if e.get("lane"):
+        detail.append(f"lane {e['lane']}")
+    if e.get("lanes"):
+        detail.append(f"lanes {_lane_names(e['lanes'])}")
+    if e.get("sha"):
+        detail.append(f"sha {str(e['sha'])[:12]}")
+    if e.get("reset_to"):
+        detail.append(f"main reset to {str(e['reset_to'])[:12]}")
+    if e.get("budget_secs"):
+        detail.append(f"budget was {e['budget_secs']}s")
+    if e.get("deploy_ok") is True:
+        detail.append("deployed")
+    elif e.get("deploy_ok") is False:
+        detail.append("deploy FAILED")
+    if e.get("dirty"):
+        detail.append("dirty: " + _lane_names(e["dirty"], cap=4))
+    for k in ("detail", "stderr", "log_tail"):
+        if e.get(k):
+            detail.append(_clip(e[k], 120))
+            break
+    return (f"{t}  [{e.get('project') or '?'}] {mark} {words}"
+            + (f" — {'; '.join(detail)}" if detail else ""))
 
 # ─── git helpers ─────────────────────────────────────────────────────────────
 
@@ -805,12 +987,18 @@ def cmd_list(a):
     if a.json:
         print(json.dumps({"subs": subs}, indent=2))
         return 0
+    scope = f" for {a.project}" if a.project else ""
     if not subs:
-        print("no ci subscriptions" + (f" for {a.project}" if a.project else ""))
+        print(f"no ci subscriptions{scope}")
+        print("next: ygg ci subscribe --lane lane/<topic> [--project <name>] — the watcher builds what is subscribed")
         return 0
+    print(f"ci subscriptions{scope} — {len(subs)}")
     for s in subs:
-        age_m = (time.time() - s.get("enlisted_at", time.time())) / 60
-        print(f"{s.get('project')}:{s.get('lane')}  tip={ (s.get('tip_at_enlist') or '?')[:12]}  by={s.get('by','')[:8]}  {age_m:.0f}m ago  want={s.get('want')}")
+        tip = (s.get("tip_at_enlist") or "?")[:12]
+        print(f"  {(s.get('project') or '?'):<12} {(s.get('lane') or '?'):<36} "
+              f"tip {tip:<12} enlisted {_time_ago(s.get('enlisted_at'))}  "
+              f"by {(s.get('by') or '?')[:8]:<8} want={s.get('want')}")
+    print("next: ygg ci tick --dry-run to rehearse · ygg ci unsubscribe when the lane has landed")
     return 0
 
 def cmd_config(a):
@@ -818,17 +1006,40 @@ def cmd_config(a):
         pcfg = _project_cfg(a.project)
         if a.json:
             print(json.dumps({a.project: pcfg}, indent=2))
-        else:
-            print(f"project {a.project}:")
-            for k, v in pcfg.items():
-                print(f"  {k}: {v}")
+            return 0
+        print(f"project {a.project} — build recipe")
+        print(f"  repo: {pcfg.get('repo')}")
+        print(f"  host: {pcfg.get('host')} · interval: {pcfg.get('interval')}s · "
+              f"remote: {pcfg.get('remote', 'origin')} · "
+              f"push: {'true' if pcfg.get('push', True) else 'false'}"
+              + (f" → {pcfg.get('push_remote')}" if pcfg.get("push_remote") else ""))
+        print(f"  build: {pcfg.get('build') or '(none — ticks treat builds as ok)'}")
+        print(f"  deploy: {pcfg.get('deploy') or '(none — build-and-gate only)'}")
+        gates = [g for g in (pcfg.get("gates") or "").split() if g]
+        print(f"  gates: {', '.join(gates) if gates else '(none set)'}")
+        tos = [(label, pcfg[k]) for k, label in
+               (("build_timeout_secs", "build"), ("gate_timeout_secs", "gate"),
+                ("deploy_timeout_secs", "deploy"), ("step_heartbeat_secs", "step-heartbeat"))
+               if pcfg.get(k) is not None]
+        if tos:
+            print(f"  step budgets: {', '.join(f'{label} {v}s' for label, v in tos)}")
+        print("next: ygg ci tune --project <name> --build/--deploy/--gates to change it")
         return 0
     cfg = _load_config()
     if a.json:
         print(json.dumps(cfg, indent=2))
         return 0
-    for proj, pcfg in cfg.get("projects", {}).items():
-        print(f"[{proj}] repo={pcfg.get('repo')} host={pcfg.get('host')} interval={pcfg.get('interval')} build={pcfg.get('build')[:60]}")
+    projects = cfg.get("projects", {})
+    if not projects:
+        print("no ci projects configured")
+        print("next: ygg ci tune --project <name> --build ... --repo ... to add one")
+        return 0
+    print(f"ci config — {len(projects)} project(s)")
+    for proj, pcfg in projects.items():
+        print(f"  {proj:<12} {pcfg.get('host')} · {pcfg.get('interval')}s · "
+              f"build: {_clip(pcfg.get('build') or '(none)', 56)} · "
+              f"deploy: {_clip(pcfg.get('deploy') or '(none)', 40)}")
+    print("next: ygg ci config --project <name> for the full recipe")
     return 0
 
 def cmd_tune(a):
@@ -894,6 +1105,10 @@ def cmd_tune(a):
 # ─── status ──────────────────────────────────────────────────────────────────
 
 def cmd_status(a):
+    global _LOG_STREAM
+    # --json keeps stdout for the machine plane: disarm_state()'s expiry log
+    # (and any other diagnostic) rides stderr, never before the JSON. (F2)
+    _LOG_STREAM = sys.stderr if a.json else None
     subs = load_subs(project=a.project)
     alive = watcher_alive()
     dis = disarm_state()
@@ -931,21 +1146,52 @@ def cmd_status(a):
     if a.json:
         print(json.dumps(info, indent=2))
         return 0
-    print(f"ygg-ci status host={this_host()} ci_host={CI_HOST}")
-    print(f"  watcher: {'alive' if alive else 'not running'}" + (f" pid {hb.get('pid')}" if hb else ""))
+    print("ygg-ci — fleet single build plane")
+    print(f"  host: {this_host()} (this seat) · ci host: {CI_HOST}")
+    if alive:
+        up = _age_of((hb or {}).get("started_ts"))
+        pid = (hb or {}).get("pid") or "?"
+        print(f"  watcher: alive (pid {pid}" + (f", up {up}" if up != "?" else "") + ")")
+    else:
+        print("  watcher: not running — spawned again on the next subscribe/tick")
     if hb:
-        age = time.time() - hb.get("ts", 0)
-        print(f"  heartbeat: {age:.0f}s ago host={hb.get('host')} last_log={time.time()-hb.get('last_log_write_ts',0):.0f}s ago")
-    print(f"  subs: {len(subs)}" + (f" (project {a.project})" if a.project else ""))
+        print(f"  heartbeat: {_time_ago(hb.get('ts'))} · log quiet "
+              f"{_age_of(hb.get('last_log_write_ts'))}")
+    print(f"  subscriptions: {len(subs)}" + (f" (filtered to {a.project})" if a.project else ""))
     if dis:
-        print(f"  ⛔ DISARMED for {hold_remaining(dis)} note={dis.get('note')}")
+        print(f"  ⛔ DISARMED — {hold_remaining(dis)}"
+              + (f" — {dis.get('note')}" if dis.get("note") else ""))
     if hold:
-        print(f"  ⏸ HOLD {hold_remaining(hold)} reason={hold.get('reason') or hold.get('note')}")
+        reason = hold.get("reason") or hold.get("note")
+        print(f"  ⏸ HOLD — {hold_remaining(hold)}" + (f" — {reason}" if reason else ""))
+    quar_shown = False
+    for proj, qmap in sorted(_quarantine_load().items()):
+        if a.project and proj != a.project:
+            continue
+        for ln in _quarantine_lines(qmap):
+            if not quar_shown:
+                print("  quarantined lanes:")
+                quar_shown = True
+            print(f"  [{proj}] {ln[2:].lstrip()}")
     if last:
-        print(f"  last build: {last.get('id')} project={last.get('project')} status={last.get('status')} sha={last.get('sha','')[:12]} lanes={len(last.get('lanes',[]))}")
-        if last.get("conflicts"):
-            print(f"    conflicts: {last['conflicts']}")
+        print(f"  last build: {_build_line(last)}")
+        for ln in _conflict_lines(last.get("conflicts")):
+            print(ln)
+    else:
+        print("  last build: none yet — the first tick with dirty subs lands one")
     print(f"  log: {LOGPATH}")
+    hints = []
+    if dis:
+        hints.append("ygg ci arm to re-arm")
+    if hold:
+        hints.append("ygg ci hold --clear to resume")
+    if not alive:
+        hints.append("ygg ci subscribe --lane lane/<topic> to spawn the watcher")
+    if last and last.get("status") in _BAD_STATUSES:
+        hints.append("ygg ci why — triage the failing build")
+    if not hints:
+        hints.append("ygg ci events --since 1h · ygg ci tick --dry-run")
+    print("  next: " + " · ".join(hints))
     return 0
 
 # ─── disarm / arm / hold ─────────────────────────────────────────────────────
@@ -1618,8 +1864,88 @@ def _dirty_subs(project, pcfg, subs):
             dirty.append(s)
     return dirty, last
 
+def _tick_human_summary(project, r):
+    """Operator-facing summary under the tick's own log lines — statuses in
+    words, lanes named, next verb offered. Skipped when stdout IS the log
+    (the watcher) so ci.log does not fill with rendering chrome."""
+    if _stdout_is_the_log():
+        return
+    r = r or {}
+    st = r.get("status") or "?"
+    print(f"──── tick {project} → {_status_icon(st)} {st} "
+          + "─" * max(2, 44 - len(project) - len(st)))
+    swept = r.get("swept") or []
+    if swept:
+        bits = ", ".join(f"{s.get('lane')} ({(s.get('disposition') or '?').replace('-', ' ')})"
+                         for s in swept[:6])
+        print(f"  swept from subscriptions: {bits}")
+    if st == "dry":
+        print(f"  rehearsal only — {r.get('subs', 0)} sub(s), "
+              f"{r.get('dirty', 0)} dirty; per-lane marks above; nothing was "
+              f"merged, built or pushed")
+        print(f"  next: ygg ci tick --project {project} to run the real integration")
+        return
+    if st in ("disarmed", "held"):
+        print("  nothing integrated — the build plane is standing down")
+        print("  next: " + ("ygg ci arm" if st == "disarmed" else "ygg ci hold --clear"))
+        return
+    if st == "no-subs":
+        print(f"  next: ygg ci subscribe --lane lane/<topic> --project {project}")
+        return
+    if st == "no-repo":
+        print(f"  next: ygg ci tune --project {project} --repo <path>")
+        return
+    if st in ("blocked", "no-main", "refused-diverged", "ff-failed"):
+        if r.get("why"):
+            print(f"  {_clip(r['why'], 140)}")
+        print("  next: ygg ci why — clear the main checkout / divergence by hand")
+        return
+    if st == "build-failed":
+        lanes = r.get("quarantined") or []
+        if lanes:
+            print(f"  quarantined: {', '.join(lanes)} (fresh TTL — the next tick builds the rest)")
+        if r.get("reset_to"):
+            print(f"  main reset to {str(r['reset_to'])[:12]} — nothing broken landed")
+        print("  next: ygg ci why — triage the failing lanes")
+        return
+    lanes = r.get("lanes") or []
+    fresh = [m for m in lanes if not m.get("already_in_main")]
+    if fresh:
+        print(f"  merged: {_lane_names(fresh)}")
+    elif lanes:
+        print("  no new tips — every lane is already in main")
+    # the clean early-return carries conflicts as a COUNT, the full record as
+    # a LIST — only a list renders as lines (F1: int is not iterable).
+    conflicts = r.get("conflicts")
+    if isinstance(conflicts, list):
+        for ln in _conflict_lines(conflicts):
+            print(ln)
+    if r.get("sha"):
+        print(f"  integrated sha {str(r['sha'])[:12]}")
+    pushed = r.get("pushed")
+    if pushed is True:
+        print(f"  pushed to {r.get('upstream') or 'upstream'}")
+    elif pushed is False:
+        print("  ⛔ push FAILED — main was reset to the pre-tick state; the lanes stay subscribed")
+    elif pushed is None and st in ("built", "deployed"):
+        print("  push disabled for this project (tune --push true to enable)")
+    dep = r.get("deploy_ok")
+    if dep is True:
+        print("  deployed")
+    elif dep is False:
+        print("  ⛔ deploy FAILED — the sha is upstream but not on the fleet")
+    if st == "clean":
+        print(f"  nothing new to integrate (merged {r.get('merged', 0)}, "
+              f"conflicts {r.get('conflicts', 0)})")
+    print("  next: ygg ci events --since 1h to watch outcomes")
+
 def cmd_tick(a):
-    # optionally host gate
+    global _LOG_STREAM
+    # --json keeps stdout for the machine plane; the tick's own log lines are
+    # diagnostics and ride stderr (they would otherwise precede the JSON and
+    # break every parser).
+    _LOG_STREAM = sys.stderr if a.json else None
+    bad = {"build-failed","push-failed","deploy-failed","no-main","no-repo","blocked","refused-diverged"}
     if not a.project:
         # tick all projects that have subs
         projects = set(s["project"] for s in load_subs())
@@ -1636,47 +1962,61 @@ def cmd_tick(a):
                 pass
         if a.json:
             print(json.dumps(results, indent=2))
-        bad = {"build-failed","push-failed","deploy-failed","no-main","no-repo","blocked","refused-diverged"}
+        else:
+            for proj in sorted(results):
+                _tick_human_summary(proj, results[proj])
         return 0 if all(v.get("status") not in bad for v in results.values()) else 1
     else:
         r = _do_tick_project(a.project, dry=bool(a.dry_run))
         if a.json:
             print(json.dumps(r, indent=2))
-        bad = {"build-failed","push-failed","deploy-failed","no-main","no-repo","blocked","refused-diverged"}
+        else:
+            _tick_human_summary(a.project, r)
         return 0 if r.get("status") not in bad else 1
 
 def cmd_events(a):
     """Read the CI's talking plane: every state transition, newest last."""
-    if not EVENTS.exists():
-        print("no events yet — the watcher emits on its first transition")
-        return 0
     since = None
     if a.since:
         import re as _re
         m = _re.match(r"^(\d+)([smh])$", a.since.strip())
         secs = {"s": 1, "m": 60, "h": 3600}[m.group(2)] * int(m.group(1)) if m else 1800
         since = time.time() - secs
-    out = []
-    for line in EVENTS.read_text().splitlines():
-        try:
-            e = json.loads(line)
-        except Exception:
-            continue
-        if a.project and e.get("project") != a.project:
-            continue
-        if a.kind and e.get("kind") != a.kind:
-            continue
-        if since and e.get("at", 0) < since:
-            continue
-        out.append(e)
+    matched = []
+    if EVENTS.exists():
+        for line in EVENTS.read_text().splitlines():
+            try:
+                e = json.loads(line)
+            except Exception:
+                continue
+            if a.project and e.get("project") != a.project:
+                continue
+            if a.kind and e.get("kind") != a.kind:
+                continue
+            if since and e.get("at", 0) < since:
+                continue
+            matched.append(e)
     if a.json:
-        print(json.dumps(out[-a.tail:], indent=2))
+        print(json.dumps(matched[-a.tail:], indent=2))
         return 0
-    for e in out[-a.tail:]:
-        t = time.strftime("%H:%M:%S", time.localtime(e.get("at", 0)))
-        body = {k: v for k, v in e.items() if k not in ("event_id", "at", "project", "host")}
-        print(f"{t} [{e.get('project')}] {e.get('kind')}: {json.dumps(body, default=str)[:220]}")
-    print(f"— {len(out)} event(s) — ids in events.jsonl; failures also posted to msgboard {BOARD}")
+    if not EVENTS.exists():
+        print("no events yet — the watcher emits on its first transition")
+        print("next: ygg ci tick --dry-run to inspect the current state")
+        return 0
+    shown = matched[-a.tail:]
+    if not shown:
+        filters = ", ".join(x for x in (f"project={a.project}" if a.project else "",
+                                        f"kind={a.kind}" if a.kind else "",
+                                        f"window {a.since}" if a.since else "") if x)
+        print(f"no events match the filters ({filters or 'none'})")
+        print("next: widen with --since 24h, or drop --project/--kind")
+        return 0
+    print(f"ci events — showing {len(shown)} of {len(matched)} matching"
+          + (f", {a.since} window" if a.since else "") + " (newest last)")
+    for e in shown:
+        print(f"  {_event_line(e)}")
+    print(f"— full records in events.jsonl; failures also post to msgboard {BOARD}")
+    print("next: ygg ci why to triage the latest failure · ygg ci events --json for machine output")
     return 0
 
 def cmd_why(a):
@@ -1685,10 +2025,19 @@ def cmd_why(a):
     pcfg = _project_cfg(project)
     repo = Path(pcfg["repo"]).expanduser()
     alive = watcher_alive()
-    print(f"project {project}: repo={repo} ci_host={pcfg.get('host')} watcher={'ALIVE' if alive else 'DOWN (ensure_watcher spawns on next subscribe/tick)'}")
+    print(f"project {project}")
+    print(f"  repo: {repo}")
+    print(f"  ci host: {pcfg.get('host')} · watcher: "
+          f"{'ALIVE' if alive else 'DOWN (ensure_watcher spawns on next subscribe/tick)'}")
     dis = disarm_state(); hold = hold_state()
-    if dis: print(f"  DISARMED: {dis}")
-    if hold: print(f"  HELD: {hold}")
+    if dis:
+        print(f"  ⛔ DISARMED — {hold_remaining(dis)}"
+              + (f" — {dis.get('note')}" if dis.get("note") else ""))
+        print("     next: ygg ci arm to re-arm builds")
+    if hold:
+        reason = hold.get("reason") or hold.get("note")
+        print(f"  ⏸ HELD — {hold_remaining(hold)}" + (f" — {reason}" if reason else ""))
+        print("     next: ygg ci hold --clear to resume builds")
     if not repo.exists():
         print(f"  next: fix the repo path (tune --repo)")
         return 2
@@ -1699,21 +2048,29 @@ def cmd_why(a):
         print("     next: resolve or stash in the main checkout — the CI refuses to integrate on a dirty floor")
         return 2
     br = (_run(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=str(repo), timeout=30).stdout or "").strip()
-    print(f"  main checkout: branch={br} clean={not hard}")
+    print(f"  main checkout: branch {br}, clean")
     quar = _quarantine_load().get(project, {})
     if quar:
-        print(f"  quarantined lanes (tip failed a build; new tip re-arms): {quar}")
+        print(f"  quarantined ({len(quar)}) — a failed tip waits here; a new tip or the expiry re-arms it:")
+        for ln in _quarantine_lines(quar):
+            print(ln)
     last = _last_build(project)
     if last:
-        print(f"  last build: {last.get('id')} status={last.get('status')} pushed={last.get('pushed')}")
+        print(f"  last build: {_build_line(last)}")
+        for ln in _conflict_lines(last.get("conflicts")):
+            print(ln)
         if last.get("status") in ("build-failed",):
             print("     next: the failing lanes are quarantined; fix their build or land a corrected tip")
     if EVENTS.exists():
         recent = [l for l in EVENTS.read_text().splitlines()[-40:]]
         fails = [l for l in recent if '"kind":' in l and any(k in l for k in BOARD_FAILURE_KINDS)]
         if fails:
-            lastf = json.loads(fails[-1])
-            print(f"  last failure: {time.strftime('%H:%M', time.localtime(lastf.get('at',0)))} {lastf.get('kind')} {json.dumps({k:v for k,v in lastf.items() if k in ('lane','sha','detail')}, default=str)[:160]}")
+            try:
+                lastf = json.loads(fails[-1])
+            except Exception:
+                lastf = None
+            if lastf:
+                print(f"  last failure: {_event_line(lastf)}")
     print("  verbs: events (history) · tick --dry-run (rehearse) · tune --gates/--push (config)")
     return 0
 
