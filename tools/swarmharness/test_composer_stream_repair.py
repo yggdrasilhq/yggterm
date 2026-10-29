@@ -20,6 +20,7 @@ import sys
 import tempfile
 import uuid
 from pathlib import Path
+from unittest.mock import patch
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
@@ -301,19 +302,36 @@ def t_a3_integrity():
           == len(data) // 2,
           json.dumps(reset_notes(rep)[:1])[:160])
 
-    # same-size interior rewrite (F6): token-blind, caught by the anchor
-    # rotation within a bounded budget
+    # same-size interior rewrite (F6/CSR-10): the control now states its
+    # geometry honestly — records are EQUAL WIDTH (60 bytes replaced by
+    # 60 bytes, no size delta), the fixture fits ONE verification budget
+    # (65,536 x 4 >= 240,000), and the assertions include the invariants
+    # the rewrite depends on: equal byte length and an unchanged
+    # generation token. This is the original short-prefix audit control.
     w2 = fresh("a3rewrite")
     st2 = w2 / "state"
     f2 = w2 / "mid.jsonl"
-    clean = ("x" * 59 + "\n").encode()
+    clean = ("x" * 59 + "\n").encode()                 # 60-byte records
     f2.write_bytes(clean * 4000)                       # 240,000 B
+    tok0 = cp.generation(f2)
     cp.tick({"board": [str(f2)]}, state_dir=st2, max_bytes_per_source=65536,
             max_pages=10)                              # fully consumed
     body = bytearray(f2.read_bytes())
-    bad = ("NameError: name 'zz' is not defined".ljust(60) + "\n").encode()
-    body[100_000:100_000 + 60 * 900] = bad * 900       # same size, interior
+    bad = ("NameError: name 'zz' is not defined".ljust(59) + "\n").encode()
+    start, width = 100_000, 60 * 900
+    check("A3-2p falsifier geometry is honest: equal-width records, "
+          "rewrite inside one verification budget",
+          len(bad) == 60 and len(body) == 240_000
+          and start + width <= len(body) and width <= 65536 * 4,
+          json.dumps({"record": len(bad), "size": len(body),
+                      "span": [start, start + width]})[:160])
+    body[start:start + width] = bad * 900              # SAME size, interior
     f2.write_bytes(bytes(body))
+    check("A3-2q rewrite is size-preserving and the sampled generation "
+          "token cannot see it (token-blind control)",
+          f2.stat().st_size == 240_000 and cp.generation(f2) == tok0,
+          json.dumps({"size": f2.stat().st_size,
+                      "tok_blind": cp.generation(f2) == tok0})[:140])
     rep2 = cp.tick({"board": [str(f2)]}, state_dir=st2,
                    max_bytes_per_source=65536, max_pages=10)
     loops = [o for o in cp.load_observations(st2)
@@ -324,6 +342,47 @@ def t_a3_integrity():
           and any("consumed-prefix mutation" in n for n in rep2["notes"]),
           json.dumps({"faults": len(loops),
                       "notes": [n[:60] for n in reset_notes(rep2)[:1]]})[:200])
+
+    # long-prefix rotation counterexample (CSR-01/CSR-10): the rewrite
+    # begins BEYOND one verification budget, so only an ADVANCING
+    # rotation — never a single budget-sized pass — can see it; the
+    # position geometry is asserted exactly
+    w2b = fresh("a3rotate")
+    st2b = w2b / "state"
+    f2b = w2b / "long.jsonl"
+    long_clean = ("x" * 63 + "\n").encode()            # 64-byte records
+    f2b.write_bytes(long_clean * 16384)                # 1,048,576 B
+    tokL = cp.generation(f2b)
+    cp.tick({"board": [str(f2b)]}, state_dir=st2b,
+            max_bytes_per_source=65536, max_pages=32)
+    bodyL = bytearray(f2b.read_bytes())
+    badL = ("NameError: name 'zz' is not defined".ljust(63) + "\n").encode()
+    offL = 700_032                                     # inside chunk 10
+    bodyL[offL:offL + 64] = badL
+    f2b.write_bytes(bytes(bodyL))
+    check("A3-2r long-prefix rewrite is same-size, token-blind, and sits "
+          "beyond four verification budgets",
+          f2b.stat().st_size == 1_048_576 and cp.generation(f2b) == tokL
+          and offL >= 65536 * 4 * 2,
+          json.dumps({"size": f2b.stat().st_size,
+                      "tok_blind": cp.generation(f2b) == tokL,
+                      "off": offL})[:160])
+    positionsL = []
+    for _ in range(8):
+        cp.tick({"board": [str(f2b)]}, state_dir=st2b,
+                max_bytes_per_source=65536, max_pages=32)
+        positionsL.append(
+            anchors_of(st2b)["board::" + str(f2b)]["verify_pos"])
+    loopsL = [o for o in cp.load_observations(st2b)
+              if o["detector_id"] == "sig-nameerror-typo"]
+    check("A3-2s rotation beyond one verification budget: position "
+          "advances (4 chunks/pass, cyclic) and the fault is seen "
+          "within one sweep",
+          positionsL == [4, 8, 0, 4, 8, 12, 0, 4] and len(loopsL) == 1,
+          json.dumps({"positions": positionsL,
+                      "faults": len(loopsL)})[:220])
+    for d in (w2b,):
+        shutil.rmtree(d)
 
     # path resurrection: same path, NEW inode, byte-identical content
     w3 = fresh("a3inode")
@@ -542,6 +601,200 @@ def t_a5_static_controls():
     shutil.rmtree(w)
 
 
+def t_csr02_fair_scheduling():
+    """CSR-02: a hoarding first source — one that grows faster than the
+    page budget drains it — cannot permanently starve a later enrolled
+    prefix. Probe-mirror geometry: one-page total budget, cohort of two,
+    the big source appends 2KiB every pass. The persisted round-robin
+    scheduler must give the later prefix its page chance within one
+    cohort round while the big source keeps progressing."""
+    w = fresh("csr02")
+    state = w / "state"
+    big = w / "big.jsonl"
+    later = w / "later.jsonl"
+    clean = ("x" * 63 + "\n").encode()
+    big.write_bytes(clean * 128)
+    later.write_bytes(FAULT2.encode())                 # 37 B, one record
+    sources = {"board": [str(big), str(later)]}
+    cursors = []
+    for _ in range(8):
+        rep = cp.tick(sources, state_dir=state, max_bytes_per_source=1024,
+                      max_pages=1, claim_cap=0)
+        cur = json.loads((state / "cursors.json").read_text())
+        cursors.append([cur.get("board::" + str(big), {}).get("cursor"),
+                        cur.get("board::" + str(later), {}).get("cursor")])
+        with big.open("ab") as f:
+            f.write(clean * 32)                        # grows 2 KiB/pass
+    rows = cp.load_observations(state)
+    later_size = later.stat().st_size
+    check("C2-1 the later enrolled prefix is served within one cohort "
+          "round despite the hoarding source (cursor reaches its EOF)",
+          cursors[1][1] == later_size,
+          json.dumps({"cursors": cursors})[:260])
+    check("C2-2 the later prefix's fault is OBSERVED, not just passed "
+          "over",
+          any(o["detector_id"] == "sig-nameerror-typo" for o in rows),
+          json.dumps([o["detector_id"] for o in rows])[:160])
+    check("C2-3 the hoarding source still progresses (fairness adds "
+          "service, it does not stall the big source)",
+          cursors[-1][0] > cursors[0][0],
+          json.dumps({"first": cursors[0][0], "last": cursors[-1][0]})[:140])
+    check("C2-4 the later prefix stays covered after being served "
+          "(closed snapshot: cursor pinned at its EOF; backlog stays "
+          "honest about the still-growing source)",
+          all(c[1] == later_size for c in cursors[1:])
+          and rep["backlog_remaining"] == 1,
+          json.dumps({"later": [c[1] for c in cursors],
+                      "backlog": rep["backlog_remaining"]})[:220])
+    check("C2-5 the scheduler state is persisted and bounded",
+          json.loads((state / "scheduler.json").read_text())
+          .get("rr") is not None
+          and 0 <= json.loads(
+              (state / "scheduler.json").read_text()).get("rr", -1) < 2,
+          json.dumps(json.loads(
+              (state / "scheduler.json").read_text()))[:100])
+    shutil.rmtree(w)
+
+
+def t_csr03_crash_gap_reconciled():
+    """CSR-03: the cursor commits per page, the anchor saves once per
+    pass — a crash between the two leaves the cursor AHEAD of the
+    anchored frontier. Recovery must detect the mismatch and re-read the
+    gap (fresh detector state, dedupe keeping prior evidence); the
+    previously-uncovered interval must become anchored and rotation-
+    verified. Probe-mirror geometry: cursor 131072, anchor 65536."""
+    w = fresh("csr03")
+    state = w / "state"
+    src = w / "crash.jsonl"
+    clean = ("x" * 63 + "\n").encode()                 # 64-byte records
+    src.write_bytes(clean * 8192)                      # 512 KiB
+    cp.tick({"board": [str(src)]}, state_dir=state,
+            max_bytes_per_source=65536, max_pages=1)
+    with patch.object(cp, "_save_anchors",
+                      side_effect=OSError("injected anchor write crash")):
+        try:
+            cp.tick({"board": [str(src)]}, state_dir=state,
+                    max_bytes_per_source=65536, max_pages=1)
+        except OSError:
+            pass
+    crashed_cur = cursor_of(state, "board::" + str(src))["cursor"]
+    crashed_anchor = anchors_of(state)["board::" + str(src)]
+    check("C3-0 the injected crash reproduces the cursor-ahead state: "
+          "cursor 131072, anchored frontier 65536, chunk [65536,131072) "
+          "absent",
+          crashed_cur == 131_072 and crashed_anchor["size"] == 65_536
+          and not any(ch["start"] == 65_536 for ch in crashed_anchor["chunks"]),
+          json.dumps({"cursor": crashed_cur, "anchor": crashed_anchor["size"],
+                      "chunks": [c["start"] for c in
+                                 crashed_anchor["chunks"]]})[:200])
+    rep = cp.tick({"board": [str(src)]}, state_dir=state,
+                  max_bytes_per_source=65536, max_pages=16)
+    an = anchors_of(state)["board::" + str(src)]
+    covered = any(ch["start"] <= 96_000 < ch["start"] + ch["len"]
+                  for ch in an["chunks"])
+    check("C3-1 recovery NAMES the crash gap explicitly (never a silent "
+          "skip)",
+          any("crash gap" in n for n in rep["notes"]),
+          json.dumps(rep["notes"])[:220])
+    check("C3-2 the previously-uncovered interval is ANCHORED after "
+          "recovery (contiguous chunk coverage from 0)",
+          covered and an["chunks"] == sorted(an["chunks"], key=lambda c: c["start"])
+          and an["chunks"][0]["start"] == 0,
+          json.dumps([c["start"] for c in an["chunks"]])[:200])
+    rows0 = cp.load_observations(state)
+    check("C3-3 no evidence was manufactured or lost across the crash "
+          "and its reconciliation (clean prefix mines zero rows)",
+          len(rows0) == 0, json.dumps(len(rows0)))
+    # fault INSIDE the recovered interval; the anchor rotation must see it
+    body = bytearray(src.read_bytes())
+    bad = ("NameError: name 'widget' is not defined".ljust(63)
+           + "\n").encode()
+    body[96_000:96_064] = bad
+    src.write_bytes(bytes(body))
+    found = 0
+    gap_notes = []
+    for _ in range(8):
+        rep2 = cp.tick({"board": [str(src)]}, state_dir=state,
+                       max_bytes_per_source=65536, max_pages=16)
+        gap_notes += [n for n in rep2["notes"] if "crash gap" in n]
+        found = len([o for o in cp.load_observations(state)
+                     if o["detector_id"] == "sig-nameerror-typo"])
+        if found:
+            break
+    check("C3-4 the injected fault inside the recovered interval is seen "
+          "within the rotation bound",
+          found == 1, json.dumps({"rows": found})[:100])
+    # crash-replay idempotence: converged passes emit no new gap notes,
+    # no new rows
+    for _ in range(2):
+        rep3 = cp.tick({"board": [str(src)]}, state_dir=state,
+                       max_bytes_per_source=65536, max_pages=16)
+        gap_notes += [n for n in rep3["notes"] if "crash gap" in n]
+    rows3 = cp.load_observations(state)
+    check("C3-5 recovery is crash-replay idempotent: the gap reconcile is "
+          "one-time (no repeated notes) and evidence stays stable",
+          not gap_notes and len(rows3) == 1
+          and cursor_of(state, "board::" + str(src))["cursor"]
+          == src.stat().st_size,
+          json.dumps({"gap_notes": gap_notes, "rows": len(rows3)})[:200])
+    shutil.rmtree(w)
+
+
+def t_csr10_control_strength():
+    """CSR-10: the long-prefix same-size control must FAIL a wrong-
+    rotation implementation. Proof by construction: under the historical
+    non-advancing rotation (verify_pos never moves — the CSR-01 defect),
+    the SAME scenario never sees the fault; restore the advancing
+    rotation and the fault is seen within one sweep. The control is not
+    weakened acceptance — it discriminates."""
+    w = fresh("csr10")
+    state = w / "state"
+    src = w / "long.jsonl"
+    clean = ("x" * 63 + "\n").encode()
+    src.write_bytes(clean * 16384)                     # 1 MiB, 16 chunks
+    cp.tick({"board": [str(src)]}, state_dir=state,
+            max_bytes_per_source=65536, max_pages=32)
+    body = bytearray(src.read_bytes())
+    bad = ("NameError: name 'widget' is not defined".ljust(63)
+           + "\n").encode()
+    body[700_032:700_096] = bad                        # same-size, chunk 10
+    src.write_bytes(bytes(body))
+    tok = cp.generation(src)
+    real_verify = cp._verify_prefix_chunks
+
+    def stuck_rotation(path, anchor, budget_bytes):
+        ok, mismatch, vbytes, _ = real_verify(
+            path, {"chunks": anchor.get("chunks") or [],
+                   "verify_pos": 0}, budget_bytes)
+        return ok, mismatch, vbytes, 0                 # position never moves
+
+    cp._verify_prefix_chunks = stuck_rotation
+    try:
+        for _ in range(8):
+            cp.tick({"board": [str(src)]}, state_dir=state,
+                    max_bytes_per_source=65536, max_pages=32)
+    finally:
+        cp._verify_prefix_chunks = real_verify
+    stuck_rows = [o for o in cp.load_observations(state)
+                  if o["detector_id"] == "sig-nameerror-typo"]
+    check("C10-1 under the historical non-advancing rotation the fault "
+          "stays UNSEEN for 8 passes (the control would fail it)",
+          len(stuck_rows) == 0 and cp.generation(src) == tok,
+          json.dumps({"rows": len(stuck_rows)})[:100])
+    seen = 0
+    for _ in range(8):
+        cp.tick({"board": [str(src)]}, state_dir=state,
+                max_bytes_per_source=65536, max_pages=32)
+        seen = len([o for o in cp.load_observations(state)
+                    if o["detector_id"] == "sig-nameerror-typo"])
+        if seen:
+            break
+    check("C10-2 the SAME scenario under correct advancing rotation sees "
+          "the fault within one sweep (green is earned, not assumed)",
+          seen == 1, json.dumps({"rows": seen})[:100])
+    shutil.rmtree(w)
+
+
 def main():
     t_a1_progression_and_completion()
     t_a1_progress_vs_backlog_distinction()
@@ -549,6 +802,9 @@ def main():
     t_a3_integrity()
     t_a4_crash_and_concurrency()
     t_a5_static_controls()
+    t_csr02_fair_scheduling()
+    t_csr03_crash_gap_reconciled()
+    t_csr10_control_strength()
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
     if FAIL:
         print("FAILED:", *FAIL, sep="\n  - ")

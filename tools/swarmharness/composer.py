@@ -76,16 +76,40 @@ no longer reset. The cursor carries an integrity ANCHOR — full head/tail
 growth is accepted as append-only when the head window verifies equal.
 Windows covering the whole consumed prefix (prefix <= 128KiB) verify the
 FULL prefix; larger prefixes are SAMPLED: the interior is re-verified
-rotationally, a bounded number of chunk bytes per tick. Honest statement
-of the integrity tradeoff: the generation token is a SAMPLED token
+rotationally, a bounded number of chunk bytes per tick, with the
+rotation position advancing by the chunks ACTUALLY verified (CSR-01) so
+every anchored chunk is revisited within len(chunks) passes (ceil(total
+chunk bytes / budget) for uniform chunks). Honest statement of the
+integrity tradeoff: the generation token is a SAMPLED token
 (size + two 64KiB windows), not a full-content hash — a same-size
 interior rewrite is invisible to it, so the anchor's rotation is the
 detector, and detection is EVENTUAL (within the rotation period), not
 instantaneous; content that mutates and mutates back between checks is
-undetectable at any sampling depth. The tick notes name this explicitly:
+undetectable at any sampling depth; UNANCHORED bytes (beyond the chunk
+cap, or a crash gap not yet reconciled) have NO rotation coverage until
+anchored. The tick notes name this explicitly:
 "prefix integrity: full" (windows proved the whole consumed prefix) vs
 "prefix integrity: sampled" (windows proved the head; rotation owns the
 interior). A sampled pass is never presented as full integrity.
+
+Fair cohort scheduling (CSR-02 repair, 2026-10-29): the enrolled cohort
+is a finite list per census; each pass serves it from a persisted
+round-robin offset advanced by the sources actually served, so a source
+that grows faster than the page budget drains it cannot permanently
+starve a later enrolled prefix — every enrolled source gets its page
+chance within len(cohort) consecutive passes when the budget is at least
+one page. The scheduler is order-only state; losing it reorders, never
+loses evidence.
+
+Crash-gap reconciliation (CSR-03 repair, 2026-10-29): the cursor commits
+per page, the anchor once per pass; a crash between the two can leave
+the cursor AHEAD of the anchored frontier. Recovery detects the mismatch
+and re-reads the gap from the anchored frontier with FRESH detector
+state before trusting anything — prior evidence survives via the v2
+dedupe, chunk hashes come from re-read RAW bytes, and the reconciled
+cursor persists even when the pass has no budget left, so the reconcile
+is one-time and crash-replay idempotent. Bytes that changed while
+unobserved stay distinct evidence at their own offsets.
 
 Observation identity v2 (F2 repair, 2026-10-29): the dedupe identity is
 (source_kind, lineage, span, detector, detector_version, fingerprint) —
@@ -137,6 +161,27 @@ _ANCHOR_FILE = "anchors.json"
 # ---- observation identity version (F2 repair) ----
 _OBS_IDENTITY_VERSION = 2
 _STORE_META = "observations.meta.json"
+
+# ---- fair cohort scheduling (CSR-02 repair) ----
+_SCHEDULER_FILE = "scheduler.json"
+
+
+def _load_scheduler(state):
+    """Persisted round-robin serving offset over the enrolled cohort
+    (CSR-02). Advisory ONLY: a lost or corrupt file reorders which source
+    is served first — it can never lose evidence, cursor or anchor state —
+    so it resets to 0 without a note, unlike substantive state."""
+    try:
+        rr = json.loads((Path(state) / _SCHEDULER_FILE).read_text()).get("rr")
+        if type(rr) is int and rr >= 0:
+            return rr
+    except Exception:
+        pass
+    return 0
+
+
+def _save_scheduler(state, rr):
+    _atomic_write_json(Path(state) / _SCHEDULER_FILE, {"rr": int(rr)})
 
 
 def _now():
@@ -973,14 +1018,21 @@ def _growth_verdict(path, anchor):
 def _verify_prefix_chunks(path, anchor, budget_bytes):
     """Rotationally verify bounded anchor chunks of the consumed prefix —
     the detector for same-size interior rewrites the sampled generation
-    token cannot see (F6). One sweep max per call, cyclic from
-    verify_pos; cost never counts against the page budget. Returns
-    (ok, mismatch_note, verified_bytes, new_pos)."""
+    token cannot see (F6). One bounded sweep per call, cyclic from
+    verify_pos; cost never counts against the page budget. The position
+    advances by the number of chunks ACTUALLY verified (CSR-01): at least
+    one chunk per call (the first chunk is verified even past the budget)
+    and at most budget_bytes worth, so every anchored chunk is revisited
+    within len(chunks) calls and within ceil(total chunk bytes / budget)
+    calls for uniform chunks — a persistent fault anywhere in the anchored
+    prefix is seen in bounded time, never parked behind a position that
+    never moves. Returns (ok, mismatch_note, verified_bytes, new_pos)."""
     chunks = anchor.get("chunks") or []
     if not chunks or budget_bytes <= 0:
         return True, None, 0, anchor.get("verify_pos", 0)
     pos = anchor.get("verify_pos", 0) % len(chunks)
     verified = 0
+    checked = 0
     with Path(path).open("rb") as f:
         for k in range(len(chunks)):
             ch = chunks[(pos + k) % len(chunks)]
@@ -995,7 +1047,8 @@ def _verify_prefix_chunks(path, anchor, budget_bytes):
                     "changed under recorded evidence; re-scanning with "
                     "FRESH detector state"), verified, (pos + k) % len(chunks)
             verified += ch["len"]
-    return True, None, verified, (pos + len(chunks)) % len(chunks)
+            checked += 1
+    return True, None, verified, (pos + checked) % len(chunks)
 
 
 # ------------------------------------------------------------ patterns
@@ -1178,10 +1231,13 @@ def tick(sources, state_dir=None, max_bytes_per_source=262144,
     explicit backlog reporting; growing sources PROGRESS from the stored
     cursor when the integrity anchor verifies the consumed prefix (F1
     repair), and same-size interior rewrites are caught by the anchor
-    rotation regardless of the token (F6 repair); generation validated
-    around every commit; corrupted cursors reset explicitly; zero model
-    calls. The tick body runs under the state lock — concurrent ticks
-    serialize (acceptance 4)."""
+    rotation regardless of the token (F6 repair); the enrolled cohort is
+    served round-robin from a persisted offset so a hoarding source
+    cannot starve later prefixes (CSR-02); a cursor ahead of its anchor
+    is reconciled by re-reading the crash gap before anything is trusted
+    (CSR-03); generation validated around every commit; corrupted cursors
+    reset explicitly; zero model calls. The tick body runs under the
+    state lock — concurrent ticks serialize (acceptance 4)."""
     if not isinstance(max_bytes_per_source, int) \
             or isinstance(max_bytes_per_source, bool) \
             or max_bytes_per_source <= 0:
@@ -1229,12 +1285,28 @@ def tick(sources, state_dir=None, max_bytes_per_source=262144,
                        and c["lineage_id"]}
         pages = 0
         backlog = 0
-        for entry in manifest["sources"]:
+        # Fair bounded scheduling (CSR-02): the cohort is the FINITE list
+        # of enrolled sources this census returned. Each pass serves it
+        # starting at the persisted round-robin offset and advances that
+        # offset by the number of sources actually served, so a hoarding
+        # source — one that grows faster than the page budget drains it —
+        # cannot permanently starve a later enrolled prefix: with a
+        # per-pass budget of at least one page, every enrolled source is
+        # given its page chance at least once within len(cohort)
+        # consecutive passes. Closed-snapshot vs new-tail coverage
+        # accounting is unchanged; the scheduler is order-only state.
+        cohort = [e for e in manifest["sources"]
+                  if e.get("status") == "ok"]
+        rr = _load_scheduler(state) % max(1, len(cohort))
+        order = cohort[rr:] + cohort[:rr]
+        served = 0
+        for entry in order:
             if entry.get("status") != "ok":
                 continue
             if pages >= max_pages:
                 backlog += 1
                 continue
+            served += 1
             p = Path(entry["path"])
             size = p.stat().st_size
             key = f"{entry['source_kind']}::{entry['path']}"
@@ -1246,6 +1318,7 @@ def tick(sources, state_dir=None, max_bytes_per_source=262144,
             fresh = False
             anchors_dirty = False
             reset_occurred = False
+            gap_reconciled = False
 
             def _reset(note):
                 nonlocal cur, fresh, anchor, anchors_dirty, reset_occurred
@@ -1284,6 +1357,45 @@ def tick(sources, state_dir=None, max_bytes_per_source=262144,
                        f"({anchor['size']} -> {size} bytes) — explicit "
                        "re-scan with FRESH detector state")
             else:
+                # Cursor/anchor reconciliation BEFORE anything is trusted
+                # (CSR-03): the cursor is committed per page while the
+                # anchor is saved once at pass end, so a crash between the
+                # two can leave the cursor AHEAD of the anchored frontier.
+                # Those gap bytes were consumed but never anchored —
+                # trusting the cursor alone would skip them forever and
+                # the anchor's rotation could never verify them. The gap
+                # is re-read from the anchored frontier with FRESH
+                # detector state (the persisted detector state may already
+                # include gap content); prior evidence is preserved — the
+                # identity-v2 dedupe makes re-derived identical rows a
+                # no-op, and any bytes that changed while unobserved stay
+                # distinct evidence at their own offsets. Chunk hashes are
+                # taken from the re-read RAW bytes, so the anchor never
+                # blesses bytes nobody read.
+                if cur > anchor["size"]:
+                    gap_lo, gap_hi = anchor["size"], cur
+                    cur = anchor["size"]
+                    gap_reconciled = True
+                    report["notes"].append(
+                        f"cursor ahead of anchored prefix on "
+                        f"{entry['path']} (crash gap "
+                        f"[{gap_lo},{gap_hi})) — reconciling: gap re-read "
+                        "from the anchored frontier with FRESH detector "
+                        "state; dedupe keeps prior evidence")
+                elif cur < anchor["size"]:
+                    # safe direction (evidence commits before the cursor):
+                    # trim chunks past the cursor so the re-read rebuilds
+                    # contiguous non-overlapping coverage — never a silent
+                    # overlap
+                    trimmed = [c for c in anchor["chunks"]
+                               if c["start"] < cur]
+                    if len(trimmed) != len(anchor["chunks"]):
+                        anchor["chunks"] = trimmed
+                        anchors_dirty = True
+                        report["notes"].append(
+                            f"cursor behind anchored prefix on "
+                            f"{entry['path']} — anchor chunks past the "
+                            "cursor trimmed; re-read rebuilds coverage")
                 # rotation re-verification runs on EVERY pass over an
                 # anchored prefix — it is the detector for same-size
                 # interior rewrites the sampled generation token cannot
@@ -1320,7 +1432,8 @@ def tick(sources, state_dir=None, max_bytes_per_source=262144,
                                     f"{coverage}); {size - anchor['size']} "
                                     "tail bytes to read")
 
-            cmd_fps, pending_fps, att_offs = _page_state(cstate, fresh)
+            cmd_fps, pending_fps, att_offs = _page_state(
+                cstate, fresh or gap_reconciled)
             local_chunks = [] if fresh else \
                 [dict(c) for c in (anchor or {}).get("chunks", [])]
             prev_pos = 0 if fresh else (anchor or {}).get("verify_pos", 0)
@@ -1372,12 +1485,15 @@ def tick(sources, state_dir=None, max_bytes_per_source=262144,
             if read_any:
                 scanned.add(lineage)
                 report["new_tail_bytes"] += src_bytes
-            if reset_occurred and not read_any and not deferred:
-                # a reset that consumed no pages (budget starved behind an
-                # earlier source, or an empty source) still persists its
-                # cursor so the reset is ONE-TIME, never a per-pass note
-                # loop; the next pass reads it as a plain fresh start
-                commit_batch(state, entry, [], 0,
+            if (reset_occurred or gap_reconciled) and not read_any \
+                    and not deferred:
+                # a reset or gap reconciliation that consumed no pages
+                # (budget starved behind an earlier source, or an empty
+                # source) still persists its cursor so the reconcile is
+                # ONE-TIME, never a per-pass note loop; the next pass
+                # reads it as a plain fresh start (reset: cursor 0) or
+                # from the anchored frontier (gap reconcile)
+                commit_batch(state, entry, [], cur,
                              {"cmd_fps": {}, "pending_fps": [],
                               "att_offs": {}})
             if deferred:
@@ -1404,6 +1520,8 @@ def tick(sources, state_dir=None, max_bytes_per_source=262144,
                 anchors_dirty = True
             if anchors_dirty:
                 _save_anchors(state, anchors)
+        if cohort:
+            _save_scheduler(state, (rr + served) % len(cohort))
         report["backlog_remaining"] = backlog
         # opportunities use the MEASURED scanned cohort (sol t31 F31.2), never
         # the enrolled count; both are reported
