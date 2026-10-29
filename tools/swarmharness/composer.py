@@ -69,12 +69,52 @@ path to fleet improvement — conformance-green is not production. Until an
 owner-approved enrollment manifest exists (default-deny, per-source, per
 the privacy law), this kernel's outbox stays empty BY DESIGN and nothing
 may claim composer-driven improvement.
+
+Append-stream progression (F1 repair, 2026-10-29): a source that GREW is
+no longer reset. The cursor carries an integrity ANCHOR — full head/tail
+64KiB hashes of the consumed prefix plus per-page chunk hashes — and a
+growth is accepted as append-only when the head window verifies equal.
+Windows covering the whole consumed prefix (prefix <= 128KiB) verify the
+FULL prefix; larger prefixes are SAMPLED: the interior is re-verified
+rotationally, a bounded number of chunk bytes per tick. Honest statement
+of the integrity tradeoff: the generation token is a SAMPLED token
+(size + two 64KiB windows), not a full-content hash — a same-size
+interior rewrite is invisible to it, so the anchor's rotation is the
+detector, and detection is EVENTUAL (within the rotation period), not
+instantaneous; content that mutates and mutates back between checks is
+undetectable at any sampling depth. The tick notes name this explicitly:
+"prefix integrity: full" (windows proved the whole consumed prefix) vs
+"prefix integrity: sampled" (windows proved the head; rotation owns the
+interior). A sampled pass is never presented as full integrity.
+
+Observation identity v2 (F2 repair, 2026-10-29): the dedupe identity is
+(source_kind, lineage, span, detector, detector_version, fingerprint) —
+generation EXCLUDED. The same logical occurrence (same bytes at the same
+offsets, same normalized fault) dedupes across appends and re-scans;
+appends do not shift byte offsets, so a re-scanned prefix re-derives the
+same identity and stays one row. A genuinely distinct occurrence (same
+fault text at a different offset) or changed content (different
+fingerprint) remains distinct evidence. The row's `generation` field is
+PROVENANCE (the generation the observation was made in), not identity;
+replay under a newer generation is a no-op that preserves the original
+row immutably. Migration of v1 stores (identity embedded generation) is
+explicit: rekeyed under v2, generation-era duplicates coalesced to the
+earliest row with the counts reported in the tick notes, foreign-version
+rows preserved verbatim — no silent discard, no faked identity.
+
+Durability (acceptance 4): every tick body runs under a per-state-dir
+flock — concurrent ticks serialize, a crashed holder releases by process
+death, and observation/cursor writes stay ordered observations-first so
+a crash can only leave the cursor behind (re-read + dedupe), never
+orphan evidence; files are fsynced before rename and the directory after
+it.
 """
 import fcntl
 import hashlib
 import json
 import os
 import re
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -87,6 +127,16 @@ SUPPORTED_SOURCES = ("zcode_rollout", "codex_session", "queue_run",
                      "review_chain", "board")
 _SEVERITIES = ("high", "medium", "low")
 _MAX_CARRY = 65536  # oversized-event policy bound
+
+# ---- append-stream integrity anchors (F1/F6 repair) ----
+_ANCHOR_WINDOW = 65536       # head/tail verification window (bytes)
+_ANCHOR_FULL_LIMIT = 131072  # windows cover the whole prefix up to here
+_MAX_ANCHOR_CHUNKS = 1024    # per-source chunk cap (~266 MiB at 256 KiB pages)
+_ANCHOR_FILE = "anchors.json"
+
+# ---- observation identity version (F2 repair) ----
+_OBS_IDENTITY_VERSION = 2
+_STORE_META = "observations.meta.json"
 
 
 def _now():
@@ -160,12 +210,31 @@ def generation_and_size(path):
     return token, st.st_size
 
 
+def source_identity(path):
+    """(generation_token, size, lineage_id) from ONE opened handle —
+    lineage (st_dev:st_ino), size and both content windows are read off
+    the same fd, so a stat/read race can never pair one source's lineage
+    with another's generation or byte count (acceptance 3; sol t26 #4
+    extended to identity). Symlinks AND hard links collapse to one
+    physical source."""
+    path = Path(path)
+    with path.open("rb") as f:
+        st = os.fstat(f.fileno())
+        head = f.read(65536)
+        if st.st_size > 65536:
+            f.seek(-65536, os.SEEK_END)
+            tail = f.read(65536)
+        else:
+            tail = b""
+    token = f"sz{st.st_size}:{_sha(head)[:12]}:{_sha(tail)[:12]}"
+    return token, st.st_size, _sha(f"{st.st_dev}:{st.st_ino}")[:16]
+
+
 def lineage_id(path):
-    """Lineage identity from the INODE (st_dev:st_ino) after realpath —
-    symlinks AND hard links collapse to one physical source (sol t28 #1)."""
-    rp = Path(path).resolve()
-    st = os.stat(rp)
-    return _sha(f"{st.st_dev}:{st.st_ino}")[:16]
+    """Lineage identity from the INODE (st_dev:st_ino) of the opened
+    source — symlinks AND hard links collapse to one physical source
+    (sol t28 #1). Reads through source_identity for one-fd consistency."""
+    return source_identity(path)[2]
 
 
 # ------------------------------------------------------------ detector set
@@ -192,6 +261,19 @@ def _detect_line(line):
     return None
 
 
+def observation_identity(source_kind, lineage, span, detector_id,
+                         detector_version, fingerprint):
+    """Stable LOGICAL observation identity, v2 (F2 repair): generation
+    EXCLUDED. Appends never shift byte offsets, so the same occurrence
+    re-derived after an append or an explicit re-scan re-computes the
+    same identity and stays ONE row; a distinct occurrence (different
+    offset) or changed content (different fingerprint) stays distinct
+    evidence. The generation remains on the row as provenance."""
+    return "v2-" + _sha(_canonical(
+        [source_kind, lineage, span, detector_id, detector_version,
+         fingerprint]))
+
+
 def make_observation(detector_id, severity, source_kind, gen, span, fp,
                      lineage, status="unverified-symptom"):
     body = {"detector_id": detector_id, "detector_version": DETECTOR_VERSION,
@@ -199,9 +281,8 @@ def make_observation(detector_id, severity, source_kind, gen, span, fp,
             "source_kind": source_kind, "generation": gen,
             "lineage_id": lineage, "span": span, "fingerprint": fp,
             "at": _now()}
-    body["dedupe_key"] = _sha(_canonical(
-        [source_kind, lineage, gen, span, detector_id, DETECTOR_VERSION,
-         fp]))
+    body["dedupe_key"] = observation_identity(
+        source_kind, lineage, span, detector_id, DETECTOR_VERSION, fp)
     return body
 
 
@@ -228,10 +309,9 @@ def validate_observation(obs):
               "fingerprint", "at", "dedupe_key", "lineage_id"):
         if not isinstance(obs[k], str) or not obs[k]:
             return f"{k} must be a nonempty string"
-    key = _sha(_canonical(
-        [obs["source_kind"], obs["lineage_id"], obs["generation"],
-         obs["span"], obs["detector_id"], obs["detector_version"],
-         obs["fingerprint"]]))
+    key = observation_identity(
+        obs["source_kind"], obs["lineage_id"], obs["span"],
+        obs["detector_id"], obs["detector_version"], obs["fingerprint"])
     if key != obs["dedupe_key"]:
         return "dedupe key mismatch (forged or stale observation)"
     return None
@@ -410,16 +490,9 @@ def census(sources, cutoff=None, state_dir=None):
                 manifest["gaps"].append(entry)
                 continue
             try:
-                entry["lineage_id"] = lineage_id(p)
-            except OSError as exc:
-                entry["status"] = f"error: {exc}"[:80]
-                manifest["gaps"].append(entry)
-                manifest["sources"].append(entry)
-                continue
-            try:
                 entry["status"] = "ok"
-                entry["generation"], entry["bytes"] = \
-                    generation_and_size(p)
+                entry["generation"], entry["bytes"], entry["lineage_id"] = \
+                    source_identity(p)
                 manifest["total_bytes"] += entry["bytes"]
                 manifest.setdefault("_lineage_set", set())
                 manifest["_lineage_set"].add(entry["lineage_id"])
@@ -435,6 +508,18 @@ def census(sources, cutoff=None, state_dir=None):
 
 
 # ------------------------------------------------------------ read
+
+class _Page(tuple):
+    """The historical read_page 4-tuple (text, next_cursor, done,
+    line_offs) carrying the raw emitted bytes for anchor hashing on
+    `.raw`. Oversized-drop pages return raw=None: the skipped bytes are
+    deliberately unanchored (typed in-content marker instead)."""
+
+    def __new__(cls, text, nxt, done, line_offs, raw):
+        self = super().__new__(cls, (text, nxt, done, line_offs))
+        self.raw = raw
+        return self
+
 
 def read_page(path, cursor=0, max_bytes=262144):
     """Bounded page of COMPLETE records. Bytes are buffered RAW, framed by
@@ -472,7 +557,8 @@ def read_page(path, cursor=0, max_bytes=262144):
                 # bound: drop exactly that record, advance past it (F33.4)
                 first = pieces[0] if pieces else raw
                 marker = f"<<oversized-event dropped at bytes@{cursor}>>\n"
-                return marker, cursor + len(first), False, [cursor]
+                return _Page(marker, cursor + len(first), False, [cursor],
+                             None)
     complete = []
     partial = b""
     if raw:
@@ -497,26 +583,65 @@ def read_page(path, cursor=0, max_bytes=262144):
     next_cursor = min(cursor + len(emitted), size)  # byte-exact
     # done means EMITTED everything (sol t30 P5): an unterminated tail
     # record must still be read — the handle reaching EOF is not done
-    return text, next_cursor, next_cursor >= size, starts
+    return _Page(text, next_cursor, next_cursor >= size, starts, emitted)
 
 
 # ------------------------------------------------------------ store
 
-def load_observations(state_dir=None):
+def load_observations_report(state_dir=None):
+    """(rows, corrupt_lines, foreign_version_rows). Corrupt store lines
+    are counted and reported by the tick — never silently skipped
+    (acceptance 3); foreign-detector-version rows are kept verbatim."""
     path = (Path(state_dir).expanduser() if state_dir
             else DEFAULT_STATE.expanduser()) / "observations.jsonl"
     if not path.exists():
-        return []
-    out = []
+        return [], 0, 0
+    out, corrupt, foreign = [], 0, 0
     for line in path.read_text().splitlines():
         try:
-            out.append(json.loads(line))
+            row = json.loads(line)
         except Exception:
+            corrupt += 1
             continue
-    return out
+        if not isinstance(row, dict):
+            corrupt += 1
+            continue
+        if row.get("detector_version") != DETECTOR_VERSION:
+            foreign += 1
+        out.append(row)
+    return out, corrupt, foreign
+
+
+def load_observations(state_dir=None):
+    return load_observations_report(state_dir)[0]
+
+
+def _fsync_dir(path):
+    dfd = os.open(str(path), os.O_RDONLY)
+    try:
+        os.fsync(dfd)
+    finally:
+        os.close(dfd)
+
+
+def _atomic_write_jsonl(path, rows):
+    """Full atomic rewrite preserving row order (migration path)."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + f".tmp{os.getpid()}")
+    with tmp.open("w") as f:
+        for row in rows:
+            f.write(_canonical(row) + "\n")
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+    _fsync_dir(path.parent)
 
 
 def _atomic_append_jsonl(path, rows):
+    """Atomic read-merge-write — the EXISTING rows are read back and
+    rewritten with the new ones under the tick lock; a fresh-file
+    append-temp that would lose rows is never used (acceptance 4)."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     existing = []
@@ -531,14 +656,95 @@ def _atomic_append_jsonl(path, rows):
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp, path)
+    _fsync_dir(path.parent)
 
 
 def _atomic_write_json(path, obj):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + f".tmp{os.getpid()}")
-    tmp.write_text(_canonical(obj))
+    with tmp.open("w") as f:
+        f.write(_canonical(obj))
+        f.flush()
+        os.fsync(f.fileno())
     os.replace(tmp, path)
+    _fsync_dir(path.parent)
+
+
+@contextmanager
+def _state_lock(state):
+    """Exclusive inter-process tick lock (flock on state/lock).
+    Concurrent ticks serialize; a crashed holder releases by process
+    death. Cursor and evidence can therefore never interleave two
+    writers (acceptance 4)."""
+    state.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(state / "lock"), os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+
+def migrate_observations(state_dir):
+    """One-time EXPLICIT identity migration (acceptance 2): v1 stores
+    embedded the generation in the dedupe identity, so the same logical
+    fault re-minted a row per generation (audit F2). Under v2 the rows
+    are rekeyed by observation_identity; generation-era duplicates
+    (same logical occurrence, different generations) coalesce to the
+    EARLIEST row — provenance lives on the kept row, the counts land in
+    the tick notes. Foreign-detector-version rows are preserved
+    verbatim. Never a silent discard; never a faked identity."""
+    state = Path(state_dir).expanduser()
+    meta_path = state / _STORE_META
+    if meta_path.exists():
+        try:
+            if json.loads(meta_path.read_text()).get(
+                    "identity_version") == _OBS_IDENTITY_VERSION:
+                return []
+        except Exception:
+            pass  # unreadable meta: re-migrate deterministically below
+    opath = state / "observations.jsonl"
+    rows, corrupt, foreign = load_observations_report(state)
+    rekeyed = coalesced = 0
+    seen, kept = set(), []
+    for o in rows:
+        if o.get("detector_version") != DETECTOR_VERSION:
+            kept.append(o)  # foreign rows verbatim — identity preserved
+            continue
+        k = observation_identity(o.get("source_kind"), o.get("lineage_id"),
+                                 o.get("span"), o.get("detector_id"),
+                                 o.get("detector_version"),
+                                 o.get("fingerprint"))
+        if k in seen:
+            coalesced += 1
+            continue
+        seen.add(k)
+        kept.append(dict(o, dedupe_key=k))
+        rekeyed += 1
+    if opath.exists():
+        _atomic_write_jsonl(opath, kept)
+    _atomic_write_json(meta_path, {
+        "identity_version": _OBS_IDENTITY_VERSION,
+        "dedupe_identity": "v2 (source_kind, lineage, span, detector, "
+                           "version, fingerprint) — generation excluded",
+        "migrated_at": _now()})
+    bits = []
+    if rekeyed:
+        bits.append(f"rekeyed {rekeyed} rows")
+    if coalesced:
+        bits.append(f"coalesced {coalesced} generation-era duplicates "
+                    "(earliest kept — provenance lives on the kept row)")
+    if corrupt:
+        bits.append(f"{corrupt} corrupt store lines skipped (pre-existing, "
+                    "counted, not silent)")
+    if foreign:
+        bits.append(f"{foreign} foreign-version rows preserved verbatim")
+    return [f"observation store migrated to identity v2: " + "; ".join(bits)] \
+        if bits else []
 
 
 def commit_batch(state_dir, entry, observations, cursor, stats):
@@ -569,10 +775,13 @@ def commit_batch(state_dir, entry, observations, cursor, stats):
                 "(sol t31 F31.6)")
         prev = existing.get(obs["dedupe_key"])
         if prev is not None:
-            # `at` is observation time, not identity: replay after a cursor
-            # reset re-derives the same key with a fresh timestamp and MUST
-            # stay a no-op. Everything else must match exactly.
-            ident = lambda o: {k: o[k] for k in o if k != "at"}
+            # `at` and `generation` are observation metadata, not identity:
+            # replay after an append or an explicit re-scan re-derives the
+            # same key with a fresh timestamp and possibly a newer
+            # generation, and MUST stay a no-op that preserves the original
+            # row immutably (F2). Everything else must match exactly.
+            ident = lambda o: {k: o[k] for k in o
+                               if k not in ("at", "generation")}
             if _canonical(ident(prev)) != _canonical(ident(obs)):
                 raise ValueError(
                     f"integrity error: conflicting record for "
@@ -668,6 +877,125 @@ def _page_state(cstate, fresh):
     return (dict(cstate.get("cmd_fps", {})),
             list(cstate.get("pending_fps", [])),
             dict(cstate.get("att_offs", {})))
+
+
+# ------------------------------------------------------------ anchors
+
+def _load_anchors(state):
+    """Integrity anchors per source key, validated like cursors. Legacy
+    stores have no anchors.json — absence is a typed reset-once condition
+    in the tick (explicit migration, never a silent assumption)."""
+    apath = state / _ANCHOR_FILE
+    if not apath.exists():
+        return {}, []
+    try:
+        raw = json.loads(apath.read_text())
+    except Exception:
+        return {}, [f"{_ANCHOR_FILE} unreadable — all anchors reset "
+                    "(one-time explicit re-scan per affected source)"]
+    if not isinstance(raw, dict):
+        return {}, [f"{_ANCHOR_FILE} not a mapping — all anchors reset"]
+
+    def _bad_entry(k):
+        return f"anchor entry {k[:40]}: invalid — dropped (explicit re-scan)"
+
+    clean, notes = {}, []
+    for k, v in raw.items():
+        if not isinstance(v, dict) or type(v.get("size")) is not int \
+                or v["size"] < 0 or not isinstance(v.get("head_sha"), str) \
+                or not isinstance(v.get("tail_sha"), str):
+            notes.append(_bad_entry(k))
+            continue
+        chunks = v.get("chunks")
+        if not isinstance(chunks, list) or any(
+                not isinstance(c, dict)
+                or type(c.get("start")) is not int or c["start"] < 0
+                or type(c.get("len")) is not int or c["len"] < 0
+                or not isinstance(c.get("sha"), str) or len(c["sha"]) != 64
+                for c in chunks) or len(chunks) > _MAX_ANCHOR_CHUNKS:
+            notes.append(_bad_entry(k))
+            continue
+        pos = v.get("verify_pos", 0)
+        if type(pos) is not int or pos < 0:
+            notes.append(_bad_entry(k))
+            continue
+        clean[k] = {"size": v["size"], "head_sha": v["head_sha"],
+                    "tail_sha": v["tail_sha"], "chunks": [
+                        {"start": c["start"], "len": c["len"],
+                         "sha": c["sha"]} for c in chunks],
+                    "verify_pos": pos}
+    return clean, notes
+
+
+def _save_anchors(state, anchors):
+    _atomic_write_json(Path(state) / _ANCHOR_FILE, anchors)
+
+
+def _refresh_anchor_windows(path, consumed):
+    """Full head/tail hashes over the CONSUMED prefix (exactly [0,
+    consumed) — never past the cursor), read from the live file — two
+    bounded reads. For consumed <= 64KiB the head window IS the whole
+    prefix (tail == head)."""
+    head = tail = b""
+    if consumed > 0:
+        with Path(path).open("rb") as f:
+            head = f.read(min(_ANCHOR_WINDOW, consumed))
+            if consumed > _ANCHOR_WINDOW:
+                f.seek(consumed - _ANCHOR_WINDOW)
+                tail = f.read(_ANCHOR_WINDOW)
+            else:
+                tail = head
+    return _sha(head), _sha(tail)
+
+
+def _growth_verdict(path, anchor):
+    """Immediate window verdict for a grown source: ("append", coverage)
+    | ("mutated", None). coverage is "full" when the two windows prove the
+    WHOLE consumed prefix unchanged (prefix <= 128KiB) and "sampled" when
+    only the head is proved and the anchor rotation owns the interior."""
+    old = anchor.get("size", 0)
+    with Path(path).open("rb") as f:
+        head = f.read(min(_ANCHOR_WINDOW, old)) if old > 0 else b""
+    if _sha(head) != anchor.get("head_sha"):
+        return "mutated", None
+    if old <= _ANCHOR_WINDOW:
+        return "append", "full"
+    if old <= _ANCHOR_FULL_LIMIT:
+        with Path(path).open("rb") as f:
+            f.seek(old - _ANCHOR_WINDOW)
+            old_tail = f.read(_ANCHOR_WINDOW)
+        if _sha(old_tail) == anchor.get("tail_sha"):
+            return "append", "full"
+        return "mutated", None
+    return "append", "sampled"
+
+
+def _verify_prefix_chunks(path, anchor, budget_bytes):
+    """Rotationally verify bounded anchor chunks of the consumed prefix —
+    the detector for same-size interior rewrites the sampled generation
+    token cannot see (F6). One sweep max per call, cyclic from
+    verify_pos; cost never counts against the page budget. Returns
+    (ok, mismatch_note, verified_bytes, new_pos)."""
+    chunks = anchor.get("chunks") or []
+    if not chunks or budget_bytes <= 0:
+        return True, None, 0, anchor.get("verify_pos", 0)
+    pos = anchor.get("verify_pos", 0) % len(chunks)
+    verified = 0
+    with Path(path).open("rb") as f:
+        for k in range(len(chunks)):
+            ch = chunks[(pos + k) % len(chunks)]
+            if k > 0 and verified + ch["len"] > budget_bytes:
+                break
+            f.seek(ch["start"])
+            data = f.read(ch["len"])
+            if len(data) != ch["len"] or _sha(data) != ch["sha"]:
+                return False, (
+                    f"consumed-prefix mutation detected in anchor chunk "
+                    f"[bytes@{ch['start']}+{ch['len']}] on {path} — content "
+                    "changed under recorded evidence; re-scanning with "
+                    "FRESH detector state"), verified, (pos + k) % len(chunks)
+            verified += ch["len"]
+    return True, None, verified, (pos + len(chunks)) % len(chunks)
 
 
 # ------------------------------------------------------------ patterns
@@ -847,8 +1175,13 @@ def propose_claims(state_dir, ranked, cap=5, max_outbox=200):
 def tick(sources, state_dir=None, max_bytes_per_source=262144,
          claim_cap=5, max_pages=10, max_outbox=200):
     """One BOUNDED pass (sol t25 #5): page budget stops the pass with
-    explicit backlog reporting; generation validated around every commit;
-    corrupted cursors reset explicitly; zero model calls."""
+    explicit backlog reporting; growing sources PROGRESS from the stored
+    cursor when the integrity anchor verifies the consumed prefix (F1
+    repair), and same-size interior rewrites are caught by the anchor
+    rotation regardless of the token (F6 repair); generation validated
+    around every commit; corrupted cursors reset explicitly; zero model
+    calls. The tick body runs under the state lock — concurrent ticks
+    serialize (acceptance 4)."""
     if not isinstance(max_bytes_per_source, int) \
             or isinstance(max_bytes_per_source, bool) \
             or max_bytes_per_source <= 0:
@@ -859,120 +1192,229 @@ def tick(sources, state_dir=None, max_bytes_per_source=262144,
         else DEFAULT_STATE.expanduser()
     report = {"at": _now(), "census_sources": 0, "gaps": 0,
               "pages_read": 0, "observations": 0, "patterns": 0,
-              "proposals": 0, "backlog_remaining": 0, "notes": []}
-    manifest = census(sources, state_dir=state)
-    report["census_sources"] = len(manifest["sources"])
-    report["gaps"] = len(manifest["gaps"])
-    cursors, cursor_notes = _load_cursors(state)
-    report["notes"].extend(cursor_notes)
-    try:
-        raw_scanned = json.loads((state / "scanned.json").read_text())
-        if isinstance(raw_scanned, list) and all(
-                isinstance(x, str) and x for x in raw_scanned):
-            scanned = set(raw_scanned)
-        else:
-            raise ValueError("invalid cohort shape")
-    except FileNotFoundError:
-        # missing state is recovered the same as malformed state — a lost
-        # file must not silently erase completed scans (sol t33 F33.2)
-        report["notes"].append(
-            "scanned.json absent — cohort rebuilt from validated cursors")
-        scanned = {c["lineage_id"] for c in cursors.values()
-                   if isinstance(c.get("lineage_id"), str)
-                   and c["lineage_id"]}
-    except Exception:
-        # corruption never INVENTS cohort members (sol t32 F32.4): rebuild
-        # from validated cursor lineage ids and say so
-        report["notes"].append(
-            "scanned.json invalid — cohort rebuilt from validated cursors")
-        scanned = {c["lineage_id"] for c in cursors.values()
-                   if isinstance(c.get("lineage_id"), str)
-                   and c["lineage_id"]}
-    pages = 0
-    backlog = 0
-    for entry in manifest["sources"]:
-        if entry.get("status") != "ok":
-            continue
-        if pages >= max_pages:
-            backlog += 1
-            continue
-        p = Path(entry["path"])
-        size = p.stat().st_size
-        cstate = cursors.get(
-            f"{entry['source_kind']}::{entry['path']}", {})
-        cur = cstate.get("cursor", 0)
-        fresh = False
-        if not isinstance(cur, int) or cur < 0 or cur > size:
-            if cur:
-                report["notes"].append(
-                    f"cursor out of bounds on {entry['path']}: reset "
-                    "(replay dedupes)")
-            cur, fresh = 0, True
-        if cstate.get("generation") not in (None, entry["generation"]):
+              "proposals": 0, "backlog_remaining": 0,
+              "coverage_complete": 0, "new_tail_bytes": 0,
+              "prefix_verified_bytes": 0, "notes": []}
+    with _state_lock(state):
+        report["notes"].extend(migrate_observations(state))
+        manifest = census(sources, state_dir=state)
+        report["census_sources"] = len(manifest["sources"])
+        report["gaps"] = len(manifest["gaps"])
+        cursors, cursor_notes = _load_cursors(state)
+        report["notes"].extend(cursor_notes)
+        anchors, anchor_notes = _load_anchors(state)
+        report["notes"].extend(anchor_notes)
+        try:
+            raw_scanned = json.loads((state / "scanned.json").read_text())
+            if isinstance(raw_scanned, list) and all(
+                    isinstance(x, str) and x for x in raw_scanned):
+                scanned = set(raw_scanned)
+            else:
+                raise ValueError("invalid cohort shape")
+        except FileNotFoundError:
+            # missing state is recovered the same as malformed state — a lost
+            # file must not silently erase completed scans (sol t33 F33.2)
             report["notes"].append(
-                f"source generation changed: {entry['path']} — reprocessing "
-                "with FRESH detector state")
-            cur, fresh = 0, True
-        if cstate.get("lineage_id") not in (None, entry["lineage_id"]):
+                "scanned.json absent — cohort rebuilt from validated cursors")
+            scanned = {c["lineage_id"] for c in cursors.values()
+                       if isinstance(c.get("lineage_id"), str)
+                       and c["lineage_id"]}
+        except Exception:
+            # corruption never INVENTS cohort members (sol t32 F32.4): rebuild
+            # from validated cursor lineage ids and say so
             report["notes"].append(
-                f"lineage changed on {entry['path']} — reprocessing with "
-                "FRESH detector state (sol t32 F32.1)")
-            cur, fresh = 0, True
-        gen = entry["generation"]
-        lineage = entry["lineage_id"]
-        cmd_fps, pending_fps, att_offs = _page_state(cstate, fresh)
-        read_any = False
-        deferred = False
-        while pages < max_pages and cur < size:
-            text, nxt, done, line_offs = read_page(p, cur,
-                                                   max_bytes_per_source)
-            if not text:
-                break
-            obs, pending_fps, att_offs = extract_page_with_state(
-                entry["source_kind"], entry["path"], gen, lineage, text,
-                cur, cmd_fps, pending_fps, att_offs=att_offs,
-                line_offs=line_offs)
-            pages += 1
-            read_any = True
-            report["pages_read"] += 1
-            report["observations"] += len(obs)
-            # generation validated BEFORE recording (sol t25 #3)
-            if generation(p) != gen:
+                "scanned.json invalid — cohort rebuilt from validated cursors")
+            scanned = {c["lineage_id"] for c in cursors.values()
+                       if isinstance(c.get("lineage_id"), str)
+                       and c["lineage_id"]}
+        pages = 0
+        backlog = 0
+        for entry in manifest["sources"]:
+            if entry.get("status") != "ok":
+                continue
+            if pages >= max_pages:
+                backlog += 1
+                continue
+            p = Path(entry["path"])
+            size = p.stat().st_size
+            key = f"{entry['source_kind']}::{entry['path']}"
+            cstate = cursors.get(key, {})
+            anchor = anchors.get(key)
+            cur = cstate.get("cursor", 0)
+            gen = entry["generation"]
+            lineage = entry["lineage_id"]
+            fresh = False
+            anchors_dirty = False
+
+            def _reset(note):
+                nonlocal cur, fresh, anchor, anchors_dirty
+                report["notes"].append(note)
+                cur, fresh = 0, True
+                if key in anchors:
+                    anchors.pop(key)
+                    anchors_dirty = True
+                anchor = None
+
+            # ---- identity + progression decision (F1/F6 repair) ----
+            if not isinstance(cur, int) or isinstance(cur, bool) \
+                    or cur < 0 or cur > size:
+                if cur > size and anchor is not None \
+                        and anchor["size"] > size:
+                    _reset(f"source truncated: {entry['path']} "
+                           f"({anchor['size']} -> {size} bytes) — explicit "
+                           "re-scan with FRESH detector state")
+                elif cur:
+                    _reset(f"cursor out of bounds on {entry['path']}: reset "
+                           "(replay dedupes)")
+                else:
+                    cur, fresh = 0, True
+            elif cstate.get("lineage_id") not in (None, lineage):
+                _reset(f"lineage changed on {entry['path']} — reprocessing "
+                       "with FRESH detector state (sol t32 F32.1)")
+            elif cur == 0 or cstate.get("generation") is None:
+                fresh = True  # first read; nothing consumed to verify
+            elif anchor is None:
+                _reset(f"integrity anchor absent for consumed prefix on "
+                       f"{entry['path']} — explicit one-time re-scan to "
+                       "build the anchor (replay dedupes)")
+            elif size < anchor["size"]:
+                _reset(f"source truncated: {entry['path']} "
+                       f"({anchor['size']} -> {size} bytes) — explicit "
+                       "re-scan with FRESH detector state")
+            else:
+                # rotation re-verification runs on EVERY pass over an
+                # anchored prefix — it is the detector for same-size
+                # interior rewrites the sampled generation token cannot
+                # see (F6); its cost never counts against the page budget
+                ok, mismatch, vbytes, vpos = _verify_prefix_chunks(
+                    p, anchor, max_bytes_per_source * 4)
+                report["prefix_verified_bytes"] += vbytes
+                if not ok:
+                    _reset(mismatch)
+                else:
+                    anchor["verify_pos"] = vpos
+                    anchors_dirty = True
+                    if cstate.get("generation") not in (None, gen):
+                        if size == anchor["size"]:
+                            _reset(f"content mutated at unchanged size: "
+                                   f"{entry['path']} — re-scanning with "
+                                   "FRESH detector state")
+                        else:
+                            verdict, coverage = _growth_verdict(p, anchor)
+                            if verdict == "mutated":
+                                _reset(f"prefix content mutated across "
+                                       f"growth on {entry['path']} — "
+                                       "re-scanning with FRESH detector "
+                                       "state")
+                            else:
+                                # the consumed prefix is retained; the
+                                # delta is UNREAD tail (appended or
+                                # otherwise changed — read fresh either
+                                # way), never a re-observation of old
+                                # bytes
+                                report["notes"].append(
+                                    f"prefix progression on {entry['path']}: "
+                                    f"consumed prefix retained (integrity: "
+                                    f"{coverage}); {size - anchor['size']} "
+                                    "tail bytes to read")
+
+            cmd_fps, pending_fps, att_offs = _page_state(cstate, fresh)
+            local_chunks = [] if fresh else \
+                [dict(c) for c in (anchor or {}).get("chunks", [])]
+            prev_pos = 0 if fresh else (anchor or {}).get("verify_pos", 0)
+            read_any = False
+            deferred = False
+            cap_noted = False
+            src_bytes = 0
+            utf8_hits = 0
+            while pages < max_pages and cur < size:
+                page = read_page(p, cur, max_bytes_per_source)
+                text, nxt, done, line_offs = page
+                if not text:
+                    break
+                utf8_hits += text.count("\ufffd")
+                obs, pending_fps, att_offs = extract_page_with_state(
+                    entry["source_kind"], entry["path"], gen, lineage, text,
+                    cur, cmd_fps, pending_fps, att_offs=att_offs,
+                    line_offs=line_offs)
+                pages += 1
+                read_any = True
+                report["pages_read"] += 1
+                report["observations"] += len(obs)
+                src_bytes += nxt - cur  # bytes newly consumed this pass
+                # (previously unread gap + appended tail)
+                # generation validated BEFORE recording (sol t25 #3)
+                if generation(p) != gen:
+                    report["notes"].append(
+                        f"generation flapped mid-read: {entry['path']} — "
+                        "page discarded, source deferred")
+                    deferred = True  # counted in backlog + gaps (F33.5)
+                    break
+                commit_batch(state, entry, obs, nxt,
+                             {"cmd_fps": cmd_fps, "pending_fps": pending_fps,
+                              "att_offs": att_offs})
+                if page.raw is not None:
+                    if len(local_chunks) < _MAX_ANCHOR_CHUNKS:
+                        local_chunks.append({"start": cur,
+                                             "len": len(page.raw),
+                                             "sha": _sha(page.raw)})
+                    elif not cap_noted:
+                        report["notes"].append(
+                            f"anchor chunk cap reached on {entry['path']} — "
+                            "prefix integrity sampled beyond "
+                            f"{_MAX_ANCHOR_CHUNKS} chunks")
+                        cap_noted = True
+                cur = nxt
+                if done:
+                    break
+            if read_any:
+                scanned.add(lineage)
+                report["new_tail_bytes"] += src_bytes
+            if deferred:
+                backlog += 1
+                report["gaps"] += 1
+            elif cur < size and pages >= max_pages:
+                backlog += 1
+            if cur >= size:
+                # closed SNAPSHOT coverage: everything visible at pass
+                # start is consumed; bytes appended AFTER that are new
+                # tail for the next pass — the two are reported apart
+                report["coverage_complete"] += 1
+            if utf8_hits:
                 report["notes"].append(
-                    f"generation flapped mid-read: {entry['path']} — "
-                    "page discarded, source deferred")
-                deferred = True  # counted in backlog + gaps (F33.5)
-                break
-            commit_batch(state, entry, obs, nxt,
-                         {"cmd_fps": cmd_fps, "pending_fps": pending_fps,
-                          "att_offs": att_offs})
-            cur = nxt
-            if done:
-                break
-        if read_any:
-            scanned.add(lineage)
-        if deferred:
-            backlog += 1
-            report["gaps"] += 1
-        elif cur < size and pages >= max_pages:
-            backlog += 1
-    report["backlog_remaining"] = backlog
-    # opportunities use the MEASURED scanned cohort (sol t31 F31.2), never
-    # the enrolled count; both are reported
-    _atomic_write_json(state / "scanned.json", sorted(scanned))
-    report["scanned_lineages"] = len(scanned)
-    report["enrolled_lineages"] = manifest.get("lineages", 0)
-    patterns = group_patterns(load_observations(state),
-                              scanned_lineages=len(scanned))
-    report["patterns"] = sum(1 for p in patterns if p["eligible"])
-    needs = read_needs(state)
-    if not needs.get("available"):
-        report["notes"].append(needs["reason"])
-    ranked = rank_patterns(patterns, needs)
-    proposals, cap_note = propose_claims(state, ranked, cap=claim_cap,
-                                         max_outbox=max_outbox)
-    report["proposals"] = len(proposals)
-    if cap_note.get("capacity") != "ok":
-        report["notes"].append(f"outbox {cap_note['capacity']}")
-    report["notes"].append(f"pass bounded: {pages} pages this pass")
+                    f"utf8 replacement sequences in {entry['path']}: "
+                    f"{utf8_hits} (detection-only decode; spans stay "
+                    "byte-exact)")
+            if not deferred and cur > 0:
+                head_sha, tail_sha = _refresh_anchor_windows(p, min(cur, size))
+                anchors[key] = {"size": cur, "head_sha": head_sha,
+                                "tail_sha": tail_sha,
+                                "chunks": local_chunks, "verify_pos": prev_pos,
+                                "at": _now()}
+                anchors_dirty = True
+            if anchors_dirty:
+                _save_anchors(state, anchors)
+        report["backlog_remaining"] = backlog
+        # opportunities use the MEASURED scanned cohort (sol t31 F31.2), never
+        # the enrolled count; both are reported
+        _atomic_write_json(state / "scanned.json", sorted(scanned))
+        report["scanned_lineages"] = len(scanned)
+        report["enrolled_lineages"] = manifest.get("lineages", 0)
+        obs_rows, corrupt_n, _foreign = load_observations_report(state)
+        if corrupt_n:
+            report["notes"].append(
+                f"observation store: {corrupt_n} corrupt lines skipped "
+                "(counted, not silent)")
+        patterns = group_patterns(obs_rows, scanned_lineages=len(scanned))
+        report["patterns"] = sum(1 for p in patterns if p["eligible"])
+        needs = read_needs(state)
+        if not needs.get("available"):
+            report["notes"].append(needs["reason"])
+        ranked = rank_patterns(patterns, needs)
+        proposals, cap_note = propose_claims(state, ranked, cap=claim_cap,
+                                             max_outbox=max_outbox)
+        report["proposals"] = len(proposals)
+        if cap_note.get("capacity") != "ok":
+            report["notes"].append(f"outbox {cap_note['capacity']}")
+        report["notes"].append(f"pass bounded: {pages} pages this pass")
     return report
