@@ -349,6 +349,7 @@ def _sync_native_document(
     state_scope: str | None = None,
     _watermark: dict | None = None,
     _version_lookup=None,
+    _checkpoint=None,
 ) -> tuple[int, int, int]:
     """Three-way synchronize one sanctioned native Markdown document.
 
@@ -362,7 +363,8 @@ def _sync_native_document(
 
     A tree pass may supply its lock-scoped watermark to avoid reloading the
     entire harness checkpoint for every document. Changed document state is
-    still saved before returning; unchanged state does not rewrite it.
+    saved before returning unless the locked tree supplies its completion
+    checkpoint callback; unchanged state does not rewrite it.
     """
     lookup_version = _version_lookup or (lambda name, digest: version_for_digest(root, namespace, name, digest))
     hub = get_namespace_dir(root, namespace) / filename
@@ -508,7 +510,10 @@ def _sync_native_document(
         state["delivered_hub_digest"] = file_sha256(hub)
         state["delivered_version"] = lookup_version(filename, state["delivered_hub_digest"])
     if new_state or removed_legacy or state != previous_state:
-        save_watermark(root, watermark)
+        if _checkpoint is None:
+            save_watermark(root, watermark)
+        else:
+            _checkpoint()
     return ingested, delivered, deleted
 
 
@@ -572,32 +577,57 @@ def _sync_native_tree(
     # snapshot across passes: another writer may update the checkpoint then.
     watermark = load_watermark(root, harness)
     lookup_version = _version_lookup or _native_version_lookup(root, namespace)
-    for relative in sorted(set(local) | set(hub)):
-        safe_relative = _safe_native_relative(relative)
-        if safe_relative is None:
-            continue
-        filename = hub.get(relative)
-        if filename is None:
-            slug = re.sub(r"[^a-z0-9]+", "-", safe_relative.stem.lower()).strip("-")[:40] or "memory"
-            key = hashlib.sha256(relative.encode()).hexdigest()[:12]
-            filename = f"native-{harness}-{prefix}-{key}-{slug}.md"
-        inc, outc, delc = _sync_native_document(
-            root,
-            harness,
-            directory / safe_relative,
-            namespace,
-            filename,
-            f"{prefix} {relative}",
-            target_harness=target_harness,
-            managed_block=None,
-            native_path=relative,
-            state_scope=str(directory),
-            _watermark=watermark,
-            _version_lookup=lookup_version,
-        )
-        ingested += inc
-        delivered += outc
-        deleted += delc
+    dirty = False
+
+    def checkpoint():
+        nonlocal dirty
+        dirty = True
+
+    # All callers hold the global sync lock. Persist one complete checkpoint
+    # per tree, including completed documents on an ordinary exception. The
+    # journal remains the durable source for replay after process loss.
+    try:
+        for relative in sorted(set(local) | set(hub)):
+            safe_relative = _safe_native_relative(relative)
+            if safe_relative is None:
+                continue
+            filename = hub.get(relative)
+            if filename is None:
+                slug = re.sub(r"[^a-z0-9]+", "-", safe_relative.stem.lower()).strip("-")[:40] or "memory"
+                key = hashlib.sha256(relative.encode()).hexdigest()[:12]
+                filename = f"native-{harness}-{prefix}-{key}-{slug}.md"
+            keys = (f"{namespace}/{filename}", f"{namespace}/{filename}::{directory}")
+            documents = watermark.setdefault("native_documents", {})
+            previous = {key: dict(documents[key]) if key in documents else None for key in keys}
+            try:
+                inc, outc, delc = _sync_native_document(
+                    root,
+                    harness,
+                    directory / safe_relative,
+                    namespace,
+                    filename,
+                    f"{prefix} {relative}",
+                    target_harness=target_harness,
+                    managed_block=None,
+                    native_path=relative,
+                    state_scope=str(directory),
+                    _watermark=watermark,
+                    _version_lookup=lookup_version,
+                    _checkpoint=checkpoint,
+                )
+            except BaseException:
+                for key, value in previous.items():
+                    if value is None:
+                        documents.pop(key, None)
+                    else:
+                        documents[key] = value
+                raise
+            ingested += inc
+            delivered += outc
+            deleted += delc
+    finally:
+        if dirty:
+            save_watermark(root, watermark)
     return ingested, delivered, deleted
 
 
