@@ -39462,7 +39462,7 @@ mod test_settings_string_overrides {
 
     /// Panic-safe restore: a fixture body that panics still unwinds the
     /// staged set back to the previous value on the same thread.
-    pub(crate) struct Restore(Option<Vec<(String, String)>>);
+    pub(crate) struct Restore(pub(crate) Option<Vec<(String, String)>>);
 
     impl Drop for Restore {
         fn drop(&mut self) {
