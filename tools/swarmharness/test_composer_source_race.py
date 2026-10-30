@@ -10,16 +10,22 @@ different inode; tick N+1 census rebinds to the new lineage through the
 designed reset and re-mines the same bytes — two "independent" incident
 lineages for one physical swap, eligible=true.
 
-The repair: the tick validates generation, size AND lineage off ONE
-handle after every read and before every commit; a flapping axis is a
-typed defer (page discarded, cursor/anchor never advance), and the new
-lineage is rebound only through the explicit lineage-change reset on a
-later pass.
+The repair: every page carries `.rid` — the (dev, ino, size) fstat'ed on
+the ONE handle that read it — and the tick commits only when that read
+lineage equals the census lineage; the post-read pathname check
+(generation, size AND lineage off ONE handle) is retained for the
+read→validation window. A flapping axis is a typed defer (page
+discarded, cursor/anchor never advance), and the new lineage is rebound
+only through the explicit lineage-change reset on a later pass. The
+validation→commit sub-window stays unlocked (no pathname lock); the next
+pass's checks catch it — stated, never claimed closed.
 
-Tests the swap in both windows — before the read's open (census→read)
-and after the read returns (read→validation) — plus controls: a stable
-append keeps the current lineage with plain progression, and genuinely
-distinct lineages still make a pattern eligible.
+Tests the swap in all three windows — before the read's open (census→read),
+inside the read with the census inode restored before validation
+(read-restore ABA: byte-identical and different-bytes), and after the
+read returns (read→validation) — plus controls: a stable append keeps the
+current lineage with plain progression, and genuinely distinct lineages
+still make a pattern eligible.
 
 Hermetic: tempdirs only, no network, no model calls, no live state.
 Run:  python3 tools/swarmharness/test_composer_source_race.py
@@ -66,22 +72,48 @@ def fault_lineages(state):
             or o["detector_id"].startswith("sig-")}
 
 
-def swap_patch(src, twin, when):
+def _anchor_substance(anchor):
+    """Anchor content minus volatile fields (bytes or a file path): the
+    per-pass rewrite round-trips through _load_anchors, which rebuilds
+    entries without the `at` timestamp — compare what the anchor CLAIMS,
+    not when."""
+    body = json.loads(
+        Path(anchor).read_text() if isinstance(anchor, Path) else anchor)
+    for entry in body.values():
+        entry.pop("at", None)
+    return body
+
+
+def swap_patch(src, twin, when, parked=None, captured=None):
     """Patch read_page so the path is replaced by the byte-identical
-    twin inode either BEFORE the original open (`when="before-open"`)
-    or AFTER the original read returns (`when="after-read"`). One
-    replacement only — the swap is a physical event, not a loop."""
+    twin inode either BEFORE the original open (`when="before-open"`),
+    AFTER the original read returns (`when="after-read"`), or ONLY
+    INSIDE the read (`when="read-restore"` — the twin is placed for the
+    open and the census inode is restored before read_page returns, so
+    validation opens the census inode: the CSR-05 EDITOR-01 restore
+    geometry). One replacement cycle only — the swap is a physical
+    event, not a loop. `captured`, when a dict, receives the first real
+    page (with its .rid read-handle identity)."""
     real = cp.read_page
     fired = {"v": False}
+    parked = parked or src.parent / (src.name + ".parked")
 
     def swapping(path, cursor=0, max_bytes=262144):
         if not fired["v"]:
             fired["v"] = True
             if when == "before-open":
                 os.replace(twin, src)
+            elif when == "read-restore":
+                os.replace(src, parked)
+                os.replace(twin, src)
             page = real(path, cursor, max_bytes)
+            if captured is not None:
+                captured["page"] = page
             if when == "after-read":
                 os.replace(twin, src)
+            elif when == "read-restore":
+                os.replace(src, twin)
+                os.replace(parked, src)
             return page
         return real(path, cursor, max_bytes)
 
@@ -270,10 +302,142 @@ def t_c2_two_lineage_eligibility_control():
     shutil.rmtree(w)
 
 
+# =====================================================================
+# R4 — read-restore ABA, byte-identical: the page must answer for its
+# OWN read handle, not for what the path holds at validation time
+# =====================================================================
+
+def t_r4_read_restore_byte_identical_aba():
+    """Editor geometry (CSR05-EDITOR-01): rename the census inode aside,
+    place a byte-identical twin ONLY while read_page's own handle reads
+    it, restore the census inode before validation. The path-only check
+    then matches the census — the old code committed the twin's bytes
+    under the census lineage. The read identity must reject it."""
+    w = fresh("r4")
+    state = w / "state"
+    src = w / "board.jsonl"
+    parked = w / "parked.jsonl"
+    src.write_text(CLEAN)
+    cp.tick({"board": [str(src)]}, state_dir=state)
+    lineage_a = json.loads((state / "cursors.json").read_text())[
+        "board::" + str(src)]["lineage_id"]
+    cursors_before = (state / "cursors.json").read_bytes()
+    anchors_before = (state / "anchors.json").read_bytes()
+
+    with src.open("a") as f:
+        f.write(FAULT * 4)
+    twin = w / "twin.jsonl"
+    twin.write_bytes(src.read_bytes())  # byte-identical, OWN inode
+    lineage_b = cp.source_identity(twin)[2]
+    check("R4-0 fixture: byte-identical twin, distinct physical lineage",
+          lineage_a != lineage_b and twin.read_bytes() == src.read_bytes(),
+          json.dumps({"a": lineage_a, "b": lineage_b}))
+
+    seen = {}
+    with swap_patch(src, twin, "read-restore", parked=parked,
+                    captured=seen):
+        r1 = cp.tick({"board": [str(src)]}, state_dir=state)
+
+    rid_lineage = cp._sha(f"{seen['page'].rid[0]}:{seen['page'].rid[1]}")[:16]
+    flap = [n for n in r1["notes"] if "read-lineage" in n]
+    check("R4-1 the page was really read from the twin's handle while the "
+          "path held the census inode (old check was blind here)",
+          rid_lineage == lineage_b
+          and cp.source_identity(src)[2] == lineage_a,
+          json.dumps({"rid": rid_lineage, "path": lineage_a}))
+    check("R4-2 the read-identity mismatch is a typed defer",
+          bool(flap) and r1["gaps"] >= 1,
+          json.dumps(r1["notes"])[:240])
+    check("R4-3 nothing from the foreign read is published: zero "
+          "observations, cursor never advances, anchor never blesses the "
+          "twin bytes (substantive anchor fields equal baseline)",
+          rows_for(state) == []
+          and (state / "cursors.json").read_bytes() == cursors_before
+          and _anchor_substance(state / "anchors.json")
+          == _anchor_substance(anchors_before),
+          json.dumps([o["dedupe_key"][:12] for o in rows_for(state)]))
+
+    # expose the twin for the next pass: the designed lineage rebind
+    # mines B once, under B — never a second incident attributed to A
+    os.replace(src, parked)
+    os.replace(twin, src)
+    r2 = cp.tick({"board": [str(src)]}, state_dir=state)
+    lins = fault_lineages(state)
+    check("R4-4 the later rebind mines the twin ONCE under ITS lineage",
+          len(lins) == 1 and lineage_b in lins and lineage_a not in lins,
+          json.dumps({"lineages": sorted(lins)})[:140])
+    check("R4-5 one physical swap still never fabricates an eligible "
+          "pattern", eligible_fault_patterns(state) == [],
+          json.dumps([p["independent_incidents"]
+                      for p in eligible_fault_patterns(state)]))
+    check("R4-6 the rebind went through the explicit lineage reset",
+          any("lineage changed" in n for n in r2["notes"]),
+          json.dumps(r2["notes"])[:200])
+    shutil.rmtree(w)
+
+
+# =====================================================================
+# R5 — read-restore ABA, different bytes: a fault-free census inode is
+# never slandered with another inode's faults
+# =====================================================================
+
+def t_r5_restore_different_bytes_aba():
+    """Same-size different-bytes control: fault-free A is censused, a
+    faulty twin B is read, A restored before validation. The faults
+    belong to B and must not be committed under A's lineage."""
+    w = fresh("r5")
+    state = w / "state"
+    src = w / "board.jsonl"
+    parked = w / "parked.jsonl"
+    src.write_text("x" * (len(FAULT) - 1) + "\n")  # A: fault-free, |A|=|FAULT|
+    lineage_a = cp.source_identity(src)[2]
+    twin = w / "twin.jsonl"
+    twin.write_text(FAULT)                          # B: faulty, same size
+    lineage_b = cp.source_identity(twin)[2]
+    assert lineage_a != lineage_b
+    assert cp.source_identity(src)[1] == cp.source_identity(twin)[1]
+
+    seen = {}
+    with swap_patch(src, twin, "read-restore", parked=parked,
+                    captured=seen):
+        r1 = cp.tick({"board": [str(src)]}, state_dir=state)
+
+    rid_lineage = cp._sha(f"{seen['page'].rid[0]}:{seen['page'].rid[1]}")[:16]
+    check("R5-1 the faults were read off B's handle; validation-time path "
+          "was the census inode (path-only check saw nothing)",
+          rid_lineage == lineage_b
+          and cp.source_identity(src)[2] == lineage_a
+          and rows_for(state) == [],
+          json.dumps({"rid": rid_lineage, "path": lineage_a,
+                      "rows": len(rows_for(state))}))
+    check("R5-2 the defer is typed on the read identity and the fault-free "
+          "census lineage never appears in evidence",
+          any("read-lineage" in n for n in r1["notes"])
+          and fault_lineages(state) == set(),
+          json.dumps(r1["notes"])[:240])
+
+    # exposing B mines its own faults under ITS lineage — genuine
+    # detection, correct provenance, still not eligible alone
+    os.replace(src, parked)
+    os.replace(twin, src)
+    cp.tick({"board": [str(src)]}, state_dir=state)
+    lins = fault_lineages(state)
+    check("R5-3 the twin's own faults later land under the twin's lineage "
+          "only", len(lins) == 1 and lineage_b in lins,
+          json.dumps({"lineages": sorted(lins)})[:140])
+    check("R5-4 and the repair blocks detection of nothing: the twin IS "
+          "mined once exposed", len(rows_for(state)) >= 1
+          and eligible_fault_patterns(state) == [],
+          json.dumps({"rows": len(rows_for(state))}))
+    shutil.rmtree(w)
+
+
 def main():
     t_r1_swap_before_open()
     t_r2_swap_after_read()
     t_r3_truncate_mid_read()
+    t_r4_read_restore_byte_identical_aba()
+    t_r5_restore_different_bytes_aba()
     t_c1_stable_append_control()
     t_c2_two_lineage_eligibility_control()
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed")

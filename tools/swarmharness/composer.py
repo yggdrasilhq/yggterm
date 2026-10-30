@@ -8,7 +8,14 @@ dispatches, never spawns workers, never publishes lessons by itself.
 
 Identity model (sol t25 #1/#3): a source has a stable LINEAGE (enrolled
 path) and a content GENERATION token (size + head64KiB + tail64KiB hashes).
-Incidents are counted per LINEAGE — an appended line is the same lineage,
+Every page additionally carries .rid — the (dev, ino, size) of the ONE
+handle that read it — and the tick commits only when that read identity
+equals the census lineage, so a path swapped away for the read and
+restored before validation can never launder another inode's bytes under
+the census identity (CSR-05 EDITOR-01). The validation→commit sub-window
+stays unlocked by design (no pathname lock exists); it is caught by the
+next pass's checks, never claimed closed. Incidents are counted per
+LINEAGE — an appended line is the same lineage,
 never a second incident. Observations bind their generation; a generation
 change mid-read aborts that source with an enumerated gap, never records
 cross-generation evidence.
@@ -565,12 +572,18 @@ def census(sources, cutoff=None, state_dir=None):
 class _Page(tuple):
     """The historical read_page 4-tuple (text, next_cursor, done,
     line_offs) carrying the raw emitted bytes for anchor hashing on
-    `.raw`. Oversized-drop pages return raw=None: the skipped bytes are
-    deliberately unanchored (typed in-content marker instead)."""
+    `.raw`, and `.rid` — the (st_dev, st_ino, st_size) fstat'ed on the
+    ONE opened handle that supplied the bytes (CSR-05 EDITOR-01). A path
+    swapped away before the open, or restored after the read, cannot
+    change what the handle was bound to, so .rid is the only identity the
+    page can truthfully claim. Oversized-drop pages return raw=None: the
+    skipped bytes are deliberately unanchored (typed in-content marker
+    instead)."""
 
-    def __new__(cls, text, nxt, done, line_offs, raw):
+    def __new__(cls, text, nxt, done, line_offs, raw, rid):
         self = super().__new__(cls, (text, nxt, done, line_offs))
         self.raw = raw
+        self.rid = rid
         return self
 
 
@@ -582,17 +595,29 @@ def read_page(path, cursor=0, max_bytes=262144):
     bytes (progress guaranteed, sol t28 V3-N1). The oversized bound applies
     to the individual leading unfinished record. Returns (text,
     next_cursor, done, line_offs) — RAW-BYTE start offsets of the emitted
-    complete records (sol t31 F31.4)."""
+    complete records (sol t31 F31.4). The page carries .rid =
+    (st_dev, st_ino, st_size) fstat'ed on this same reading handle — never
+    a separate path stat — so the caller can bind the bytes to the identity
+    of the inode that was actually read (CSR-05 EDITOR-01): size and both
+    cursor bounds come off that handle too, so one race-free open pairs
+    the bytes, the size and the identity."""
     if not isinstance(max_bytes, int) or isinstance(max_bytes, bool) \
             or max_bytes <= 0:
         raise ValueError(
             f"max_bytes must be a positive int, got {max_bytes!r} (F33.6)")
     p = Path(path)
-    size = p.stat().st_size
     raw = bytearray()
     pos = cursor
     eof = False
     with p.open("rb") as f:
+        # identity of the handle that supplies every byte below: fstat on
+        # the SAME fd the reads flow through (CSR-05 EDITOR-01) — an
+        # fd-bound rename/replace cannot change it, so a path that is
+        # swapped away for this read and restored before validation is
+        # exposed by comparing .rid against the census identity.
+        st = os.fstat(f.fileno())
+        size = st.st_size
+        rid = (st.st_dev, st.st_ino, st.st_size)
         f.seek(pos)
         while True:
             chunk = f.read(max_bytes)
@@ -611,7 +636,7 @@ def read_page(path, cursor=0, max_bytes=262144):
                 first = pieces[0] if pieces else raw
                 marker = f"<<oversized-event dropped at bytes@{cursor}>>\n"
                 return _Page(marker, cursor + len(first), False, [cursor],
-                             None)
+                             None, rid)
     complete = []
     partial = b""
     if raw:
@@ -636,7 +661,8 @@ def read_page(path, cursor=0, max_bytes=262144):
     next_cursor = min(cursor + len(emitted), size)  # byte-exact
     # done means EMITTED everything (sol t30 P5): an unterminated tail
     # record must still be read — the handle reaching EOF is not done
-    return _Page(text, next_cursor, next_cursor >= size, starts, emitted)
+    return _Page(text, next_cursor, next_cursor >= size, starts, emitted,
+                 rid)
 
 
 # ------------------------------------------------------------ store
@@ -1525,21 +1551,36 @@ def tick(sources, state_dir=None, max_bytes_per_source=262144,
                 report["observations"] += len(obs)
                 src_bytes += nxt - cur  # bytes newly consumed this pass
                 # (previously unread gap + appended tail)
-                # identity validated BEFORE recording (sol t25 #3; CSR-05):
+                # identity validated BEFORE recording (sol t25 #3; CSR-05),
+                # in two layers (CSR-05 EDITOR-01):
+                # 1. THE PAGE IS BOUND TO THE HANDLE THAT ACTUALLY READ
+                # IT: page.rid is fstat'ed on read_page's own opened
+                # handle — the handle that supplied these bytes — and its
+                # lineage must equal the census lineage the page was mined
+                # under. This closes the restore geometry the old
+                # path-only check was blind to: rename A aside, place a
+                # byte-identical B for the read, restore A before
+                # validation — the second handle then matched the census
+                # and committed B's bytes as A, and the later rebind
+                # re-mined them as a second "independent" incident
+                # (eligible=true). Missing .rid (a page not built by this
+                # read_page) cannot be bound and defers — fail closed.
+                # 2. The post-read PATHNAME check is RETAINED for the
+                # read→validation window (replacement after the read):
                 # generation, size AND lineage re-read off ONE handle must
-                # equal the census identity the page was mined under. A
-                # byte-identical inode swap inside read_page passes the
-                # sampled generation token alone and would publish the
-                # census lineage for bytes read off a different inode —
-                # the next census then re-mines the same bytes under the
-                # new lineage as a second "independent" incident
-                # (eligible=true). The full identity check turns the swap
-                # into a typed defer: the page is invalidated, the cursor
-                # and anchor never advance, and the next pass rebinds the
-                # new lineage only through the explicit lineage-change
-                # reset (never a silent rebind).
+                # equal the census identity. Explicit residual limit: the
+                # window between this validation and commit_batch is NOT
+                # locked (no pathname lock exists on Linux for arbitrary
+                # paths); a swap landing inside it is caught by the next
+                # pass's checks, not by this one — stated, never claimed
+                # impossible.
                 i_gen, i_size, i_lineage = source_identity(p)
+                rid = getattr(page, "rid", None)
+                r_lineage = (_sha(f"{rid[0]}:{rid[1]}")[:16]
+                             if rid else None)
                 flapped = []
+                if r_lineage != lineage:
+                    flapped.append("read-lineage")
                 if i_gen != gen:
                     flapped.append("generation")
                 if i_size != entry["bytes"]:
