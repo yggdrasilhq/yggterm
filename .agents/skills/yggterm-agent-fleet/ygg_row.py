@@ -45,7 +45,7 @@ Usage:
                                          [--session u] [--model m] [--pid p]
 """
 
-import argparse, json, os, re, socket, subprocess, sys, time
+import argparse, fcntl, json, os, re, socket, subprocess, sys, tempfile, time
 from pathlib import Path
 
 ID_RE = re.compile(r"^\d+(\.\d+)+(R|\.0)*$")
@@ -105,8 +105,10 @@ def allocate(store, n, role, explicit_id):
     if explicit_id:
         if not ID_RE.match(explicit_id):
             sys.exit(f"⛔ id `{explicit_id}` does not match the grammar N.X[.0|R]")
+        if explicit_id.split(".")[0] != n:
+            sys.exit("⛔ explicit id belongs to another campaign")
         p = store / "claims" / f"{explicit_id}.json"
-        if p.exists():
+        if os.path.lexists(p):
             sys.exit(f"⛔ {explicit_id} is already claimed — see `ygg_row.py show {explicit_id}`")
         return explicit_id
     lock = store / "claims" / f".alloc-{n}.lock"
@@ -123,12 +125,19 @@ def allocate(store, n, role, explicit_id):
     if fd is None:
         sys.exit("⛔ could not allocate: allocation lock busy")
     try:
-        used = {c.get("x") for c in map(lambda p: load_json(p, {}) or {}, (store / "claims").glob("*.json"))
-                if c.get("n") == n and c.get("x") is not None}
+        # Reserve filenames even when their JSON is malformed or unknown.
+        # Stored x values are strings; integer candidates must compare with
+        # integers. Never interpret an unreadable occupied seat as free.
+        used = {int(p.stem.split(".")[1].rstrip("R"))
+                for p in (store / "claims").glob("*.json")
+                if ID_RE.fullmatch(p.stem)
+                and p.stem.split(".")[0] == n}
         x = 1
         while x in used:
             x += 1
         if role == "orchestrator":
+            if os.path.lexists(store / "claims" / f"{n}.0.json"):
+                sys.exit(f"⛔ {n}.0 is already claimed")
             return f"{n}.0"
         suffix = "R" if role == "relay" else ""
         return f"{n}.{x}{suffix}"
@@ -166,6 +175,14 @@ def cmd_campaign(a):
 def cmd_claim(a):
     store = rows_dir()
     n, name = resolve_campaign(store, a.campaign)
+    # Hold one stable flock inode through lookup, allocation AND durable
+    # publication. The old allocator released its lock before the write.
+    with (store / "claims" / ".claim-transaction.lock").open("a+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        _claim_locked(a, store, n, name)
+
+
+def _claim_locked(a, store, n, name):
     prior = find_own(store, n)
     if prior and not a.id:
         print(f"= this session already holds {prior['id']} (campaign {n}) — idempotent")
@@ -181,7 +198,25 @@ def cmd_claim(a):
              "model": a.model, "cwd": os.getcwd(), "purpose": a.purpose,
              "parent": a.parent, "bridge_sub": a.bridge_sub, "row_path": a.row_path,
              "ttl_hours": a.ttl_hours, "claimed_at": time.time(), "heartbeat": time.time()}
-    write_json(store / "claims" / f"{rid}.json", claim)
+    destination = store / "claims" / f"{rid}.json"
+    fd, temporary = tempfile.mkstemp(prefix=".claim-", dir=destination.parent)
+    try:
+        with os.fdopen(fd, "w") as stream:
+            json.dump(claim, stream, indent=1)
+            stream.flush()
+            os.fsync(stream.fileno())
+        # Never replace a seat introduced by an external/legacy writer
+        # between allocation and publication, including a dangling symlink.
+        os.link(temporary, destination)
+        directory = os.open(destination.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    except FileExistsError:
+        sys.exit(f"⛔ {rid} became occupied before publication; claim retained")
+    finally:
+        os.unlink(temporary)
     journal(store, "claim", id=rid, n=n, role=a.role, purpose=a.purpose)
     print(f"✓ claimed {rid} ({name}, {a.role})" + (f" — {a.purpose}" if a.purpose else ""))
 
