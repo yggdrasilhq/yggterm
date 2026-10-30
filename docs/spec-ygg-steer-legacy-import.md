@@ -44,16 +44,25 @@ after acceptance.
 
 Recognized: module `ROOT`, a `CFG` loader bound to `targets.toml`, literal
 `DOOR_GUARD`/`HARNESS_GUARD` constants, a `guarded` wrapper whose format
-string byte-matches the compiler's guard, an `extract_foreign` with a literal
-default owner tag, and an `assemble` body of exactly: harness config lookup,
-one core literal open, 1–64 managed appends of `guarded(<literal tag or
-guard constant>, (ROOT / '<relative path>').read_text())`, one optional
-`if t.get('local')` wrap, the foreign-owner stamp branch, and a two-newline
-join over the parts list. Anything else — loops, computed tags, method
-chains on reads, extra statements, missing pieces — HOLDs. No template code
-is ever executed; the legacy script is only parsed. A parse that matches
-binds `steer_sha256` into the candidate identity, so a changed assembler is
-a different proposal.
+string byte-matches the compiler's guard — plain format fields over the
+wrapper's own `name`/`body` parameters (no `!conversion`, no format spec, no
+cutset `rstrip`) — and an `extract_foreign` whose body binds `m =
+re.search(<f-string interpolating the owner tag>, <text>, re flags)` and
+returns `m.group(0) if m else None` (a recognized grammar that returns the
+matched region, never discards or rewrites it), with a literal default owner
+tag. The `assemble` body is exactly: `t = CFG[<harness variable>]` (operands
+pinned, not mere presence), one core literal open `(ROOT / t['core'])
+.read_text().rstrip()` with no cutset, 1–64 managed appends of
+`guarded(<literal tag or guard constant>, (ROOT / '<relative path>')
+.read_text())`, one optional `if t.get('local')` wrap under
+`HARNESS_GUARD` specifically, `stamp = extract_foreign(...) if ... else
+None`, a foreign-owner slot appending `stamp.rstrip() + '\n'` verbatim, and
+a two-newline join over the parts list. Anything else — loops, computed
+tags, wrong config or guard operands, `!r` views, cutset stripping, an
+extractor that drops the region, replaced appends, extra statements,
+missing pieces — HOLDs. No template code is ever executed; the legacy
+script is only parsed. A parse that matches binds `steer_sha256` into the
+candidate identity, so a changed assembler is a different proposal.
 
 `[hosts]` in `targets.toml` is observed as private placement data only: its
 keys are recorded, its values are not compiled, staged, or imported, and it
@@ -72,13 +81,26 @@ root resolver (initialized roots only; no genesis, no foreign-root bypass):
 - `complete.json` — written last, sealing the ID, manifest digest and every
   file digest.
 
-Directories are 0700, files 0600, enforced after umask. Publication is a
-single rename from a private temp dir with fsync discipline, so a partial
-copy or full-disk failure leaves no candidate and no complete marker. Replay
-revalidates all sealed hashes and is idempotent (no rewrite). An existing
-directory that is incomplete or disagrees with its seal HOLDs and is never
-overwritten. Nothing outside `candidates/<id>` is touched: existing policy,
-`active.json`, target bytes and foreign-memory guards stay unchanged.
+Directories are 0700, files 0600, enforced after umask. Before anything is
+staged or replayed, `steer` and `targets.toml` are re-read against the
+digests bound by the plan: any drift between plan and stage HOLDs without
+publishing (replan instead). Publication is a single Linux
+`renameat2(RENAME_NOREPLACE)` from a private temp dir with fsync discipline
+— a platform without a typed renameat2 route HOLDs rather than falling back
+to replacing `rename` — so a partial copy, full-disk failure, or a
+concurrently created directory at the destination (even an empty one)
+publishes nothing into it: the occupied destination is preserved in place
+and the stage HOLDs. Replay recomputes the candidate ID from the staged
+`descriptor.json` bytes, binds the staged manifest to the descriptor's
+manifest, and revalidates all sealed hashes; it is idempotent (no rewrite)
+and reports the disk manifest digest. After a successful rename the
+candidate is the commit point: a parent-directory fsync failure cannot
+unpublish it, and is reported truthfully as `durable: false` with a typed
+`fsync_error` and a replay recovery contract instead of a false failure
+claim. An existing directory that is incomplete or disagrees with its seal
+HOLDs and is never overwritten. Nothing outside `candidates/<id>` is
+touched: existing policy, `active.json`, target bytes and foreign-memory
+guards stay unchanged.
 
 ## Input controls
 

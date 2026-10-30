@@ -211,6 +211,27 @@ class Import(unittest.TestCase):
         self.assertEqual(plan['adapter']['kind'],'yggsteer-steer-v1')
         self.assertFalse(bomb.exists())
 
+    def test_ast_semantic_mutations_hold(self):
+        variants={
+            'wrapper_replaces_body':('{body.rstrip()}','{"REPLACEMENT".rstrip()}'),
+            'wrapper_repr_conversion':('{name}','{name!r}'),
+            'core_reads_wrong_config':("ROOT / t['core']","ROOT / CFG['core']"),
+            'core_strip_semantics':('read_text().rstrip()]',"read_text().rstrip('y.\\n')]"),
+            'local_wrap_wrong_guard':("guarded(HARNESS_GUARD, (ROOT / t['local'])",
+                                      "guarded(DOOR_GUARD, (ROOT / t['local'])"),
+            'foreign_extractor_discards_region':('return m.group(0) if m else None','return None'),
+            'foreign_append_replaced':("parts.append(stamp.rstrip() + '\\n')",
+                                       "parts.append('REPLACEMENT')"),
+            'config_assignment_wrong_variable':('t = CFG[harness]','other = CFG[harness]'),
+        }
+        for name,(old,new) in variants.items():
+            with self.subTest(name=name):
+                source=STEER_SOURCE.replace(old,new)
+                self.assertNotEqual(source,STEER_SOURCE)
+                (self.legacy/'steer').write_text(source)
+                with self.assertRaises(mod.fs.Held):
+                    self.plan()
+
     def test_unknown_toml_fields_captured_and_staging_refused(self):
         (self.legacy/'targets.toml').write_text(
             TARGETS_SOURCE.replace("[alpha]\n","[alpha]\nmode = 'fast'\n"))
@@ -384,6 +405,103 @@ class Import(unittest.TestCase):
                  capture_output=True,text=True)
         self.assertEqual(held.returncode,75)
         self.assertIn('HOLD',held.stderr)
+
+    def test_assembler_and_toml_drift_between_plan_and_stage_hold(self):
+        plan=self.plan();manifest=mod.build_manifest(plan)
+        with open(self.legacy/'steer','a') as handle:handle.write('\n# changed after planning\n')
+        with self.assertRaisesRegex(mod.fs.Held,'steer changed since the plan'):
+            self.stage(plan,manifest)
+        build_legacy(self.legacy)
+        with open(self.legacy/'targets.toml','a') as handle:handle.write('\n# changed after planning\n')
+        with self.assertRaisesRegex(mod.fs.Held,'targets.toml changed since the plan'):
+            self.stage(plan,manifest)
+        candidates=self.ygg/'steer'/'candidates'
+        self.assertFalse(candidates.exists() and any(candidates.iterdir()))
+        build_legacy(self.legacy)
+        result=self.stage(plan,manifest)
+        self.assertTrue(result['published'])
+
+    def test_replay_recomputes_identity_and_binds_manifest(self):
+        first=self.stage()
+        base=Path(first['path'])
+        plan=self.plan();manifest=mod.build_manifest(plan)
+        forged=json.loads(json.dumps(manifest))
+        forged['targets']['alpha']['target']='.synthetic-wrong-target/AGENTS.md'
+        descriptor=mod._descriptor(plan,forged)
+        marker=json.loads((base/'complete.json').read_text())
+        for rel,doc in [('manifest.json',forged),('descriptor.json',descriptor)]:
+            data=mod.canonical(doc)
+            (base/rel).write_bytes(data)
+            marker['files'][rel]=mod.sha(data)
+        marker['manifest_sha256']=marker['files']['manifest.json']
+        marker['descriptor_sha256']=marker['files']['descriptor.json']
+        (base/'complete.json').write_bytes(mod.canonical(marker))
+        with self.assertRaisesRegex(mod.fs.Held,'does not hash to the candidate'):
+            self.stage(plan,manifest)
+        self.assertEqual((base/'manifest.json').read_bytes(),mod.canonical(forged))
+        manifest_inode=(base/'manifest.json').stat().st_ino
+        with self.assertRaisesRegex(mod.fs.Held,'does not hash to the candidate'):
+            self.stage(plan,manifest)
+        self.assertEqual((base/'manifest.json').stat().st_ino,manifest_inode)
+
+    def test_clean_replay_reports_disk_manifest_digest(self):
+        first=self.stage()
+        second=self.stage()
+        self.assertFalse(second['published'])
+        self.assertTrue(second['validated'])
+        self.assertEqual(second['manifest_sha256'],
+                         hashlib.sha256((Path(first['path'])/'manifest.json').read_bytes()).hexdigest())
+
+    def test_concurrent_occupied_candidate_preserved_by_no_replace_publish(self):
+        plan=self.plan();manifest=mod.build_manifest(plan)
+        cid=mod.candidate_identity(plan,manifest)
+        original=mod._fsync_tree
+        def race(path):
+            original(path)
+            (self.ygg/'steer'/'candidates'/cid).mkdir()
+        with mock.patch.object(mod,'_fsync_tree',race):
+            with self.assertRaisesRegex(mod.fs.Held,'occupied by an unrecognized'):
+                self.stage(plan,manifest)
+        occupied=self.ygg/'steer'/'candidates'/cid
+        self.assertTrue(occupied.is_dir())
+        self.assertFalse((occupied/'complete.json').exists())
+        self.assertFalse(occupied.is_symlink())
+        self.assertEqual([p for p in (self.ygg/'steer'/'candidates').iterdir()
+                          if p.name.startswith('.staging-')],[])
+        occupied.rmdir()
+        result=self.stage(plan,manifest)
+        self.assertTrue(result['published'])
+
+    def test_post_rename_fsync_failure_reports_truthful_state(self):
+        plan=self.plan();manifest=mod.build_manifest(plan)
+        cid=mod.candidate_identity(plan,manifest)
+        real=mod.os.fsync
+        def full_disk(fd):
+            if (os.readlink('/proc/self/fd/%d'%fd).endswith('/steer/candidates')
+                    and (self.ygg/'steer'/'candidates'/cid/'complete.json').exists()):
+                raise OSError(28,'invented post-rename full disk')
+            return real(fd)
+        with mock.patch.object(mod.os,'fsync',full_disk):
+            result=self.stage(plan,manifest)
+        self.assertTrue(result['published'])
+        self.assertFalse(result['durable'])
+        self.assertIn('recovery',result['fsync_error'])
+        self.assertTrue((self.ygg/'steer'/'candidates'/cid/'complete.json').exists())
+        replay=self.stage(plan,manifest)
+        self.assertTrue(replay['validated'])
+        self.assertEqual(replay['manifest_sha256'],result['manifest_sha256'])
+
+    def test_crash_before_rename_publishes_nothing(self):
+        plan=self.plan();manifest=mod.build_manifest(plan)
+        cid=mod.candidate_identity(plan,manifest)
+        def boom(*_args):
+            raise RuntimeError('invented crash before commit')
+        with mock.patch.object(mod,'_rename_no_replace',boom):
+            with self.assertRaisesRegex(RuntimeError,'crash before commit'):
+                self.stage(plan,manifest)
+        candidates=self.ygg/'steer'/'candidates'
+        self.assertFalse((candidates/cid).exists())
+        self.assertEqual([p for p in candidates.iterdir() if p.name.startswith('.staging-')],[])
 
     def test_real_legacy_checkout_smoke(self):
         real=Path.home()/'git'/'yggsteer'

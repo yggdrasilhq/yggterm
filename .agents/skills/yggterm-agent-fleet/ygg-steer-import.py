@@ -17,6 +17,7 @@ pretending a general Python translation.
 from __future__ import annotations
 import argparse
 import ast
+import ctypes
 import datetime as dt
 import errno
 import hashlib
@@ -24,6 +25,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path, PurePath
+import platform
 import pwd
 import shutil
 import stat
@@ -204,9 +206,10 @@ def _is_parts_append(node):
 
 
 def _is_core_read(node):
-    """(ROOT / t['core']).read_text().rstrip()"""
+    """(ROOT / t['core']).read_text().rstrip() — rstrip carries no cutset: a
+    cutset would strip different bytes than the accepted compiler's core mode."""
     if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
-            and node.func.attr == "rstrip"):
+            and node.func.attr == "rstrip" and not node.args and not node.keywords):
         return False
     call = node.func.value
     return (isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute)
@@ -215,6 +218,8 @@ def _is_core_read(node):
             and isinstance(call.func.value.op, ast.Div)
             and isinstance(call.func.value.left, ast.Name) and call.func.value.left.id == "ROOT"
             and isinstance(call.func.value.right, ast.Subscript)
+            and isinstance(call.func.value.right.value, ast.Name)
+            and call.func.value.right.value.id == "t"
             and _constant_str(call.func.value.right.slice) == "core")
 
 
@@ -244,8 +249,21 @@ def _is_docstring(node):
             and isinstance(node.value.value, str))
 
 
+def _plain_format(formatted):
+    """No !conversion and no format spec: the formatted value inserts the
+    operand itself, not a repr/str/format view of it."""
+    if getattr(formatted, "conversion", -1) not in (-1, None) or formatted.format_spec is not None:
+        raise fs.Held("legacy wrapper uses an unsupported format conversion or spec")
+
+
+def _no_arg_call(node):
+    return not node.args and not node.keywords
+
+
 def _match_guarded_fn(fn):
-    """The wrapper must byte-match the accepted compiler's guarded chunk."""
+    """The wrapper must byte-match the accepted compiler's guarded chunk:
+    f'<!-- BEGIN {name} -->\\n{body.rstrip()}\\n<!-- END {name} -->\\n' with
+    plain format fields over the wrapper's own name/body parameters."""
     body = [s for s in fn.body if not _is_docstring(s)]
     if len(body) != 1 or not isinstance(body[0], ast.Return) or not isinstance(body[0].value, ast.JoinedStr):
         raise fs.Held("legacy wrapper is not a single literal guard format string")
@@ -258,10 +276,16 @@ def _match_guarded_fn(fn):
             or not (isinstance(formatted[0].value, ast.Name) and formatted[0].value.id == "name")
             or not (isinstance(formatted[2].value, ast.Name) and formatted[2].value.id == "name")):
         raise fs.Held("legacy wrapper does not format the guard identity directly")
+    for field in formatted:
+        _plain_format(field)
     second = formatted[1].value
+    # The wrapped body itself is inserted, rstripped with no arguments: a
+    # different operand, a repr conversion or stripping with a cutset would
+    # compile a different projection and must HOLD.
     if not (isinstance(second, ast.Call) and isinstance(second.func, ast.Attribute)
-            and second.func.attr == "rstrip"):
-        raise fs.Held("legacy wrapper does not strip the wrapped body")
+            and second.func.attr == "rstrip" and _no_arg_call(second)
+            and isinstance(second.func.value, ast.Name) and second.func.value.id == "body"):
+        raise fs.Held("legacy wrapper does not strip the wrapped body operand itself")
     return "<!-- BEGIN {name} -->\\n{body.rstrip()}\\n<!-- END {name} -->\\n"
 
 
@@ -270,6 +294,49 @@ def _match_extract_foreign(fn):
     if not tag:
         raise fs.Held("legacy foreign-owner tag is not a literal default")
     compiler._tag(tag)
+    stmts = [s for s in fn.body if not _is_docstring(s)]
+    if len(stmts) != 2:
+        raise fs.Held("unsupported legacy foreign-owner extractor shape")
+    bind = stmts[0]
+    if not (isinstance(bind, ast.Assign) and len(bind.targets) == 1
+            and isinstance(bind.targets[0], ast.Name) and bind.targets[0].id == "m"
+            and isinstance(bind.value, ast.Call)
+            and isinstance(bind.value.func, ast.Attribute) and bind.value.func.attr == "search"
+            and isinstance(bind.value.func.value, ast.Name) and bind.value.func.value.id == "re"
+            and len(bind.value.args) >= 2):
+        raise fs.Held("unsupported legacy foreign-owner extractor match shape")
+    pattern = bind.value.args[0]
+    if not (isinstance(pattern, ast.JoinedStr)
+            and any(isinstance(value, ast.FormattedValue)
+                    and isinstance(value.value, ast.Name) and value.value.id == "tag"
+                    for value in pattern.values)):
+        raise fs.Held("unsupported legacy foreign-owner extractor pattern "
+                      "does not interpolate the owner tag")
+    for value in pattern.values:
+        if isinstance(value, ast.FormattedValue):
+            _plain_format(value)
+    text_arg = bind.value.args[1]
+    flags_ok = all(isinstance(a, ast.Attribute) and isinstance(a.value, ast.Name)
+                   and a.value.id == "re" for a in bind.value.args[2:])
+    keywords_ok = all(k.arg == "flags" and isinstance(k.value, ast.Attribute)
+                      and isinstance(k.value.value, ast.Name) and k.value.value.id == "re"
+                      for k in bind.value.keywords)
+    if not (isinstance(text_arg, ast.Name) and flags_ok and keywords_ok):
+        raise fs.Held("unsupported legacy foreign-owner extractor arguments")
+    outcome = stmts[1]
+    if not (isinstance(outcome, ast.Return) and isinstance(outcome.value, ast.IfExp)
+            and isinstance(outcome.value.test, ast.Name) and outcome.value.test.id == "m"
+            and isinstance(outcome.value.orelse, ast.Constant) and outcome.value.orelse.value is None
+            and isinstance(outcome.value.body, ast.Call)
+            and isinstance(outcome.value.body.func, ast.Attribute)
+            and outcome.value.body.func.attr == "group"
+            and isinstance(outcome.value.body.func.value, ast.Name)
+            and outcome.value.body.func.value.id == "m"
+            and len(outcome.value.body.args) == 1
+            and isinstance(outcome.value.body.args[0], ast.Constant)
+            and outcome.value.body.args[0].value == 0
+            and not outcome.value.body.keywords):
+        raise fs.Held("unsupported legacy foreign-owner extractor discards or rewrites the region")
     return tag
 
 
@@ -287,7 +354,10 @@ def _match_assemble(fn, constants):
 
     node = take()
     if not (isinstance(node, ast.Assign) and isinstance(node.value, ast.Subscript)
-            and isinstance(node.value.value, ast.Name) and node.value.value.id == "CFG"):
+            and isinstance(node.value.value, ast.Name) and node.value.value.id == "CFG"
+            and isinstance(node.value.slice, ast.Name)
+            and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name)
+            and node.targets[0].id == "t"):
         raise fs.Held("unsupported legacy assembly: harness config lookup not recognized")
     node = take()
     if not (isinstance(node, ast.Assign) and isinstance(node.value, ast.List)
@@ -324,9 +394,12 @@ def _match_assemble(fn, constants):
              and inner.func.id == "guarded") or len(inner.args) != 2 or inner.keywords
             or not _is_local_read(inner.args[1])):
         raise fs.Held("unsupported legacy assembly: local harness wrap not recognized")
-    compiler._tag(_guard_tag(inner.args[0], constants))
+    if _guard_tag(inner.args[0], constants) != constants["HARNESS_GUARD"]:
+        raise fs.Held("unsupported legacy assembly: local harness wrap does not use the harness guard constant")
     node = take()
     if not (isinstance(node, ast.Assign) and isinstance(node.value, ast.IfExp)
+            and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name)
+            and node.targets[0].id == "stamp"
             and isinstance(node.value.body, ast.Call)
             and isinstance(node.value.body.func, ast.Name)
             and node.value.body.func.id == "extract_foreign"
@@ -338,6 +411,18 @@ def _match_assemble(fn, constants):
         raise fs.Held("unsupported legacy assembly: foreign-owner slot branch not recognized")
     if len(node.body) != 1 or not _is_parts_append(node.body[0]):
         raise fs.Held("unsupported legacy assembly: foreign-owner append not recognized")
+    appended = node.body[0].value.args[0]
+    if not (len(node.body[0].value.args) == 1
+            and isinstance(appended, ast.BinOp) and isinstance(appended.op, ast.Add)
+            and isinstance(appended.left, ast.Call)
+            and isinstance(appended.left.func, ast.Attribute)
+            and appended.left.func.attr == "rstrip"
+            and isinstance(appended.left.func.value, ast.Name)
+            and appended.left.func.value.id == "stamp"
+            and not appended.left.args and not appended.left.keywords
+            and _constant_str(appended.right) == "\n"):
+        raise fs.Held("unsupported legacy assembly: foreign-owner append does not "
+                      "stamp the extracted region verbatim")
     node = take()
     if not (isinstance(node, ast.Return) and isinstance(node.value, ast.Call)
             and isinstance(node.value.func, ast.Attribute) and node.value.func.attr == "join"
@@ -580,11 +665,58 @@ def _fsync_tree(root):
     _fsync_directory(root)
 
 
+_RENAME_NOREPLACE = 1  # Linux renameat2 flag: fail with EEXIST instead of replacing
+_RENAMEAT2_SYSCALL = {"x86_64": 316, "aarch64": 276, "armv7l": 382, "i686": 353, "ppc64le": 357, "s390x": 347}
+_libc = None
+
+
+def _rename_no_replace(src_dir_fd, src_name, dst_dir_fd, dst_name):
+    """Linux renameat2(RENAME_NOREPLACE): rename only when the destination is absent.
+
+    Returns True on rename, False when the destination exists (EEXIST/ENOTEMPTY).
+    Raises fs.Held on platforms without a typed renameat2 route — never falls
+    back to replacing os.rename, and the claim is Linux-scoped, not portable.
+    """
+    global _libc
+    if sys.platform != "linux":
+        raise fs.Held("atomic no-replace publication needs Linux renameat2; "
+                      f"platform {sys.platform!r} is unsupported for candidate staging")
+    src, dst = os.fsencode(src_name), os.fsencode(dst_name)
+    if _libc is None:
+        try:
+            _libc = ctypes.CDLL(None, use_errno=True)
+        except OSError as exc:
+            raise fs.Held(f"renameat2 unavailable ({type(exc).__name__})") from exc
+    if hasattr(_libc, "renameat2"):
+        _libc.renameat2.restype = ctypes.c_int
+        _libc.renameat2.argtypes = [ctypes.c_int, ctypes.c_char_p,
+                                    ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+        result = _libc.renameat2(src_dir_fd, src, dst_dir_fd, dst, _RENAME_NOREPLACE)
+    else:
+        number = _RENAMEAT2_SYSCALL.get(platform.machine())
+        if number is None:
+            raise fs.Held(f"renameat2 has no typed syscall route for machine "
+                          f"{platform.machine()!r}; staging HOLDs rather than replacing")
+        _libc.syscall.restype = ctypes.c_long
+        result = _libc.syscall(ctypes.c_long(number), ctypes.c_int(src_dir_fd), src,
+                               ctypes.c_int(dst_dir_fd), dst, ctypes.c_uint(_RENAME_NOREPLACE))
+    if result == 0:
+        return True
+    code = ctypes.get_errno()
+    if code in (errno.ENOTEMPTY, errno.EEXIST):
+        return False
+    if code in (errno.ENOSYS, errno.EINVAL, errno.EOPNOTSUPP):
+        raise fs.Held("Linux renameat2(RENAME_NOREPLACE) is not supported by this kernel "
+                      f"(errno {code}); candidate staging HOLDs instead of replacing")
+    raise OSError(code, os.strerror(code), os.fsdecode(dst))
+
+
 class _Staging:
     """Private temp directory that publishes atomically or not at all."""
 
     def __init__(self, parent_fd, candidates_path, name):
         self.name = name
+        self.fsync_error = None
         os.mkdir(name, 0o700, dir_fd=parent_fd)
         self.path = Path(candidates_path) / name
 
@@ -603,14 +735,21 @@ class _Staging:
                 os.close(fd)
 
     def publish(self, parent_fd, candidate_id):
+        """Rename into place with no-replace semantics.
+
+        Returns False when the destination is occupied (nothing written there).
+        After a successful rename the candidate is published; a parent-directory
+        fsync failure cannot undo it, so the error is recorded on the instance
+        and reported truthfully as a durability uncertainty instead of being
+        raised as a false failure claim.
+        """
         _fsync_tree(self.path)
-        try:
-            os.rename(self.name, candidate_id, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
-        except OSError as exc:
-            if exc.errno not in (errno.ENOTEMPTY, errno.EEXIST):
-                raise
+        if not _rename_no_replace(parent_fd, self.name, parent_fd, candidate_id):
             return False
-        os.fsync(parent_fd)
+        try:
+            os.fsync(parent_fd)
+        except OSError as exc:
+            self.fsync_error = exc
         return True
 
     def discard(self):
@@ -618,7 +757,9 @@ class _Staging:
 
 
 def _validate_existing(candidate_dir, candidate_id):
-    """Replay: a complete candidate must match its sealed manifest and hashes."""
+    """Replay: a complete candidate must match its sealed marker AND the
+    candidate identity must be recomputed from the staged bytes, never trusted
+    from the caller's in-memory plan or from the marker alone."""
     marker_raw, _ = _read_source(candidate_dir, "complete.json", LIMIT_JSON_BYTES)
     try:
         marker = json.loads(marker_raw.decode("utf-8"))
@@ -640,7 +781,26 @@ def _validate_existing(candidate_dir, candidate_id):
     manifest_raw, _ = _read_source(candidate_dir, "manifest.json", LIMIT_JSON_BYTES)
     if sha(manifest_raw) != marker.get("manifest_sha256"):
         raise fs.Held("existing candidate manifest differs from its sealed digest")
-    return marker
+    descriptor_raw, _ = _read_source(candidate_dir, "descriptor.json", LIMIT_JSON_BYTES)
+    if sha(descriptor_raw) != marker.get("descriptor_sha256"):
+        raise fs.Held("existing candidate descriptor differs from its sealed digest")
+    # Content identity recomputed from the staged descriptor: the directory
+    # name must be the hash of the descriptor bytes actually on disk.
+    if sha(descriptor_raw) != candidate_id:
+        raise fs.Held("existing candidate descriptor does not hash to the candidate "
+                      "identity; staged content id was rewritten")
+    try:
+        descriptor = json.loads(descriptor_raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise fs.Held(f"existing candidate descriptor is unreadable ({type(exc).__name__})") from exc
+    if not isinstance(descriptor, dict) or descriptor.get("schema") != SCHEMA:
+        raise fs.Held("existing candidate descriptor is not a recognized importer revision")
+    # Manifest binding: the staged manifest bytes must be exactly the manifest
+    # bound inside the staged descriptor.
+    if canonical(descriptor.get("manifest")) != manifest_raw:
+        raise fs.Held("existing candidate manifest is not the descriptor's bound manifest")
+    return {"manifest_sha256": sha(manifest_raw), "descriptor_sha256": sha(descriptor_raw),
+            "descriptor": descriptor}
 
 
 def stage_candidate(plan, manifest, *, home=None, env=None, root=None):
@@ -655,16 +815,24 @@ def stage_candidate(plan, manifest, *, home=None, env=None, root=None):
     selected = fs.resolve(home=home, env=env, explicit=root)
     if not selected.get("initialized"):
         raise fs.Held("initialize the root identity before staging legacy candidates")
+    # Metadata drift gate: every assembler/TOML dependency bound by the plan is
+    # re-read before anything is staged or replayed; the staged descriptor must
+    # never claim an old source revision against changed legacy metadata.
+    for relative, bound, limit in ((STEER_NAME, plan["adapter"]["steer_sha256"], LIMIT_STEER_BYTES),
+                                   (TARGETS_NAME, plan["targets_toml_sha256"], LIMIT_TOML_BYTES)):
+        raw, _meta = _read_source(plan["legacy_root_resolved"], relative, limit)
+        if sha(raw) != bound:
+            raise fs.Held(f"legacy {relative} changed since the plan was made; replan before staging")
     candidates_path = Path(selected["physical_path"]) / "steer" / "candidates"
     candidate_id = candidate_identity(plan, manifest)
     manifest_bytes = canonical(manifest)
     with fs._directory(candidates_path, create=True) as candidates_fd:
         existing = candidates_path / candidate_id
         if existing.is_dir() and not existing.is_symlink():
-            _validate_existing(existing, candidate_id)
+            stored = _validate_existing(existing, candidate_id)
             return {"candidate_id": candidate_id, "path": str(existing.resolve()),
                     "published": False, "validated": True, "sealed": True,
-                    "manifest_sha256": sha(manifest_bytes)}
+                    "manifest_sha256": stored["manifest_sha256"]}
         temp_name = ".staging-" + uuid.uuid4().hex
         staging = _Staging(candidates_fd, candidates_path, temp_name)
         try:
@@ -699,17 +867,31 @@ def stage_candidate(plan, manifest, *, home=None, env=None, root=None):
                 "descriptor_sha256": sha(descriptor_bytes),
                 "files": sealed_files}))
             published = staging.publish(candidates_fd, candidate_id)
+            fsync_error = staging.fsync_error
             if not published:
                 staging.discard()
         except BaseException:
             staging.discard()
             raise
     final = candidates_path / candidate_id
+    stored = None
     if not published:
-        _validate_existing(final, candidate_id)
-    return {"candidate_id": candidate_id, "path": str(final.resolve()),
-            "published": bool(published), "validated": not published, "sealed": True,
-            "manifest_sha256": sha(manifest_bytes)}
+        try:
+            stored = _validate_existing(final, candidate_id)
+        except fs.Held as exc:
+            raise fs.Held("candidate destination is occupied by an unrecognized or "
+                          f"incomplete directory (preserved in place): {exc}") from exc
+    result = {"candidate_id": candidate_id, "path": str(final.resolve()),
+              "published": bool(published), "validated": not published, "sealed": True,
+              "manifest_sha256": sha(manifest_bytes) if published
+              else stored["manifest_sha256"]}
+    if published and fsync_error is not None:
+        result["durable"] = False
+        result["fsync_error"] = (f"errno {fsync_error.errno}: the parent-directory fsync failed "
+                                 "after the rename; the candidate is published and visible, but "
+                                 "rename durability is unconfirmed. Re-running stage replays and "
+                                 "validates the existing candidate (recovery contract).")
+    return result
 
 
 def cli(argv=None):
@@ -752,6 +934,8 @@ def cli(argv=None):
             print(f"candidate {result['candidate_id'][:12]} "
                   f"{'published' if result['published'] else 'already sealed (replay validated)'} "
                   f"at {result['path']}")
+            if result.get("durable") is False:
+                print(f"  WARNING durability unconfirmed: {result['fsync_error']}", file=sys.stderr)
             print(f"  blockers preserved in place: {len(plan['unclassified'])} unclassified files; "
                   "no deletion eligibility claimed")
         elif args.verb == "preview":
