@@ -87,11 +87,36 @@ provenance columns only and never enter any identity. Identities use the `L-`,
   Raw page text itself is never stored;
   the digest is the durable binding. A window fact is written for every
   consumed page, including pages that yield no observation.
-- **Context C** = `C-` + H(context_value), where context_value is the carried
-  detector context or `None` when the observation carries no context. A
-  context value must be bounded JSON (dict/list/scalars only, depth ≤ 4,
-  ≤ 64 nodes, strings ≤ 512 chars) or the call is refused; there is no
-  arbitrary-body serialization.
+- **Context C** = `C-` + H(context_value), where context_value is the
+  carried detector context or `None` when the observation carries no
+  context. **One authoritative source per observation:** the observation's
+  own `context` when present, otherwise the call's top-level `context`;
+  supplying both for one observation is refused (`EvidenceHeld`), decided
+  before any I/O. Every accepted context is identity-bound: it determines
+  the version's C digest, so a per-observation carried-state change
+  produces a different V.
+- **Context schema (closed typed metadata projection, schema 1).** A
+  context value is a nonempty JSON object (or `None`). Dict keys are
+  short name strings (≤ 128 chars). Values admit NO free text: only
+  `null`, booleans, bounded integers, 64-hex digest strings, store
+  identity strings (`W-`/`V-`/`C-`/`U-`/`L-`/`G-` + 64 hex), and nested
+  lists/objects of the same, depth ≤ 4 and ≤ 64 nodes. Any other string
+  — prompt, credential, path, prose, enum text — is refused
+  structurally (not by secret-marker pattern matching); floats are
+  outside the projection. Body-bearing carried values travel only as
+  their canonical digest under a caller-chosen metadata key, or as an
+  `unbound` reference (typed UNKNOWN). Declared keys with meaning to
+  the binding rule: `prior_offset` (nonnegative int), `prior_window_id`
+  (`W-` identity), `prior_page_digest` (64 hex).
+- **Carried binding.** An observation whose effective context declares
+  any of `prior_offset` / `prior_window_id` / `prior_page_digest` must
+  be durably bound or explicitly unknown: `prior_window_id` must be
+  among the observation's window references; `prior_offset` must be
+  covered by some referenced window's stored half-open interval (the
+  current page counts only when its own interval covers the offset —
+  the current page is never credited for earlier bytes); if neither
+  holds, at least one `unbound` ref must mark the carried value
+  explicitly unknown, else the call HOLDS.
 - **References E** are the observation's explicit list of which bytes were
   actually observed: always the current page's own window
   (`{"kind": "window", "window_id": W}`) plus each explicit caller ref,
@@ -124,16 +149,36 @@ provenance columns only and never enter any identity. Identities use the `L-`,
   path — is validated and dropped, never stored.
 
 **Writes and holds.** record_page and record_legacy apply every insert inside
-one SQLite transaction (BEGIN IMMEDIATE, WAL); any validation, missing-window,
-digest-contradiction, storage or integrity fault raises EvidenceHeld and rolls
+one SQLite transaction (BEGIN IMMEDIATE) under a stable writer flock
+(`<state_dir>/evidence-versions.lock`); any validation, missing-window,
+digest-contradiction, integrity or storage fault raises EvidenceHeld and rolls
 the whole call back — original evidence is preserved and no cursor may advance
 on a held call. Exact replays create nothing (same IDs, zero created counts,
-timestamps untouched). A colliding ID with different stored payload is held,
-never overwritten. preflight opens read-only (`query_only`): absent store
+timestamps untouched); before a replay is accepted, the persisted window,
+context, logical-key and version identities and the version's full child-ref
+list recompute from the stored payloads — a tampered or missing dependency
+holds, never silently passes. A colliding ID with different stored payload is
+held, never overwritten. A store file that exists is validated through a
+genuinely read-only connection (URI `mode=ro`; a read/write handle with
+`query_only` is NOT a read-only open, and `immutable=1` is never used on a
+live WAL): an empty file, a non-SQLite file, a store without the schema
+marker, or a future/unknown schema raises EvidenceHeld BEFORE any read/write
+handle, journal-mode change or schema creation — the DB and WAL bytes stay
+byte-identical and sidecars are never removed or checkpointed. (The `-shm`
+is volatile SQLite reader coordination scratch; its read-mark bytes may
+change under any reader, including read-only ones; DB and WAL evidence
+bytes never do.) Only a store file proven absent — no DB, no WAL, no SHM —
+may genesis: the complete schema is built in a private temp file, fsynced,
+and published with a no-replace hardlink under the writer flock, so a crash
+mid-genesis leaves at most an unreferenced temp file and concurrent writers
+cannot race an unknown store into existence. `query_only`-style write
+preflight happens under the lock only after the read-only marker validation.
+preflight itself opens read-only: absent store
 returns `{"status": "absent", "schema_version": None}` without creating or
 writing anything; a ready store returns schema_version; a corrupt, unreadable,
 or unknown/future-schema store raises EvidenceHeld and is never modified.
-read_summary returns bounded counts and at most `limit` recent window/version
-metadata rows for verification; it never contains raw page, prompt, token or
-credential text. Row counts are storage facts, never logical incident or
-lineage counts.
+Contradictory old-schema data holds; there is no self-repair or destructive
+migration. read_summary returns bounded counts and at most `limit` recent
+window/version metadata rows for verification; it never contains raw page,
+prompt, token or credential text. Row counts are storage facts, never
+logical incident or lineage counts.

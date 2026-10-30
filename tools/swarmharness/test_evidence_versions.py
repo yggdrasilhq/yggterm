@@ -5,9 +5,12 @@ Hermetic: SQLite stdlib only, disk-backed fixtures under
 Every test names the spec falsifier it attacks."""
 
 import hashlib
+import json
 import os
 import shutil
 import sqlite3
+import subprocess
+import sys
 import threading
 import unittest
 import uuid
@@ -128,7 +131,7 @@ class WindowAndVersionIdentity(EvidenceVersionsCase):
         # Falsifier: exact replay is idempotent — no additional facts,
         # timestamps untouched (immutability of first capture).
         args = dict(source=self.source(), start=0, raw=b"record one\n",
-                    context={"kind": "hunt", "depth": 2},
+                    context={"depth": 2},
                     observations=[self.obs()])
         first = ev.record_page(self.dir, **args)
         first_created = dict(first["created_counts"])
@@ -232,7 +235,7 @@ class RawByteFidelity(EvidenceVersionsCase):
         # census project path.
         secret = b"token=hunter2 prompt text\n"
         ev.record_page(self.dir, source=self.source(), start=0, raw=secret,
-                       context={"carried": "internal-state"},
+                       context={"carried_observations": 1},
                        observations=[self.obs()])
         blob = self._db_bytes()
         self.assertNotIn(b"hunter2", blob)
@@ -282,7 +285,7 @@ class ReferenceResolution(EvidenceVersionsCase):
         with self.assertRaises(ev.EvidenceHeld):
             ev.record_page(
                 self.dir, source=self.source(), start=7, raw=b"next\n",
-                context={"kind": "carry"},
+                context={"carried": True},
                 observations=[self.obs(refs=[
                     {"kind": "window", "window_id": "W-" + "0" * 64}])])
         after = ev.read_summary(self.dir)
@@ -430,7 +433,7 @@ class DurabilityAndConcurrency(EvidenceVersionsCase):
         try:
             with self.assertRaises(ev.EvidenceHeld):
                 ev.record_page(self.dir, source=self.source(), start=7,
-                               raw=b"next\n", context={"kind": "carry"},
+                               raw=b"next\n", context={"carried": True},
                                observations=[self.obs()])
         finally:
             ev._row_matches = original_matches
@@ -438,7 +441,7 @@ class DurabilityAndConcurrency(EvidenceVersionsCase):
                          before["counts"])
         # Durable replay: the same evidence records cleanly afterwards.
         receipt = ev.record_page(self.dir, source=self.source(), start=7,
-                                 raw=b"next\n", context={"kind": "carry"},
+                                 raw=b"next\n", context={"carried": True},
                                  observations=[self.obs()])
         self.assertEqual(receipt["created_counts"],
                          {"windows": 1, "contexts": 1, "versions": 1})
@@ -508,6 +511,378 @@ class SummaryAndBaseline(EvidenceVersionsCase):
         self.assertEqual(conn.execute(
             "SELECT COUNT(DISTINCT logical_key) FROM versions"
         ).fetchone()[0], 2)
+
+
+class ContextIdentityOneSource(EvidenceVersionsCase):
+    """EV-CONTEXT-IDENTITY-01: context has one authoritative source per
+    observation and every accepted context is identity-bound into C/V."""
+
+    def test_per_observation_context_change_changes_version(self):
+        # The finding: changing only observation.context returned the
+        # same V. Now the per-observation context is authoritative and
+        # bound: same L, different C, different V.
+        a = ev.record_page(self.dir, source=self.source(), start=0,
+                           raw=b"page one\n", context=None,
+                           observations=[self.obs(
+                               context={"carried_observations": 1})])
+        b = ev.record_page(self.dir, source=self.source(), start=9,
+                           raw=b"page two\n", context=None,
+                           observations=[self.obs(
+                               context={"carried_observations": 2})])
+        self.assertNotEqual(a["version_ids"], b["version_ids"])
+        conn = self.open_db()
+        self.assertEqual(conn.execute(
+            "SELECT COUNT(*) FROM contexts "
+            "WHERE context_json != 'null'").fetchone()[0], 2)
+
+    def test_two_observations_same_l_different_context_two_versions(self):
+        receipt = ev.record_page(
+            self.dir, source=self.source(), start=0, raw=b"page\n",
+            context=None,
+            observations=[self.obs(context={"carried_observations": 1}),
+                          self.obs(context={"carried_observations": 2})])
+        self.assertEqual(len(set(receipt["version_ids"])), 2)
+        conn = self.open_db()
+        self.assertEqual(conn.execute(
+            "SELECT COUNT(DISTINCT logical_key) FROM versions"
+        ).fetchone()[0], 1)  # one logical vote, two evidence versions
+
+    def test_top_level_context_applies_when_observation_omits(self):
+        ev.record_page(self.dir, source=self.source(), start=0,
+                       raw=b"page\n", context={"carried_observations": 1},
+                       observations=[self.obs(context=None)])
+        conn = self.open_db()
+        rows = conn.execute(
+            "SELECT context_json FROM contexts "
+            "WHERE context_json != 'null'").fetchall()
+        self.assertEqual(rows, [("{\"carried_observations\":1}",)])
+        self.assertEqual(len(rows), 1)
+
+    def test_conflicting_context_sources_refused_before_any_io(self):
+        with self.assertRaises(ev.EvidenceHeld):
+            ev.record_page(
+                self.dir, source=self.source(), start=0, raw=b"page\n",
+                context={"carried_observations": 1},
+                observations=[self.obs(context={"carried_observations": 2})])
+        self.assertFalse(os.path.exists(self.db_file()))
+
+
+class CarriedSpanBinding(EvidenceVersionsCase):
+    """EV-CARRIED-UNKNOWN-02: carried state outside the current page
+    needs a durable prior-window ref or an explicit unbound marker."""
+
+    def test_carried_offset_outside_page_held_without_refs(self):
+        # The finding: page [100,108) + carried prior_offset=0 was
+        # accepted fully bound. Now the current page is never credited
+        # for earlier bytes.
+        with self.assertRaises(ev.EvidenceHeld):
+            ev.record_page(self.dir, source=self.source(), start=100,
+                           raw=b"current\n", context={"prior_offset": 0},
+                           observations=[self.obs(span="bytes@0")])
+        summary = ev.read_summary(self.dir)
+        self.assertEqual(summary["counts"]["versions"], 0)
+
+    def test_carried_offset_bound_by_durable_prior_window(self):
+        prior = ev.record_page(self.dir, source=self.source(), start=0,
+                               raw=b"earlier\n", context=None,
+                               observations=[])
+        receipt = ev.record_page(
+            self.dir, source=self.source(), start=100, raw=b"current\n",
+            context=None,
+            observations=[self.obs(
+                span="bytes@0", context={"prior_offset": 0},
+                refs=[{"kind": "window",
+                       "window_id": prior["window_id"]}])])
+        self.assertEqual(len(receipt["version_ids"]), 1)
+        self.assertEqual(receipt["unknown_evidence"], [])
+
+    def test_carried_offset_explicit_unbound_accepted(self):
+        receipt = ev.record_page(
+            self.dir, source=self.source(), start=100, raw=b"current\n",
+            context=None,
+            observations=[self.obs(
+                span="bytes@0", context={"prior_offset": 0},
+                refs=[{"kind": "unbound",
+                       "unbound_value": "pre-store carried state"}])])
+        self.assertTrue(any(u["kind"] == "unbound-context"
+                            for u in receipt["unknown_evidence"]))
+
+    def test_prior_window_id_must_be_among_refs(self):
+        prior = ev.record_page(self.dir, source=self.source(), start=0,
+                               raw=b"earlier\n", context=None,
+                               observations=[])
+        with self.assertRaises(ev.EvidenceHeld):
+            ev.record_page(
+                self.dir, source=self.source(), start=100, raw=b"current\n",
+                context=None,
+                observations=[self.obs(
+                    context={"prior_offset": 0,
+                             "prior_window_id": prior["window_id"]})])
+
+
+class StoredFactIntegrity(EvidenceVersionsCase):
+    """EV-FACT-INTEGRITY-03: persisted W/V/C identities and the full V
+    dependency graph recompute before a reference or replay is accepted."""
+
+    def _hash_bytes(self):
+        with open(self.db_file(), "rb") as fh:
+            return fh.read()
+
+    def test_tampered_referenced_window_payload_holds(self):
+        # The finding: start->999 plus cached digests f*64 under the old
+        # W was accepted when expected_digest repeated the tampered
+        # cache. Identity recomputation from the persisted payload holds.
+        prior = ev.record_page(self.dir, source=self.source(), start=0,
+                               raw=b"earlier\n", context=None,
+                               observations=[])
+        conn = self.open_db()
+        conn.execute(
+            "UPDATE windows SET start=999, page_digest=?, raw_sha256=? "
+            "WHERE window_id=?", ("f" * 64, "f" * 64, prior["window_id"]))
+        conn.commit()
+        with self.assertRaises(ev.EvidenceHeld):
+            ev.record_page(self.dir, source=self.source(), start=100,
+                           raw=b"later\n", context=None,
+                           observations=[self.obs(refs=[
+                               {"kind": "window",
+                                "window_id": prior["window_id"],
+                                "expected_digest": "f" * 64}])])
+
+    def test_deleted_child_refs_hold_on_replay(self):
+        # The finding: deleting all version_refs let an exact replay
+        # succeed with zero created counts and a ref-less V. Now holds.
+        args = dict(source=self.source(), start=0, raw=b"page\n",
+                    context=None)
+        ev.record_page(self.dir, observations=[self.obs(refs=[
+            {"kind": "unbound", "unbound_value": "carried"}])], **args)
+        conn = self.open_db()
+        conn.execute("DELETE FROM version_refs")
+        conn.commit()
+        with self.assertRaises(ev.EvidenceHeld):
+            ev.record_page(self.dir, observations=[self.obs(refs=[
+                {"kind": "unbound", "unbound_value": "carried"}])], **args)
+
+    def test_tampered_context_json_holds_on_replay(self):
+        args = dict(source=self.source(), start=0, raw=b"page\n",
+                    context={"carried_observations": 1})
+        ev.record_page(self.dir, observations=[self.obs()], **args)
+        conn = self.open_db()
+        conn.execute(
+            "UPDATE contexts SET context_json='{\"carried_observations\":9}'")
+        conn.commit()
+        with self.assertRaises(ev.EvidenceHeld):
+            ev.record_page(self.dir, observations=[self.obs()], **args)
+
+    def test_tampered_version_payload_holds_on_replay(self):
+        args = dict(source=self.source(), start=0, raw=b"page\n",
+                    context=None)
+        ev.record_page(self.dir, observations=[self.obs()], **args)
+        conn = self.open_db()
+        conn.execute("UPDATE versions SET fingerprint='fp-tampered'")
+        conn.commit()
+        with self.assertRaises(ev.EvidenceHeld):
+            ev.record_page(self.dir, observations=[self.obs()], **args)
+
+
+class RawContextPrivacy(EvidenceVersionsCase):
+    """EV-RAW-CONTEXT-04: the context projection is closed and typed;
+    free text never enters the DB, WAL or SHM — structurally, not by
+    secret-marker scanning."""
+
+    def test_free_text_context_refused_never_stored(self):
+        with self.assertRaises(ev.EvidenceHeld):
+            ev.record_page(self.dir, source=self.source(), start=0,
+                           raw=b"x\n",
+                           context={"prompt": "SYNTHETIC-CANARY prompt"},
+                           observations=[])
+        with self.assertRaises(ev.EvidenceHeld):
+            ev.record_page(self.dir, source=self.source(), start=0,
+                           raw=b"x\n", context=None,
+                           observations=[self.obs(
+                               context={"note": "SYNTHETIC-CANARY per-obs"})])
+        # Refusals happen before any I/O: no store, no sidecars.
+        self.assertFalse(os.path.exists(self.db_file()))
+
+    def test_digest_metadata_accepted_body_never_stored(self):
+        digest = hashlib.sha256(b"secret carried body").hexdigest()
+        ev.record_page(self.dir, source=self.source(), start=0, raw=b"x\n",
+                       context={"carried_digest": digest},
+                       observations=[self.obs()])
+        blob = self._db_bytes()
+        self.assertIn(digest.encode(), blob)
+        self.assertNotIn(b"secret carried body", blob)
+
+
+class PreflightReadOnlyBytes(EvidenceVersionsCase):
+    """EV-PREFLIGHT-READONLY-05 / EV-UNKNOWN-STORE-06: genuinely
+    read-only preflight and write paths that hold without touching
+    unknown store or sidecar bytes."""
+
+    def _wal_fixture_via_crash(self):
+        # Leave a schema-99 WAL store with live sidecars, exactly as
+        # after a synthetic process exit without close.
+        script = (
+            "import sqlite3, os\n"
+            f"conn = sqlite3.connect({self.db_file()!r})\n"
+            "conn.execute('PRAGMA journal_mode=WAL')\n"
+            "conn.execute('CREATE TABLE meta(key TEXT PRIMARY KEY, "
+            "value TEXT NOT NULL)')\n"
+            "conn.execute(\"INSERT INTO meta VALUES('schema_version','99')\")\n"
+            "conn.commit()\n"
+            "os._exit(0)\n"
+        )
+        subprocess.run([sys.executable, "-c", script], check=True)
+
+    def _hashes(self):
+        # DB and WAL are evidence bytes and must stay byte-identical.
+        # The -shm is volatile SQLite reader coordination scratch: its
+        # read-marks change under any reader, so we assert presence and
+        # size only (never removal, never growth of the DB or WAL).
+        out = {}
+        for suffix in ("", "-wal", "-shm"):
+            path = self.db_file() + suffix
+            if os.path.exists(path):
+                out["exists" + suffix] = True
+                if suffix in ("", "-wal"):
+                    with open(path, "rb") as fh:
+                        out[suffix] = hashlib.sha256(fh.read()).hexdigest()
+                else:
+                    out["size" + suffix] = os.path.getsize(path)
+            else:
+                out["exists" + suffix] = False
+        return out
+
+    def test_preflight_readonly_leaves_unknown_wal_store_intact(self):
+        self._wal_fixture_via_crash()
+        before = self._hashes()
+        self.assertTrue(before["exists-wal"])
+        with self.assertRaises(ev.EvidenceHeld):
+            ev.preflight(self.dir)
+        self.assertEqual(self._hashes(), before)
+
+    def test_write_path_holds_unknown_wal_store_intact(self):
+        self._wal_fixture_via_crash()
+        before = self._hashes()
+        with self.assertRaises(ev.EvidenceHeld):
+            ev.record_page(self.dir, source=self.source(), start=0,
+                           raw=b"x\n", context=None, observations=[])
+        self.assertEqual(self._hashes(), before)
+
+    def test_unknown_no_marker_store_holds_and_write_leaves_unchanged(self):
+        conn = self.open_db()
+        conn.execute("CREATE TABLE unrelated(x TEXT)")
+        conn.execute("INSERT INTO unrelated VALUES('data')")
+        conn.commit()
+        conn.close()
+        before = self._db_bytes()
+        with self.assertRaises(ev.EvidenceHeld):
+            ev.preflight(self.dir)
+        with self.assertRaises(ev.EvidenceHeld):
+            ev.record_page(self.dir, source=self.source(), start=0,
+                           raw=b"x\n", context=None, observations=[])
+        with self.assertRaises(ev.EvidenceHeld):
+            ev.record_legacy(self.dir, [{
+                "detector_id": "cmd-loop", "detector_version": "det-v2",
+                "severity": "medium", "status": "unverified-symptom",
+                "source_kind": "log", "generation": "gen-old",
+                "span": "bytes@12", "fingerprint": "fp-legacy-1",
+                "at": "2026-01-01T00:00:00+00:00",
+                "dedupe_key": "v1-legacy", "lineage_id": "42:7"}])
+        self.assertEqual(self._db_bytes(), before)
+        conn = self.open_db()
+        self.assertIsNone(conn.execute(
+            "SELECT name FROM sqlite_master WHERE name='meta'").fetchone())
+
+    def test_empty_sqlite_file_held_not_blessed(self):
+        os.makedirs(self.dir, exist_ok=True)
+        with open(self.db_file(), "wb"):
+            pass
+        before = self._db_bytes()
+        with self.assertRaises(ev.EvidenceHeld):
+            ev.preflight(self.dir)
+        with self.assertRaises(ev.EvidenceHeld):
+            ev.record_page(self.dir, source=self.source(), start=0,
+                           raw=b"x\n", context=None, observations=[])
+        self.assertEqual(self._db_bytes(), before)
+
+    def test_future_schema_delete_journal_not_flipped_to_wal(self):
+        ev.record_page(self.dir, source=self.source(), start=0,
+                       raw=b"seed\n", context=None, observations=[])
+        conn = self.open_db()
+        conn.execute("PRAGMA journal_mode=DELETE")
+        conn.execute("UPDATE meta SET value='99' "
+                     "WHERE key='schema_version'")
+        conn.commit()
+        conn.close()
+        before = self._db_bytes()
+        with self.assertRaises(ev.EvidenceHeld):
+            ev.record_page(self.dir, source=self.source(), start=5,
+                           raw=b"more\n", context=None, observations=[])
+        self.assertEqual(self._db_bytes(), before)
+        conn = self.open_db()
+        self.assertEqual(
+            conn.execute("PRAGMA journal_mode").fetchone()[0], "delete")
+
+    def test_orphan_sidecars_without_store_held(self):
+        os.makedirs(self.dir, exist_ok=True)
+        with open(self.db_file() + "-wal", "wb") as fh:
+            fh.write(b"\xde\xad")
+        with self.assertRaises(ev.EvidenceHeld):
+            ev.record_page(self.dir, source=self.source(), start=0,
+                           raw=b"x\n", context=None, observations=[])
+        self.assertFalse(os.path.exists(self.db_file()))
+
+    def test_concurrent_genesis_dedupes(self):
+        # Only an atomically proven-absent store may genesis; racing
+        # writers dedupe to one published store, one window, one version.
+        args = dict(source=self.source(), start=0, raw=b"first page\n",
+                    context=None, observations=[self.obs()])
+        errors = []
+
+        def worker():
+            try:
+                ev.record_page(self.dir, **args)
+            except Exception as exc:  # noqa: BLE001 — thread boundary
+                errors.append(exc)
+
+        threads = [threading.Thread(target=worker) for _ in range(4)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(errors, [])
+        summary = ev.read_summary(self.dir)
+        self.assertEqual(summary["counts"]["windows"], 1)
+        self.assertEqual(summary["counts"]["versions"], 1)
+
+
+class CanonicalEncoding(EvidenceVersionsCase):
+    """EV-CANONICAL-ENCODING-07: canonical json.dumps with the default
+    ensure_ascii=True; the store L matches the composer v2 logical
+    identity on the same six elements, including non-ASCII metadata."""
+
+    def test_canonical_is_ascii_escaped_like_documented_default(self):
+        canon = ev._canonical({"k": "λ"})
+        self.assertEqual(
+            canon, json.dumps({"k": "λ"}, sort_keys=True,
+                              separators=(",", ":")))
+        self.assertNotIn("λ", canon)  # ensure_ascii=True escapes U+03BB
+
+    def test_store_logical_key_matches_composer_v2_identity(self):
+        import composer
+        source = self.source()
+        span = "bytes@λ"
+        fingerprint = "fp-λ"
+        receipt = ev.record_page(
+            self.dir, source=source, start=0, raw=b"page\n", context=None,
+            observations=[self.obs(span=span, fingerprint=fingerprint)])
+        conn = self.open_db()
+        store_l = conn.execute(
+            "SELECT logical_key FROM versions").fetchone()[0]
+        composer_l = composer.observation_identity(
+            source["source_kind"], source["lineage_id"], span,
+            "cmd-loop", "det-v3", fingerprint)
+        self.assertEqual(store_l, "L-" + composer_l[len("v2-"):])
 
 
 if __name__ == "__main__":
