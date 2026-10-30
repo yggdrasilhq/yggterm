@@ -441,6 +441,13 @@ def load_provenance(harness):
         raise AuthError(5, f"lineage metadata at {path} is malformed; refusing "
                            "to treat corruption as 'no writer'",
                         {"reason": "invalid_metadata"})
+    for entry in doc.values():
+        writer = entry.get("writer")
+        if (not isinstance(writer, str) or not writer.strip()
+                or writer != writer.strip() or writer.lower() == "unknown"
+                or any(ord(c) < 32 for c in writer)):
+            raise AuthError(5, "lineage metadata has invalid writer evidence",
+                            {"reason": "invalid_metadata"})
     return doc
 
 
@@ -456,6 +463,7 @@ def stamp_provenance(harness, slug, record=None, **kw):
     prov = load_provenance(harness)
     entry = prov.get(slug) or {}
     entry.update(kw)
+    entry.setdefault("writer", HOSTNAME)
     if record is not None:
         entry["content_hash"] = record_hash(record)
     entry["updated_at"] = time.time()
@@ -1379,6 +1387,11 @@ def _exec_gate(harness, allow_refresh):
                                "profile; capture it before launch",
                             {"reason": "grant_unproven", **gate})
         gate["active_binding"] = rebound
+        rebound_health = profile_health(harness, rebound, record)
+        gate["health_state"] = rebound_health["state"]
+        if rebound_health["state"] in ("reauthorization_required", "failed"):
+            raise AuthError(5, "native rebound profile carries a recorded auth failure",
+                            {"reason": "auth_health_failed", **gate})
     return gate, record, gate["record_hash"], "refresh_once"
 
 
@@ -1419,6 +1432,9 @@ def cmd_exec(args):
             harness=harness, error_code=args.typed_failure, event_id=args.event_id,
             expected_active_hash=args.observed_active_hash, json=False))
     with fleet_lock():
+        # A metadata writer can finish while this caller waits for the lock.
+        # Validate the policy for the serialized decision, before any effect.
+        policy = rotation_policy(harness)
         gate, record, decided_hash, action = _exec_gate(harness,
                                                         allow_refresh=not args.preflight_only)
         meter = meter_snapshot(harness, record, measure=args.measure)

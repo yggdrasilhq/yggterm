@@ -7,6 +7,7 @@ hygiene. All auth paths are isolated fixtures; `--preflight-only` is a pure
 read, and spawn is asserted through the _exec_spawn seam or real child exits.
 """
 import base64
+import contextlib
 import importlib.util
 import json
 import os
@@ -24,6 +25,56 @@ SECRET = 'fixture-secret-token-do-not-print'
 
 
 class AuthExecTests(unittest.TestCase):
+    def test_policy_is_validated_after_waiting_for_serialization(self):
+        m = self.m
+        self.profile('a', expired=True, live=True)
+        self.policy()
+        real_lock = m.fleet_lock
+
+        @contextlib.contextmanager
+        def policy_writer_finishes_before_waiter():
+            with real_lock():
+                self.policy(version=2)
+            with real_lock():
+                yield
+
+        with patch.object(m, 'fleet_lock', policy_writer_finishes_before_waiter):
+            with self.assertRaises(m.AuthError):
+                m.cmd_exec(self.args())
+        self.assertFalse(self.spawns)
+
+    def test_present_invalid_writer_is_not_absent_lineage(self):
+        m = self.m
+        for writer in (None, '', 'unknown', [], ' other-host', 'bad\nhost'):
+            with self.subTest(writer=writer):
+                self.profile('a', expired=True, live=True)
+                m.atomic_write_json(m.provenance_path('codex'),
+                                    {'a': {'writer': writer, 'source': 'fetch'}})
+                with self.assertRaises(m.AuthError) as error:
+                    m.cmd_exec(self.args())
+                self.assertEqual(error.exception.details['reason'], 'invalid_metadata')
+        m.atomic_write_json(m.provenance_path('codex'), {'a': {'source': 'fetch'}})
+        with self.assertRaises(m.AuthError):
+            m.cmd_exec(self.args())
+        self.assertFalse(self.spawns)
+
+    def test_refresh_race_rebound_rechecks_recorded_health(self):
+        m = self.m
+        a = self.profile('a', expired=True, live=True)
+        b = self.profile('b', token='invented-rebound-token')
+        m.record_failure('codex', 'b', 'auth_invalid')
+
+        def native_rewrites_during_refresh(*args):
+            m.atomic_write_json(m.HARNESSES['codex']['auth_file']('codex'), b)
+            return dict(a, expires_at=time.time() + 10000)
+
+        with patch.object(m, 'refresh_grant', side_effect=native_rewrites_during_refresh):
+            with self.assertRaises(m.AuthError) as error:
+                m.cmd_exec(self.args())
+        self.assertEqual(error.exception.details['reason'], 'auth_health_failed')
+        self.assertEqual(m.live_record('codex'), b)
+        self.assertFalse(self.spawns)
+
     def setUp(self):
         scratch = Path(os.environ.get('YGG_AUTH_TEST_SCRATCH', Path.home() / '.yggterm/scratchpad/auth-tests'))
         scratch.mkdir(parents=True, exist_ok=True)
