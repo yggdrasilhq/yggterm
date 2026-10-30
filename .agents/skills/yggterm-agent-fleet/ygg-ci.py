@@ -429,10 +429,11 @@ def _cache_wire_probe(host=None):
     return {"wrapper": "W=1" in o, "binary": "B=1" in o}
 
 def _is_docs_scope(paths):
-    """Dream ACK-a8a9eec7c3 / F5: a tick whose changed paths are ALL markdown
-    cannot change the binary — the cargo build and the deploy are skipped
-    (gates still run, main still pushes). Conservative by construction: any
-    non-.md path, or an empty path list, builds."""
+    """Legacy filename classifier, not permission to skip validation.
+
+    Markdown can be embedded payload or executable policy. Historical
+    records may use this label; configured checks must still run.
+    """
     paths = [p.strip() for p in paths if p and p.strip()]
     return bool(paths) and all(p.endswith(".md") for p in paths)
 
@@ -522,18 +523,57 @@ def _write_heartbeat():
     }
     HEARTBEAT.write_text(json.dumps(rec))
 
+def _is_watcher_argv(argv):
+    if len(argv) < 3 or not re.fullmatch(r"(?:python|pypy)(?:\d+(?:\.\d+)*)?", Path(argv[0]).name):
+        return False
+    index = 1
+    while index < len(argv) and argv[index] in ("-u", "-B", "-E", "-I", "-O", "-OO"):
+        index += 1
+    return (index + 1 < len(argv) and Path(argv[index]).name == "ygg-ci.py"
+            and argv[index + 1] == "watch")
+
+
+def _watcher_argv(pid):
+    return [x.decode("utf-8", "replace") for x in
+            pathlib.Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0") if x]
+
+
 def _pid_is_ygg_ci_watcher(pid):
     # [11.227] pid-recycle guard: the pid must BE a ygg-ci watch process.
     try:
-        cmdline = pathlib.Path(f"/proc/{pid}/cmdline").read_bytes().decode("utf-8", "replace")
-        return "ygg-ci.py" in cmdline and "watch" in cmdline
-    except Exception:
-        # /proc unreadable (non-Linux or gone): fall back to the signal check
-        try:
-            os.kill(pid, 0)
-            return True
-        except Exception:
-            return False
+        return _is_watcher_argv(_watcher_argv(pid))
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return None  # A live PID alone does not identify its program.
+
+
+def _watcher_scope(pid):
+    try:
+        argv = _watcher_argv(pid)
+        if not _is_watcher_argv(argv):
+            return {"kind": "unknown"}
+        args = argv[argv.index("watch") + 1:]
+        for index, value in enumerate(args):
+            if value == "--project":
+                return {"kind": "project", "project": args[index + 1]} if index + 1 < len(args) else {"kind": "unknown"}
+            if value.startswith("--project="):
+                return {"kind": "project", "project": value.split("=", 1)[1]}
+        return {"kind": "global"}
+    except OSError:
+        return {"kind": "unknown"}
+
+
+def _watcher_covers(pid, project):
+    scope = _watcher_scope(pid)
+    return scope["kind"] == "global" or (project is not None and scope.get("project") == project)
+
+
+def _current_watcher_scope():
+    try:
+        return _watcher_scope(int(PIDFILE.read_text().split()[0]))
+    except (OSError, ValueError, IndexError):
+        return {"kind": "unknown"}
 
 def watcher_alive():
     # [11.227] THE LIVE-PID LAW: a live pid is ALIVE regardless of heartbeat
@@ -549,6 +589,8 @@ def watcher_alive():
         pid = int(PIDFILE.read_text().strip().split()[0])
         os.kill(pid, 0)
         return _pid_is_ygg_ci_watcher(pid)
+    except PermissionError:
+        return None
     except Exception:
         return False
 
@@ -561,10 +603,12 @@ def any_watcher_process_live():
         if not proc.name.isdigit() or int(proc.name) == me:
             continue
         try:
-            cmdline = (proc / "cmdline").read_bytes().decode("utf-8", "replace")
+            if proc.stat().st_uid != os.getuid():
+                continue
+            argv = _watcher_argv(int(proc.name))
         except Exception:
             continue
-        if "ygg-ci.py" in cmdline and "watch" in cmdline:
+        if _is_watcher_argv(argv):
             return int(proc.name)
     return None
 
@@ -585,19 +629,31 @@ def ensure_watcher(interval=DEFAULT_INTERVAL, project=None):
 
 
 def _ensure_watcher_locked(interval=DEFAULT_INTERVAL, project=None):
-    if watcher_alive():
+    alive = watcher_alive()
+    if alive is None:
+        log("watcher identity UNKNOWN — subscription retained; no duplicate spawned")
+        return False
+    if alive:
+        scope = _current_watcher_scope()
+        if not (scope["kind"] == "global" or (project is not None and scope.get("project") == project)):
+            log("watcher scope does not cover this request — subscription retained for owner handover")
+            return False
         return True
     # [11.227] the belt: a live watcher WITHOUT the pidfile (rogue born
     # beside a pidfile holder) is still a live watcher — adopt it, never
     # spawn a second.
-    rogue = any_watcher_process_live()
+    try:
+        rogue = any_watcher_process_live()
+    except OSError:
+        log("watcher census unavailable — automatic spawning held")
+        return False
     if rogue:
         log(f"watcher pidfile stale but live watcher pid {rogue} exists — adopting, not spawning")
         try:
             PIDFILE.write_text(str(rogue))
         except Exception:
             pass
-        return True
+        return _watcher_covers(rogue, project)
     # spawn detached watcher
     logf = open(LOGPATH, "a")
     cmd = [sys.executable, str(HERE / "ygg-ci.py"), "watch", "--interval", str(interval)]
@@ -928,7 +984,10 @@ def cmd_subscribe(a):
     p.write_text(json.dumps(rec, indent=2))
     log(f"subscribed {project}:{lane} tip={tip[:12] if tip else 'unknown'} want={rec['want']}")
     # arm watcher
-    ensure_watcher(interval=int(pcfg.get("interval", DEFAULT_INTERVAL)), project=project if project != "yggterm" else None)
+    # One shared PID/state namespace must supervise all subscribed projects.
+    # A first subscription must not strand later projects behind its scope.
+    if ensure_watcher(interval=DEFAULT_INTERVAL, project=None) is False:
+        return 3
     # readback
     if not p.exists():
         log("⛔ subscribe did not persist")
@@ -1135,6 +1194,7 @@ def cmd_status(a):
         "host": this_host(),
         "ci_host": CI_HOST,
         "watcher_alive": alive,
+        "watcher_scope": _current_watcher_scope() if alive is True else {"kind": "unknown" if alive is None else "absent"},
         "heartbeat": hb,
         "subscribed": len(subs),
         "disarmed": dis,
@@ -1148,10 +1208,15 @@ def cmd_status(a):
         return 0
     print("ygg-ci — fleet single build plane")
     print(f"  host: {this_host()} (this seat) · ci host: {CI_HOST}")
-    if alive:
+    if alive is None:
+        print("  watcher: identity UNKNOWN — automatic spawning is held")
+    elif alive:
         up = _age_of((hb or {}).get("started_ts"))
         pid = (hb or {}).get("pid") or "?"
         print(f"  watcher: alive (pid {pid}" + (f", up {up}" if up != "?" else "") + ")")
+        scope = info["watcher_scope"]
+        print("  watcher scope: " + ("all subscribed projects" if scope["kind"] == "global"
+                                      else "project " + str(scope.get("project")) if scope["kind"] == "project" else "UNKNOWN"))
     else:
         print("  watcher: not running — spawned again on the next subscribe/tick")
     if hb:
@@ -1433,7 +1498,7 @@ def _hygiene_gate(project, pcfg, repo, main_branch):
         return {"blocked": True, "why": f"checked out branch is {branch!r}, not {main_branch!r}"}
     return {"blocked": False}
 
-def _do_tick_project(project, dry=False):
+def _with_project_lease(project, operation, dry=False):
     pcfg = dict(_project_cfg(project))
     repo = Path(pcfg["repo"]).expanduser().resolve()
     if not repo.is_dir():
@@ -1458,9 +1523,91 @@ def _do_tick_project(project, dry=False):
         except BlockingIOError:
             return {"status": "busy", "why": "another integration owns this Git repository"}
         pcfg["repo"] = str(repo)
-        return _do_tick_project_locked(project, dry=dry, pcfg=pcfg)
+        return operation(project, dry=dry, pcfg=pcfg)
     finally:
         os.close(descriptor)
+
+
+def _do_tick_project(project, dry=False):
+    return _with_project_lease(project, _do_tick_project_locked, dry=dry)
+
+
+def _verify_project_locked(project, dry=False, *, pcfg):
+    repo = Path(pcfg["repo"])
+    if this_host() != pcfg.get("host", CI_HOST):
+        return {"status": "blocked", "why": "verification requires the configured CI host"}
+    hygiene = _hygiene_gate(project, pcfg, repo, pcfg.get("main_branch", "main"))
+    if hygiene.get("blocked"):
+        return {"status": "blocked", "why": hygiene["why"]}
+    source = git_rev(repo, "HEAD")
+    checks = []
+    build = (pcfg.get("build") or "").strip()
+    commands = ([("build", build)] if build else []) + [
+        ("gate:" + Path(g).name, g) for g in (pcfg.get("gates") or "").split()]
+    if not commands:
+        return {"status": "unconfigured", "why": "no verification recipe configured"}
+    for name, command in commands:
+        result = _run(command, cwd=str(repo), shell=True,
+                      timeout=int(pcfg.get("build_timeout_secs" if name == "build" else "gate_timeout_secs",
+                                           DEFAULT_BUILD_TIMEOUT_SECS if name == "build" else DEFAULT_GATE_TIMEOUT_SECS)),
+                      label=f"verify {project} {name}",
+                      heartbeat_secs=int(pcfg.get("step_heartbeat_secs", DEFAULT_STEP_HEARTBEAT_SECS)))
+        checks.append({"name": name, "exit": result.returncode})
+        if result.returncode:
+            break
+    current = git_rev(repo, "HEAD")
+    state = _run(["git", "status", "--porcelain"], cwd=str(repo), timeout=30)
+    tracked_dirt = any(line.strip() and not line.startswith("??") for line in (state.stdout or "").splitlines())
+    stable = bool(source) and current == source and state.returncode == 0 and not tracked_dirt
+    report = {"schema_version": 1, "kind": "verification", "project": project,
+              "sha": source, "at": int(time.time()), "checks": checks,
+              "status": "verified" if stable and all(c["exit"] == 0 for c in checks) else "verification-failed",
+              "subject_stable": stable, "pushed": False, "deploy_attempted": False}
+    directory = CI_STATE / "verifications"
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        return {**report, "status": "verification-held",
+                "why": "receipt directory unavailable: " + type(exc).__name__,
+                "receipt_publication": "not-created"}
+    safe_project = re.sub(r"[^A-Za-z0-9_.-]", "_", project)
+    receipt = directory / f"{safe_project}--{ts_stamp()}--{source[:12] if source else 'unknown'}--{uuid.uuid4().hex}.json"
+    report["receipt"] = str(receipt)
+    try:
+        with receipt.open("x") as handle:
+            json.dump(report, handle, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    except OSError as exc:
+        return {**report, "status": "verification-held",
+                "why": "receipt durability unconfirmed: " + type(exc).__name__,
+                "receipt_publication": "may-exist"}
+    _emit_event(project, "verification_passed" if report["status"] == "verified" else "verification_failed",
+                sha=source, receipt=str(receipt))
+    return report
+
+
+def cmd_verify(a):
+    global _LOG_STREAM
+    _LOG_STREAM = sys.stderr if a.json else None
+    result = {"schema_version": 1, "kind": "verification",
+              **_with_project_lease(a.project, _verify_project_locked)}
+    if a.json:
+        print(json.dumps(result, indent=2))
+    else:
+        print(f"verification {a.project}: {result['status']}")
+        if result.get("sha"):
+            print("  source: " + result["sha"])
+        for check in result.get("checks", []):
+            print(f"  {check['name']}: exit {check['exit']}")
+        print("  " + result.get("receipt", result.get("why", "")))
+    return 0 if result["status"] == "verified" else 3 if result["status"] in ("busy", "blocked", "no-repo", "unconfigured", "verification-held") else 1
 
 
 def _do_tick_project_locked(project, dry=False, *, pcfg):
@@ -1642,7 +1789,7 @@ def _do_tick_project_locked(project, dry=False, *, pcfg):
         q = _quarantine_load(); q[project] = quar; _quarantine_save(q)
 
     viable = [m for m in merged if not m.get("already_in_main")]
-    integrated_local = local_main != pre_tick  # local was ahead: push pending
+    integrated_local = local_main != upstream_main  # local validation is not publication
     if not viable and not integrated_local and not main_moved and not (conflicts and last is None):
         log(f"tick {project}: nothing new to integrate (merged={len(merged)} conflicts={len(conflicts)})")
         return {"status": "clean", "merged": len(merged), "conflicts": len(conflicts)}
@@ -1651,24 +1798,14 @@ def _do_tick_project_locked(project, dry=False, *, pcfg):
     integ_sha = git_rev(repo, "HEAD")
     build_ok = True
     build_log = ""
-    # [docs-scope] diff the last BUILT sha (fallback: this tick's start) against
-    # the integrated HEAD — that is exactly what this build would compile. An
-    # all-markdown diff cannot change the binary; the diff failing builds (safe).
+    # Always run the configured checks. A docs-only follow-up must not reuse a
+    # failed attempt as its "built" baseline; Markdown may also be runtime data.
     docs_scope = False
-    scope_paths = []
-    if build_cmd:
-        base = (last_attempt or {}).get("sha") or pre_tick
-        sd = _run(["git", "diff", "--name-only", f"{base}..HEAD"], cwd=str(repo), timeout=60)
-        if sd.returncode == 0:
-            scope_paths = [p for p in (sd.stdout or "").splitlines() if p.strip()]
-            docs_scope = _is_docs_scope(scope_paths)
     hb_secs = int(pcfg.get("step_heartbeat_secs", DEFAULT_STEP_HEARTBEAT_SECS))
     build_to = int(pcfg.get("build_timeout_secs", DEFAULT_BUILD_TIMEOUT_SECS))
     gate_to = int(pcfg.get("gate_timeout_secs", DEFAULT_GATE_TIMEOUT_SECS))
     cc = None
-    if build_cmd and docs_scope:
-        log(f"  docs-scope: {len(scope_paths)} changed paths, all markdown — build skipped (dream ACK-a8a9eec7c3; the binary cannot change)")
-    elif build_cmd:
+    if build_cmd:
         log(f"  building {project} IN {repo} ({main_branch}@{integ_sha[:12]}, budget {build_to}s): {build_cmd}")
         cc_pre = _sccache_stats()
         r = _run(build_cmd, cwd=str(repo), timeout=build_to, shell=True, label=f"build {project}", heartbeat_secs=hb_secs)
@@ -1765,10 +1902,8 @@ def _do_tick_project_locked(project, dry=False, *, pcfg):
         kind = "build_failed" if not build_ok else "gate_failed"
         _emit_event(project, kind, lanes=failed_lanes, reset_to=pre_tick,
                     log_tail=build_log[-900:])
-        for m in merged:
-            if m.get("already_in_main"):
-                p = _sub_path(project, m["lane"])
-                if p.exists(): p.unlink(missing_ok=True)
+        # A failed validation consumes no queued obligation. "Already in
+        # local main" can be an unpublished or previously failed integration.
         rec = {
             "id": f"{project}--{ts_stamp()}--{integ_sha[:12] if integ_sha else 'no-sha'}--failed",
             "project": project, "at": int(time.time()), "host": this_host(),
@@ -1787,9 +1922,7 @@ def _do_tick_project_locked(project, dry=False, *, pcfg):
     # guard spent 3.2.4x fighting). ──
     deploy_ok = None
     if pushed is not False:
-        if docs_scope:
-            log("  deploy skipped (docs-scope — binary unchanged; deployed sha stays where it was)")
-        if deploy_cmd and not docs_scope:
+        if deploy_cmd:
             log(f"  deploying {project}: {deploy_cmd}")
             r = _run(deploy_cmd, cwd=str(repo),
                      timeout=int(pcfg.get("deploy_timeout_secs", DEFAULT_DEPLOY_TIMEOUT_SECS)),
@@ -1839,6 +1972,7 @@ def _do_tick_project_locked(project, dry=False, *, pcfg):
         "project": project, "at": int(time.time()), "host": this_host(),
         "main": pre_tick, "sha": integ_sha, "lanes": merged, "conflicts": conflicts, "swept": swept,
         "subs": len(subs), "build": build_cmd, "build_ok": build_ok,
+        "build_ran": bool(build_cmd), "gates_ok": gate_ok,
         "gates": gates, "deploy": deploy_cmd, "deploy_ok": deploy_ok,
         "pushed": pushed, "upstream": upstream, "status": status, "sccache": cc,
     }
@@ -2063,7 +2197,7 @@ def cmd_why(a):
     print(f"project {project}")
     print(f"  repo: {repo}")
     print(f"  ci host: {pcfg.get('host')} · watcher: "
-          f"{'ALIVE' if alive else 'DOWN (ensure_watcher spawns on next subscribe/tick)'}")
+          f"{'UNKNOWN' if alive is None else 'ALIVE' if alive else 'DOWN (ensure_watcher spawns on next subscribe/tick)'}")
     dis = disarm_state(); hold = hold_state()
     if dis:
         print(f"  ⛔ DISARMED — {hold_remaining(dis)}"
@@ -2229,6 +2363,10 @@ def main():
     s.add_argument("--interval", type=int, default=None)
     s.add_argument("--project", help="watch single project")
 
+    s = sub.add_parser("verify", help="rerun configured checks on current clean main without merging, pushing or deploying")
+    s.add_argument("--project", required=True, help="configured project to verify")
+    s.add_argument("--json", action="store_true")
+
     s = sub.add_parser("disarm", help="stand ci down without dismantling it")
     s.add_argument("--hours", type=float, help="hours to stay down (default 4)")
     s.add_argument("--forever", action="store_true")
@@ -2261,6 +2399,8 @@ def main():
         sys.exit(cmd_status(a))
     elif a.cmd == "tick":
         sys.exit(cmd_tick(a))
+    elif a.cmd == "verify":
+        sys.exit(cmd_verify(a))
     elif a.cmd == "events":
         sys.exit(cmd_events(a))
     elif a.cmd == "why":
