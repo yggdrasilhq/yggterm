@@ -738,6 +738,7 @@ def read_page(path, cursor=0, max_bytes=262144, closed=True):
     raw = bytearray()
     pos = cursor
     eof = False
+    pending_cr = False
     with p.open("rb") as f:
         # identity of the handle that supplies every byte below: fstat on
         # the SAME fd the reads flow through (CSR-05 EDITOR-01) — an
@@ -755,6 +756,16 @@ def read_page(path, cursor=0, max_bytes=262144, closed=True):
                 break  # EOF: everything read is final
             raw += chunk
             pos += len(chunk)
+            if raw.endswith(b"\r"):
+                # One-byte lookahead keeps CRLF one record even when a
+                # page ends at CR. A live EOF cannot decide between CR
+                # and CRLF yet, so retain that whole final record.
+                following = f.read(1)
+                if following:
+                    raw += following
+                    pos += len(following)
+                elif not closed:
+                    pending_cr = True
             pieces = raw.splitlines(keepends=True)  # byte record grammar
             if pieces and (pieces[0].endswith(b"\n")
                            or pieces[0].endswith(b"\r")):
@@ -779,8 +790,8 @@ def read_page(path, cursor=0, max_bytes=262144, closed=True):
     partial = b""
     if raw:
         pieces = raw.splitlines(keepends=True)
-        if pieces and not (pieces[-1].endswith(b"\n")
-                           or pieces[-1].endswith(b"\r")):
+        if pieces and (pending_cr or not (pieces[-1].endswith(b"\n")
+                                         or pieces[-1].endswith(b"\r"))):
             partial = pieces[-1]
             pieces = pieces[:-1]
         complete = pieces

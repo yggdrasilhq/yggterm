@@ -183,14 +183,11 @@ def t_c06_multiple_appends():
 
 
 def t_c06_crlf_split_across_append():
-    """A CRLF terminator split across appends, the record CONTENT split
-    before the CR arrives. The byte grammar (sol t33 F33.4) makes a
-    trailing CR at EOF an ALREADY-COMPLETE bare-CR record — bare CR is
-    terminal, so it is never a half-CRLF held pending — hence once the
-    content is complete the record is mined at the \\r with its FULL
-    content: byte span + fingerprint of the stripped line equal the
-    static CRLF framing, exactly once; the late \\n forms an empty
-    record that mines nothing (no double count)."""
+    """A final live CR stays ambiguous until a following byte arrives.
+
+    It must not consume detector state and later parse LF as another
+    record. Closed immutable snapshots still accept a final bare CR.
+    """
     w = fresh("crlf")
     state = w / "state"
     src = w / "live.log"
@@ -204,24 +201,17 @@ def t_c06_crlf_split_across_append():
           "bytes)", len(fault_rows(state)) == 0
           and any("live tail pending" in n for n in r1["notes"]),
           json.dumps([len(fault_rows(state)), r1["notes"][:2]]))
-    src.write_bytes(body + b"\r")           # the CR lands: bare CR is
+    src.write_bytes(body + b"\r")
     cp.tick({"queue_run": live_src(src)}, state_dir=str(state), max_pages=10)
-    n_cr = len(fault_rows(state))           # terminal -> record COMPLETE
+    check("L3-2 ambiguous final live CR retains the whole record",
+          not fault_rows(state))
+    src.write_bytes(body + b"\r\n")
+    cp.tick({"queue_run": live_src(src)}, state_dir=str(state), max_pages=10)
     rows = fault_rows(state)
-    ref, ref_n = static_reference(w, FAULT)
-    check("L3-2 the trailing CR is an already-COMPLETE bare-CR record "
-          "(never a half-CRLF held pending): the full fault occurrence "
-          "equals the static CRLF framing (span+fingerprint), exactly "
-          "once",
-          n_cr == 1 and ref_n == 1
-          and [(o["span"], o["fingerprint"]) for o in rows] == ref,
-          json.dumps({"live": [(o["span"], o["fingerprint"])
-                               for o in rows], "static": ref}))
-    src.write_bytes(body + b"\r\n")         # the LF lands: empty record
-    cp.tick({"queue_run": live_src(src)}, state_dir=str(state), max_pages=10)
-    check("L3-3 the late \\n mined nothing extra (empty record is not "
-          "evidence — no double count)",
-          len(fault_rows(state)) == n_cr, json.dumps([n_cr, len(rows)]))
+    ref, ref_n = static_reference(w, body + b"\r\n")
+    check("L3-3 completing LF emits exactly the identical static record",
+          len(rows) == ref_n == 1
+          and [(o["span"], o["fingerprint"]) for o in rows] == ref)
     # variant: the split lands BETWEEN records — record boundary \r\n
     w2 = fresh("crlf-between")
     state2 = w2 / "state"
@@ -590,6 +580,39 @@ def t_c06_operational_manifest():
     shutil.rmtree(w)
 
 
+def t_c06_crlf_carried_hunt():
+    w = fresh("crlf-hunt")
+    source, state = w / "live", w / "state"
+    prefix = b"$ build\r\n$ build\r"
+    suffix = (b"\nnoise-one\r\nnoise-two\r\n"
+              b"NameError: name 'widget' is not defined\r\n")
+    source.write_bytes(prefix)
+    first = cp.tick({"queue_run": live_src(source)}, state_dir=state)
+    check("CRLF hunt pending terminator cannot claim complete coverage",
+          first["coverage_complete"] == 0
+          and any("live tail pending" in n for n in first["notes"]))
+    with source.open("ab") as stream:
+        stream.write(suffix)
+    cp.tick({"queue_run": live_src(source)}, state_dir=state)
+    reference_state = w / "reference"
+    cp.tick({"queue_run": [str(source)]}, state_dir=reference_state)
+    def observations(path):
+        return sorted((o["detector_id"], o["span"], o["fingerprint"])
+                      for o in cp.load_observations(path))
+    actual, expected = observations(state), observations(reference_state)
+    check("CRLF split preserves carried command hunt and signature",
+          actual == expected and len(actual) == 2
+          and any(o[0] == "cmd-failure-loop" and o[1] == "bytes@40"
+                  for o in actual), repr((actual, expected)))
+    # Exercise a finite page boundary immediately after CR as well.
+    page_state = w / "page-state"
+    cp.tick({"queue_run": [str(source)]}, state_dir=page_state,
+            max_bytes_per_source=8, max_pages=20)
+    check("CRLF page lookahead preserves exact static detector records",
+          observations(page_state) == expected)
+    shutil.rmtree(w)
+
+
 def main():
     t_c06_live_tail_completed_matches_static()
     t_c06_multiple_appends()
@@ -601,6 +624,7 @@ def main():
     t_c06_closed_contract_explicit()
     t_c06_anchor_frontier_honesty()
     t_c06_operational_manifest()
+    t_c06_crlf_carried_hunt()
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
     if FAIL:
         print("FAILED:", *FAIL, sep="\n  - ")
