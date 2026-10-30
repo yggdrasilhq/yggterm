@@ -1525,11 +1525,32 @@ def tick(sources, state_dir=None, max_bytes_per_source=262144,
                 report["observations"] += len(obs)
                 src_bytes += nxt - cur  # bytes newly consumed this pass
                 # (previously unread gap + appended tail)
-                # generation validated BEFORE recording (sol t25 #3)
-                if generation(p) != gen:
+                # identity validated BEFORE recording (sol t25 #3; CSR-05):
+                # generation, size AND lineage re-read off ONE handle must
+                # equal the census identity the page was mined under. A
+                # byte-identical inode swap inside read_page passes the
+                # sampled generation token alone and would publish the
+                # census lineage for bytes read off a different inode —
+                # the next census then re-mines the same bytes under the
+                # new lineage as a second "independent" incident
+                # (eligible=true). The full identity check turns the swap
+                # into a typed defer: the page is invalidated, the cursor
+                # and anchor never advance, and the next pass rebinds the
+                # new lineage only through the explicit lineage-change
+                # reset (never a silent rebind).
+                i_gen, i_size, i_lineage = source_identity(p)
+                flapped = []
+                if i_gen != gen:
+                    flapped.append("generation")
+                if i_size != entry["bytes"]:
+                    flapped.append("size")
+                if i_lineage != lineage:
+                    flapped.append("lineage")
+                if flapped:
                     report["notes"].append(
-                        f"generation flapped mid-read: {entry['path']} — "
-                        "page discarded, source deferred")
+                        f"source identity flapped mid-read on "
+                        f"{entry['path']} ({'+'.join(flapped)}) — page "
+                        "discarded, source deferred")
                     deferred = True  # counted in backlog + gaps (F33.5)
                     break
                 commit_batch(state, entry, obs, nxt,
