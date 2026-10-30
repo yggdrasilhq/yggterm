@@ -61,6 +61,10 @@ _OBS_FIELDS = ("detector_id", "detector_version", "severity", "status",
 _OBS_OPTIONAL = ("refs", "context")
 
 _SOURCE_FIELDS = ("project", "source_kind", "lineage_id", "generation")
+_CONTEXT_KEYS = frozenset({"depth", "count", "counts", "schema_version", "unknown",
+                          "carried", "carried_observations", "carried_digest",
+                          "prior_offset", "prior_window_id", "prior_page_digest",
+                          "cmd_fps", "pending_fps", "att_offs", "fp", "window", "byte_off"})
 
 _CONTEXT_MAX_DEPTH = 4
 _CONTEXT_MAX_NODES = 64
@@ -148,7 +152,8 @@ def _validate_context_value(value, path="context", depth=0):
     if isinstance(value, dict):
         nodes = 1
         for key, item in value.items():
-            if not isinstance(key, str) or not key or len(key) > 128:
+            if not isinstance(key, str) or (key not in _CONTEXT_KEYS
+                    and not re.fullmatch(r"[0-9a-f]{16}|[0-9a-f]{64}", key)):
                 raise EvidenceHeld(f"{path}: invalid key")
             nodes += _validate_context_value(item, f"{path}.{key}",
                                              depth + 1)
@@ -265,7 +270,15 @@ def _writable_connect(path):
 
 
 def _read_schema_version(conn):
+    normalize = lambda text: " ".join(text.replace("IF NOT EXISTS ", "").split()).lower()
+    expected = {re.search(r"CREATE TABLE IF NOT EXISTS (\w+)", statement).group(1):
+                normalize(statement) for statement in _SCHEMA_STATEMENTS}
     try:
+        objects = conn.execute("SELECT type, name, sql FROM sqlite_master "
+                               "WHERE name NOT LIKE 'sqlite_%'").fetchall()
+        if any(kind != "table" for kind, _name, _sql in objects) \
+                or {name: normalize(sql or "") for _kind, name, sql in objects} != expected:
+            raise EvidenceHeld("version store table/column/dependency schema is unknown; held")
         row = conn.execute(
             "SELECT value FROM meta WHERE key='schema_version'").fetchone()
     except sqlite3.DatabaseError as exc:
@@ -496,6 +509,8 @@ def _validate_observation(obs):
             f"invalid severity {record['severity']!r}")
     if record["status"] not in _STATUSES:
         raise EvidenceHeld(f"invalid status {record['status']!r}")
+    if not re.fullmatch(r"bytes@(0|[1-9][0-9]*)", record["span"]):
+        raise EvidenceHeld("observation.span must be a canonical raw byte offset")
     refs = obs.get("refs")
     if refs is None:
         refs = []
@@ -579,53 +594,59 @@ def _resolve_window_ref(conn, encoding, ref_window):
 
 
 def _validate_carried_binding(conn, context, all_refs, own_window):
-    """A carried observation (context declaring prior_offset /
-    prior_window_id / prior_page_digest) must be durably bound to prior
-    window bytes or explicitly typed unbound. The current page is never
-    credited for bytes outside its own interval."""
-    declared = [key for key in _CARRIED_KEYS if key in context]
-    if not declared:
+    """Named carried facts must agree on the same source evidence window."""
+    if not any(key in context for key in _CARRIED_KEYS):
         return
-    has_unbound = any(unbound_id is not None
-                      for _enc, _rw, unbound_id in all_refs)
-    prior_window_id = context.get("prior_window_id")
-    if prior_window_id is not None:
-        ref_window_ids = {ref_window for _enc, ref_window, unbound_id
-                          in all_refs if ref_window is not None}
-        if prior_window_id not in ref_window_ids:
-            raise EvidenceHeld(
-                "context.prior_window_id is not among the observation's "
-                "window references: carried state must reference its "
-                "actual prior window; held")
-    prior_offset = context.get("prior_offset")
-    if prior_offset is not None:
-        if not isinstance(prior_offset, int) or \
-                isinstance(prior_offset, bool) or prior_offset < 0:
-            raise EvidenceHeld("context.prior_offset must be a "
-                               "nonnegative int")
-        for encoding, ref_window, _unbound in all_refs:
-            if ref_window is None:
-                continue
-            stored = _fetch_window_validated(conn, ref_window)
-            if stored is None:
-                continue  # missing ref window is refused at resolution
-            if stored["start"] <= prior_offset < stored["end"]:
-                return  # durably bound to bytes that actually cover it
-        if not has_unbound:
-            raise EvidenceHeld(
-                f"carried observation declares prior_offset="
-                f"{prior_offset} outside every referenced window "
-                f"(current window covers [{own_window['start']},"
-                f"{own_window['end']})): a durable prior window ref "
-                "covering the span or an explicit unbound ref is "
-                "required; the current page is not credited for earlier "
-                "bytes")
+    unbound = any(unbound_id is not None for _encoding, _wid, unbound_id in all_refs)
+    windows = {}
+    for _encoding, wid, _unbound_id in all_refs:
+        if wid is None:
+            continue
+        window = _fetch_window_validated(conn, wid)
+        if window and window["page_digest"] != _PAGE_DIGEST_UNKNOWN \
+                and window["source_kind"] == own_window["source_kind"] \
+                and window["lineage_id"] == own_window["lineage_id"]:
+            windows[wid] = window
+    offset = context.get("prior_offset")
+    digest = context.get("prior_page_digest")
+    named = context.get("prior_window_id")
+    if offset is not None and (type(offset) is not int or offset < 0):
+        raise EvidenceHeld("context.prior_offset must be a nonnegative int")
+    if digest is not None and (not isinstance(digest, str) or not _DIGEST_RE.fullmatch(digest)):
+        raise EvidenceHeld("context.prior_page_digest must be a canonical byte digest")
+    def matches(window):
+        return (offset is None or window["start"] <= offset < window["end"]) \
+            and (digest is None or window["page_digest"] == digest)
+    if named is not None:
+        if named not in windows or not matches(windows[named]):
+            raise EvidenceHeld("named carried window is absent, foreign, or "
+                               "contradicts its declared offset/digest")
         return
-    if prior_window_id is None and not has_unbound:
-        raise EvidenceHeld(
-            "carried context declares prior_page_digest without an "
-            "offset/window binding: an explicit prior window ref or an "
-            "unbound ref is required; held")
+    if any(matches(window) for window in windows.values()):
+        return
+    if unbound:
+        return  # explicit UNKNOWN; named contradictory facts were refused above
+    raise EvidenceHeld("carried context has no matching same-source durable "
+                       "window; explicit unbound evidence is required")
+
+
+def _validate_observation_span(conn, source, observation, refs):
+    """An evidence window cannot impersonate bytes at another span."""
+    offset = int(observation["span"].split("@", 1)[1])
+    for _encoding, window_id, _unbound_id in refs:
+        if window_id is None:
+            continue
+        window = _fetch_window_validated(conn, window_id)
+        if window is not None and window["page_digest"] != _PAGE_DIGEST_UNKNOWN \
+                and window["source_kind"] == source["source_kind"] \
+                and window["lineage_id"] == source["lineage_id"] \
+                and window["start"] <= offset < window["end"]:
+            return
+    if any(unbound_id is not None for _encoding, _window, unbound_id in refs):
+        return  # explicit UNKNOWN; current page does not contain this occurrence
+    raise EvidenceHeld("observation span is outside every same-source evidence "
+                       "window; a matching prior window or explicit unbound "
+                       "evidence reference is required")
 
 
 def _ensure_context_row(conn, context_id, context, created, now):
@@ -810,6 +831,7 @@ def record_page(state_dir, *, source, start, raw, context, observations):
                 if eff_ctx is not None:
                     _validate_carried_binding(conn, eff_ctx, all_refs,
                                               own_window)
+                _validate_observation_span(conn, source_valid, obs, all_refs)
                 context_id = _identity("C-", eff_ctx)
                 if context_id not in ensured_contexts:
                     _ensure_context_row(conn, context_id, eff_ctx,

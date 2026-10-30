@@ -97,14 +97,19 @@ provenance columns only and never enter any identity. Identities use the `L-`,
   produces a different V.
 - **Context schema (closed typed metadata projection, schema 1).** A
   context value is a nonempty JSON object (or `None`). Dict keys are
-  short name strings (≤ 128 chars). Values admit NO free text: only
+  closed metadata names (`depth`, `count`, `counts`, `schema_version`,
+  `unknown`, `carried`, `carried_observations`, `carried_digest`,
+  `prior_offset`, `prior_window_id`, `prior_page_digest`, `cmd_fps`,
+  `pending_fps`, `att_offs`, `fp`, `window`, `byte_off`) or 16/64-hex
+  fingerprint/digest keys. Arbitrary body-bearing keys are refused.
+  Values admit NO free text: only
   `null`, booleans, bounded integers, 64-hex digest strings, store
   identity strings (`W-`/`V-`/`C-`/`U-`/`L-`/`G-` + 64 hex), and nested
   lists/objects of the same, depth ≤ 4 and ≤ 64 nodes. Any other string
   — prompt, credential, path, prose, enum text — is refused
   structurally (not by secret-marker pattern matching); floats are
   outside the projection. Body-bearing carried values travel only as
-  their canonical digest under a caller-chosen metadata key, or as an
+  their canonical digest under a supported metadata field, or as an
   `unbound` reference (typed UNKNOWN). Declared keys with meaning to
   the binding rule: `prior_offset` (nonnegative int), `prior_window_id`
   (`W-` identity), `prior_page_digest` (64 hex).
@@ -182,3 +187,25 @@ migration. read_summary returns bounded counts and at most `limit` recent
 window/version metadata rows for verification; it never contains raw page,
 prompt, token or credential text. Row counts are storage facts, never
 logical incident or lineage counts.
+
+
+Every current observation has a canonical `bytes@N` span. Independently of
+which context fields it declares, that offset must lie inside a referenced
+known-content window of the same source kind and lineage, or carry an
+explicit unbound reference. A window from another lineage or the current
+page at another offset cannot substitute for the earlier evidence. Valid
+fixtures use real byte positions; Unicode normalization is tested through
+accepted metadata such as fingerprints, not a malformed byte offset.
+
+Existing stores must match the complete known table/column/dependency
+schema before any write-mode journal change or initialization. A marker
+alone cannot authorize a partial, extended or unrelated SQLite schema.
+This schema check does not certify every unreferenced stored fact; facts
+and their dependencies are recomputed when referenced or replayed.
+
+Named carried context fields must cohere with the same window: a supplied
+`prior_window_id` must match a durable same-source reference, its offset must
+fall inside that named window, and its declared byte digest must agree. A
+contradictory named fact is refused even if an unrelated current window or
+an unbound reference is also present. Unknown prior evidence can instead be
+explicitly labeled unbound without asserting contradictory known facts.

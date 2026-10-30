@@ -40,7 +40,7 @@ class EvidenceVersionsCase(unittest.TestCase):
     def obs(self, **over):
         base = {"detector_id": "cmd-loop", "detector_version": "det-v3",
                 "severity": "high", "status": "unverified-symptom",
-                "span": "bytes@40", "fingerprint": "fp-normalized-1",
+                "span": "bytes@0", "fingerprint": "fp-normalized-1",
                 "refs": [], "context": None}
         base.update(over)
         return base
@@ -157,7 +157,7 @@ class WindowAndVersionIdentity(EvidenceVersionsCase):
         moved = ev.record_page(
             self.dir, source=self.source(generation="gen-b2"), start=9,
             raw=b"prefix body one\n", context=None,
-            observations=[self.obs()])
+            observations=[self.obs(refs=[{"kind": "window", "window_id": base["window_id"]}])])
         self.assertNotEqual(base["window_id"], moved["window_id"])
         self.assertNotEqual(base["version_ids"], moved["version_ids"])
         self.assertEqual(moved["created_counts"],
@@ -434,7 +434,7 @@ class DurabilityAndConcurrency(EvidenceVersionsCase):
             with self.assertRaises(ev.EvidenceHeld):
                 ev.record_page(self.dir, source=self.source(), start=7,
                                raw=b"next\n", context={"carried": True},
-                               observations=[self.obs()])
+                               observations=[self.obs(span="bytes@7")])
         finally:
             ev._row_matches = original_matches
         self.assertEqual(ev.read_summary(self.dir)["counts"],
@@ -442,7 +442,7 @@ class DurabilityAndConcurrency(EvidenceVersionsCase):
         # Durable replay: the same evidence records cleanly afterwards.
         receipt = ev.record_page(self.dir, source=self.source(), start=7,
                                  raw=b"next\n", context={"carried": True},
-                                 observations=[self.obs()])
+                                 observations=[self.obs(span="bytes@7")])
         self.assertEqual(receipt["created_counts"],
                          {"windows": 1, "contexts": 1, "versions": 1})
 
@@ -487,7 +487,7 @@ class SummaryAndBaseline(EvidenceVersionsCase):
         for i in range(5):
             ev.record_page(self.dir, source=self.source(), start=i * 10,
                            raw=f"page {i}\n".encode(), context=None,
-                           observations=[self.obs(span=f"bytes@{i}")])
+                           observations=[self.obs(span=f"bytes@{i * 10}")])
         summary = ev.read_summary(self.dir, limit=3)
         self.assertEqual(len(summary["recent_windows"]), 3)
         self.assertEqual(len(summary["recent_versions"]), 3)
@@ -525,8 +525,8 @@ class ContextIdentityOneSource(EvidenceVersionsCase):
                            raw=b"page one\n", context=None,
                            observations=[self.obs(
                                context={"carried_observations": 1})])
-        b = ev.record_page(self.dir, source=self.source(), start=9,
-                           raw=b"page two\n", context=None,
+        b = ev.record_page(self.dir, source=self.source(), start=0,
+                           raw=b"page one\n", context=None,
                            observations=[self.obs(
                                context={"carried_observations": 2})])
         self.assertNotEqual(a["version_ids"], b["version_ids"])
@@ -871,7 +871,7 @@ class CanonicalEncoding(EvidenceVersionsCase):
     def test_store_logical_key_matches_composer_v2_identity(self):
         import composer
         source = self.source()
-        span = "bytes@λ"
+        span = "bytes@0"
         fingerprint = "fp-λ"
         receipt = ev.record_page(
             self.dir, source=source, start=0, raw=b"page\n", context=None,
@@ -884,6 +884,53 @@ class CanonicalEncoding(EvidenceVersionsCase):
             "cmd-loop", "det-v3", fingerprint)
         self.assertEqual(store_l, "L-" + composer_l[len("v2-"):])
 
+
+
+class ParentEvidenceBoundaryControls(EvidenceVersionsCase):
+    def test_outside_span_without_context_or_refs_holds(self):
+        with self.assertRaisesRegex(ev.EvidenceHeld, "observation span is outside"):
+            ev.record_page(self.dir, source=self.source(), start=128,
+                           raw=b"current\n", context=None,
+                           observations=[self.obs(span="bytes@0")])
+        self.assertEqual(ev.read_summary(self.dir)["counts"]["versions"], 0)
+    def test_another_lineage_window_cannot_bind_prior_span(self):
+        foreign = ev.record_page(self.dir, source=self.source(lineage_id="different-lineage"),
+                                 start=0, raw=b"earlier\n", context=None, observations=[])
+        with self.assertRaises(ev.EvidenceHeld):
+            ev.record_page(self.dir, source=self.source(), start=128,
+                           raw=b"current\n", context=None,
+                           observations=[self.obs(span="bytes@0", refs=[
+                               {"kind":"window", "window_id":foreign["window_id"]}])])
+    def test_known_marker_with_unrecognized_tables_cannot_be_blessed(self):
+        conn = self.open_db()
+        conn.execute("CREATE TABLE meta(key TEXT PRIMARY KEY,value TEXT NOT NULL)")
+        conn.execute("INSERT INTO meta VALUES('schema_version','1')")
+        conn.commit()
+        conn.close()
+        before = self._db_bytes()
+        with self.assertRaises(ev.EvidenceHeld):ev.preflight(self.dir)
+        with self.assertRaises(ev.EvidenceHeld):
+            ev.record_page(self.dir, source=self.source(), start=0,
+                           raw=b"x\n", context=None, observations=[])
+        self.assertEqual(self._db_bytes(), before)
+    def test_named_carried_window_cannot_contradict_digest_or_offset(self):
+        earlier = ev.record_page(self.dir, source=self.source(), start=0,
+                                 raw=b"earlier\n", context=None, observations=[])
+        for fields in [{"prior_offset": 128}, {"prior_page_digest": "a"*64}]:
+            with self.subTest(fields=fields):
+                with self.assertRaisesRegex(ev.EvidenceHeld, "contradicts"):
+                    ev.record_page(self.dir, source=self.source(), start=128,
+                                   raw=b"current\n", context=None,
+                                   observations=[self.obs(context={
+                                       "prior_window_id":earlier["window_id"], **fields},
+                                       refs=[{"kind":"window", "window_id":earlier["window_id"]}])])
+    def test_raw_bodies_are_not_accepted_as_context_dictionary_keys(self):
+        for key in ["SYNTHETIC-CANARY prompt body", "Bearer_fixture_token_body", "/home/user/private/path"]:
+            with self.subTest(key=key):
+                with self.assertRaises(ev.EvidenceHeld):
+                    ev.record_page(self.dir, source=self.source(), start=0,
+                                   raw=b"x\n", context={key:True}, observations=[])
+        self.assertFalse(os.path.exists(self.db_file()))
 
 if __name__ == "__main__":
     unittest.main()
