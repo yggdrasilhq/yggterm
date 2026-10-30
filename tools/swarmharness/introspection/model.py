@@ -166,7 +166,14 @@ def queue_records(tasks, metrics, run_metadata, source, host, now):
         elif event.get("ev") == "done" and raw_id in latest:
             attempt = latest[raw_id]
             outcome = str(event.get("outcome", "unknown"))
-            state = "completed" if outcome == "completed" else "failed" if outcome.startswith("failed") else "interrupted"
+            # A finished transport is not accepted work. Preserve the
+            # producer's held lifecycle instead of inventing a failure.
+            state = ({"review_pending": "review_pending",
+                      "submitted": "submitted",
+                      "retained_partial": "interrupted"}.get(outcome)
+                     or ("completed" if outcome == "completed"
+                         else "failed" if outcome.startswith("failed")
+                         else "interrupted"))
             attempt.update(state=state, finished_at=epoch(event.get("t")), reason=text(outcome),
                            exit_code=event.get("rc"))
     work = []
@@ -200,6 +207,9 @@ def queue_records(tasks, metrics, run_metadata, source, host, now):
                 current.update(evidence_state="stale-other-execution", session_id=None)
             if task.get("status") == "running":
                 current["state"] = "running"
+            elif task.get("status") in {"review_pending", "submitted", "retained_partial"}:
+                current["state"] = ("interrupted" if task["status"] == "retained_partial"
+                                    else task["status"])
             elif current.get("state") == "unknown":
                 current["state"] = task.get("status", "unknown")
             # Older executions may have reused this ordinal's filename.

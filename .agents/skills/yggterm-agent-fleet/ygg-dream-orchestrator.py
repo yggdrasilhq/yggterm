@@ -592,6 +592,9 @@ def cmd_topup(cfg):
         # repair 3: queue state UNKNOWN — hold supply rather than act blind
         print("orchestrator: queue state UNKNOWN (qjson failed) — holding supply")
         return
+    if not queue_observation(rows)["complete"]:
+        print("orchestrator: queue schema UNKNOWN — holding supply")
+        return
     backlog = len([r for r in rows if r.get("status") in ("queued", "retry_wait", "cooldown_wait")])
     gates = plane_gates(cfg)
     pol_note = build_overlays(cfg)
@@ -903,9 +906,8 @@ def cmd_supervise(cfg):
         # scoped route_hold (the first pilot patch: ux_parity x autoclaw auth
         # wall) makes the watch WAIT; its next natural pass after expiry is
         # the bounded recovery check. It never silently re-routes planes.
-        alive = [r for r in rows if "UX-PARITY" in (r.get("title") or "").upper()
-                 and r.get("status") in ("queued", "running", "retry_wait", "cooldown_wait")]
-        if not alive:
+        open_work = ux_watch_has_open_work(rows)
+        if not open_work:
             pol = resolve_policy(family="ux_parity")
             route = _watch_route  # same value the permission gate resolved
             gate = gates.get(route, {})
@@ -1003,14 +1005,43 @@ def cmd_supervise(cfg):
         print(f"orchestrator: empire index write failed: {e}", file=sys.stderr)
 
 
+def ux_watch_has_open_work(rows):
+    """Review debt and remote submissions are unfinished commitments.
+
+    Unknown queue shape cannot justify another expensive duplicate watch.
+    """
+    if not isinstance(rows, list) or any(not isinstance(r, dict) for r in rows):
+        return True
+    return any("UX-PARITY" in str(r.get("title") or "").upper()
+               and (not isinstance(r.get("status"), str)
+                    or r["status"] not in {"completed", "failed", "cancelled"})
+               for r in rows)
+
+
+def queue_observation(rows):
+    fields = ("backlog", "running", "review_pending", "retained_partial", "submitted")
+    if not isinstance(rows, list) or any(not isinstance(r, dict) for r in rows):
+        return {"observed": False, "complete": False, "unclassified": None,
+                "total": None, **{field: None for field in fields}}
+    known = {"queued", "running", "retry_wait", "cooldown_wait", "review_pending",
+             "retained_partial", "submitted", "completed", "failed", "cancelled"}
+    unclassified = sum(not isinstance(r.get("status"), str)
+                       or r["status"] not in known for r in rows)
+    return {"observed": True, "complete": unclassified == 0,
+            "unclassified": unclassified, "total": len(rows),
+            "backlog": sum(isinstance(r.get("status"), str)
+                           and r["status"] in {"queued", "retry_wait", "cooldown_wait"}
+                           for r in rows),
+            **{field: sum(r.get("status") == field for r in rows)
+               for field in fields if field != "backlog"}}
+
+
 def cmd_status(cfg, as_json=False):
     st = load_state()
     gates = plane_gates(cfg)
     rows = qjson(cfg, ["list"])
-    if rows is None:
-        rows = []  # UNKNOWN renders as zeros + a flag, never a crash
-    backlog = len([r for r in rows if isinstance(r, dict) and r.get("status") in ("queued", "retry_wait", "cooldown_wait")])
-    running = len([r for r in rows if isinstance(r, dict) and r.get("status") == "running"])
+    queue = queue_observation(rows)
+    backlog, running = queue["backlog"], queue["running"]
     pol = resolve_policy()
     out = {
         "armed": ENABLED.exists(),
@@ -1020,19 +1051,24 @@ def cmd_status(cfg, as_json=False):
         "today": {"staged": sum(st.get("counts", {}).values()), "moderate": st.get("moderate", 0),
                   "targets": cfg["targets"]},
         "planes": gates,
-        "queue": {"backlog": backlog, "running": running},
+        "queue": queue,
         "dry": st.get("dry", {}),
     }
     if as_json:
         print(json.dumps(out, indent=1))
-        return
+        return 0 if queue["complete"] else 3
     t = cfg["targets"]
     print(f"dream orchestrator — armed={out['armed']} staged={out['today']['staged']}/{t['day']} "
-          f"moderate={out['today']['moderate']}/{t['moderate']} backlog={backlog} running={running}")
+          f"moderate={out['today']['moderate']}/{t['moderate']} "
+          + (f"backlog={backlog} running={running} review_pending={queue['review_pending']} "
+             f"retained_partial={queue['retained_partial']} submitted={queue['submitted']} "
+             f"unclassified={queue['unclassified']}"
+             if queue["observed"] else "queue=UNKNOWN (source unavailable)"))
     for r in cfg["routes"]:
         g = gates[r]
         state = "OK" if g["ok"] else f"GATED {g['why']} ({g['retry_after_min']}m)"
         print(f"  {r:16} {state}")
+    return 0 if queue["complete"] else 3
 
 
 def load_swarmconfig():
@@ -1077,7 +1113,7 @@ def main():
     cfg = load_cfg()
     SWCFG = load_swarmconfig()
     if verb == "status":
-        cmd_status(cfg, "--json" in sys.argv)
+        return cmd_status(cfg, "--json" in sys.argv)
     elif verb in ("topup", "supervise"):
         # sol turn-2 repair 1: the arming gate was NEVER enforced (main went
         # straight to the verbs) and the lock handle was discarded, releasing
@@ -1095,4 +1131,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
