@@ -1434,7 +1434,36 @@ def _hygiene_gate(project, pcfg, repo, main_branch):
     return {"blocked": False}
 
 def _do_tick_project(project, dry=False):
-    pcfg = _project_cfg(project)
+    pcfg = dict(_project_cfg(project))
+    repo = Path(pcfg["repo"]).expanduser().resolve()
+    if not repo.is_dir():
+        return {"status": "no-repo", "why": "configured integration repository unavailable"}
+    common = _run(["git", "rev-parse", "--git-common-dir"], cwd=str(repo), timeout=30)
+    if common.returncode or not common.stdout.strip():
+        return {"status": "blocked", "why": "Git integration lease identity unavailable"}
+    directory = Path(common.stdout.strip())
+    if not directory.is_absolute():
+        directory = repo / directory
+    lock_path = directory.resolve() / "ygg-ci-integration.lock"
+    # The repository, rather than the project label, owns the lease. A manual
+    # tick and the watcher (or two project aliases) must never merge/reset
+    # the same Git state while another pass is still building it.
+    try:
+        descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    except OSError as exc:
+        return {"status": "blocked", "why": "integration lease unavailable: " + type(exc).__name__}
+    try:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return {"status": "busy", "why": "another integration owns this Git repository"}
+        pcfg["repo"] = str(repo)
+        return _do_tick_project_locked(project, dry=dry, pcfg=pcfg)
+    finally:
+        os.close(descriptor)
+
+
+def _do_tick_project_locked(project, dry=False, *, pcfg):
     repo = Path(pcfg["repo"]).expanduser()
     upstream = pcfg.get("push_remote", pcfg.get("remote", "origin"))
     main_branch = pcfg.get("main_branch", "main")
@@ -1874,6 +1903,10 @@ def _tick_human_summary(project, r):
     st = r.get("status") or "?"
     print(f"──── tick {project} → {_status_icon(st)} {st} "
           + "─" * max(2, 44 - len(project) - len(st)))
+    if st == "busy":
+        print("  another integration owns this Git repository; no build attempted")
+        print(f"  next: retry ygg ci tick --project {project} after the current pass")
+        return
     swept = r.get("swept") or []
     if swept:
         bits = ", ".join(f"{s.get('lane')} ({(s.get('disposition') or '?').replace('-', ' ')})"
@@ -1965,14 +1998,16 @@ def cmd_tick(a):
         else:
             for proj in sorted(results):
                 _tick_human_summary(proj, results[proj])
-        return 0 if all(v.get("status") not in bad for v in results.values()) else 1
+        if any(v.get("status") in bad for v in results.values()):
+            return 1
+        return 3 if any(v.get("status") == "busy" for v in results.values()) else 0
     else:
         r = _do_tick_project(a.project, dry=bool(a.dry_run))
         if a.json:
             print(json.dumps(r, indent=2))
         else:
             _tick_human_summary(a.project, r)
-        return 0 if r.get("status") not in bad else 1
+        return 1 if r.get("status") in bad else 3 if r.get("status") == "busy" else 0
 
 def cmd_events(a):
     """Read the CI's talking plane: every state transition, newest last."""
