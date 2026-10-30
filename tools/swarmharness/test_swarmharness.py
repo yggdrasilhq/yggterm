@@ -2248,23 +2248,28 @@ def main():
           json.dumps([tm[:40], cm, dm]))
 
     # T34-5 a deferred source counts in backlog and gaps (F33.5) —
-    # deterministic: generation returns a different token after census
+    # deterministic: the identity validation reads off ONE handle
+    # (source_identity, CSR-05), so the flapped token arrives after
+    # census on that call
     st34d = temp_state() / "composer-t34d"
     flap = fx / "flap.txt"
     flap.write_text("one\nline\nline\nline\n")
-    real_gen = cp.generation
+    real_ident = cp.source_identity
     calls = {"n": 0}
 
-    def flappy_gen(p):
+    def flappy_ident(p):
         calls["n"] += 1
-        return "sz-flapped" if calls["n"] == 1 else real_gen(p)
+        if calls["n"] == 2:
+            tok, size, lin = real_ident(p)
+            return ("sz-flapped", size, lin)
+        return real_ident(p)
 
-    cp.generation = flappy_gen
+    cp.source_identity = flappy_ident
     try:
         repF = cp.tick({"queue_run": [str(flap)]}, state_dir=st34d,
                        max_pages=10)
     finally:
-        cp.generation = real_gen
+        cp.source_identity = real_ident
     check("T34-5 deferred source lands in backlog and gaps",
           any("flapped" in n for n in repF["notes"])
           and repF["gaps"] >= 1 and repF["backlog_remaining"] >= 1,

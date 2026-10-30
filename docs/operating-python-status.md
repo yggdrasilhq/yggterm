@@ -10,7 +10,28 @@ The fleet component path is a source alias to that document. Dispersal flattens
 source aliases into standalone installed files and checks the exact catalog
 bytes. Local next-word help, examples and completion remain available when an
 operational backend is unavailable. Planned families refuse effects explicitly;
-missing inspection adapters report unknown coverage and exit 3.
+missing inspection adapters report unknown coverage and exit 3. The bounded
+observation adapters are now published separately in this repository and have
+been qualified through installed POSIX entrypoints. They expose local source
+records; their availability does not establish complete fleet coverage.
+
+Start an inspection with `ygg dream ls --all`, `ygg service ps --host all`,
+`ygg swarm heartbeat --layers`, `ygg swarm pressure --by plan --explain`, or
+`ygg schedule ls`. These print human-readable views; add `--json` for a
+structured result. Read the coverage alongside the rows. An unavailable,
+stale or unknown source can return exit 3 with useful partial records.
+`--host all` selects hosts represented by the captured frame; it does not
+prove that every fleet host was enrolled or contacted. Native plan units,
+pressure calibration, conditional intentions and exact GUI session attachment
+have separate remaining qualification gates. `dream open` cannot certify an
+attachment by printing a session identifier.
+
+During the current rollout, an accepted observation package is installed as
+an immutable generation under the logical root and selected through
+`swarmkernel/swarmharness`. Existing flat kernel files retain their owners.
+This deployment is additive: it neither activates new configuration nor
+repairs the running Composer miner. Packaging this reader into every fresh
+native installation remains a release obligation.
 
 `ygg fs status`, `init`, `where` and `gc plan` expose the accepted local root
 contract. Initialization supports the alias-first transition from the legacy
