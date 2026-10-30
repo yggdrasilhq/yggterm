@@ -569,6 +569,29 @@ def census(sources, cutoff=None, state_dir=None):
 
 # ------------------------------------------------------------ read
 
+def _reading_identity(stream):
+    """Bounded identity samples from the actual reader, without seeking it.
+
+    Generation uses the census's two 64 KiB windows. Metadata brackets
+    those samples and the page read; measurable concurrent changes defer.
+    This is sampled integrity, not a lock on another process's writes.
+    """
+    fd = stream.fileno()
+    before = os.fstat(fd)
+    head = os.pread(fd, 65536, 0)
+    tail = (os.pread(fd, 65536, before.st_size - 65536)
+            if before.st_size > 65536 else b"")
+    after = os.fstat(fd)
+    def metadata(st):
+        return (st.st_dev, st.st_ino, st.st_size,
+                st.st_mtime_ns, st.st_ctime_ns)
+    return {"generation": f"sz{before.st_size}:{_sha(head)[:12]}:{_sha(tail)[:12]}",
+            "bytes": before.st_size,
+            "lineage_id": _sha(f"{before.st_dev}:{before.st_ino}")[:16],
+            "metadata": metadata(before),
+            "coherent": metadata(before) == metadata(after)}
+
+
 class _Page(tuple):
     """The historical read_page 4-tuple (text, next_cursor, done,
     line_offs) carrying the raw emitted bytes for anchor hashing on
@@ -580,10 +603,13 @@ class _Page(tuple):
     skipped bytes are deliberately unanchored (typed in-content marker
     instead)."""
 
-    def __new__(cls, text, nxt, done, line_offs, raw, rid):
+    def __new__(cls, text, nxt, done, line_offs, raw, rid,
+                read_before=None, read_after=None):
         self = super().__new__(cls, (text, nxt, done, line_offs))
         self.raw = raw
         self.rid = rid
+        self.read_before = read_before
+        self.read_after = read_after
         return self
 
 
@@ -615,9 +641,9 @@ def read_page(path, cursor=0, max_bytes=262144):
         # fd-bound rename/replace cannot change it, so a path that is
         # swapped away for this read and restored before validation is
         # exposed by comparing .rid against the census identity.
-        st = os.fstat(f.fileno())
-        size = st.st_size
-        rid = (st.st_dev, st.st_ino, st.st_size)
+        read_before = _reading_identity(f)
+        size = read_before["bytes"]
+        rid = read_before["metadata"][:3]
         f.seek(pos)
         while True:
             chunk = f.read(max_bytes)
@@ -636,7 +662,8 @@ def read_page(path, cursor=0, max_bytes=262144):
                 first = pieces[0] if pieces else raw
                 marker = f"<<oversized-event dropped at bytes@{cursor}>>\n"
                 return _Page(marker, cursor + len(first), False, [cursor],
-                             None, rid)
+                             None, rid, read_before, _reading_identity(f))
+        read_after = _reading_identity(f)
     complete = []
     partial = b""
     if raw:
@@ -662,7 +689,7 @@ def read_page(path, cursor=0, max_bytes=262144):
     # done means EMITTED everything (sol t30 P5): an unterminated tail
     # record must still be read — the handle reaching EOF is not done
     return _Page(text, next_cursor, next_cursor >= size, starts, emitted,
-                 rid)
+                 rid, read_before, read_after)
 
 
 # ------------------------------------------------------------ store
@@ -1579,6 +1606,21 @@ def tick(sources, state_dir=None, max_bytes_per_source=262144,
                 r_lineage = (_sha(f"{rid[0]}:{rid[1]}")[:16]
                              if rid else None)
                 flapped = []
+                before = getattr(page, "read_before", None)
+                after = getattr(page, "read_after", None)
+                for identity in (before, after):
+                    if not isinstance(identity, dict) or not identity.get("coherent"):
+                        flapped.append("read-incoherent")
+                        continue
+                    if identity.get("generation") != gen:
+                        flapped.append("read-generation")
+                    if identity.get("bytes") != entry["bytes"]:
+                        flapped.append("read-size")
+                    if identity.get("lineage_id") != lineage:
+                        flapped.append("read-lineage")
+                if isinstance(before, dict) and isinstance(after, dict) \
+                        and before.get("metadata") != after.get("metadata"):
+                    flapped.append("read-metadata")
                 if r_lineage != lineage:
                     flapped.append("read-lineage")
                 if i_gen != gen:

@@ -432,12 +432,65 @@ def t_r5_restore_different_bytes_aba():
     shutil.rmtree(w)
 
 
+def t_r6_actual_read_metadata():
+    """Visible same-inode mutations cannot borrow the restored census."""
+    for mode in ("size-before-open", "generation-before-open", "after-fstat"):
+        w = fresh("read-metadata-" + mode)
+        src, state = w / "source", w / "state"
+        fault = (FAULT * 4).encode()
+        length = len(fault) if mode == "generation-before-open" else len(fault) * 2
+        original = b"x" * (length - 1) + b"\n"
+        src.write_bytes(original)
+        read_page = cp.read_page
+        path_open = Path.open
+        class TracedFD:
+            def __init__(self, stream):
+                self.stream, self.once = stream, False
+            def __enter__(self):
+                self.stream.__enter__()
+                return self
+            def __exit__(self, *args):
+                return self.stream.__exit__(*args)
+            def __getattr__(self, name):
+                return getattr(self.stream, name)
+            def read(self, *args):
+                if mode == "after-fstat" and not self.once:
+                    self.once = True
+                    src.write_bytes(fault)
+                return self.stream.read(*args)
+        def opened(path, *args, **kwargs):
+            stream = path_open(path, *args, **kwargs)
+            return (TracedFD(stream) if path == src and args
+                    and args[0] == "rb" else stream)
+        def reader(*args, **kwargs):
+            if mode != "after-fstat":
+                src.write_bytes(fault)
+            try:
+                with patch.object(Path, "open", opened):
+                    return read_page(*args, **kwargs)
+            finally:
+                src.write_bytes(original)
+        with patch.object(cp, "read_page", reader):
+            report = cp.tick({"board": [str(src)]}, state_dir=state, max_pages=1)
+        check("R6 " + mode + " discards mismatched read generation/size",
+              not rows_for(state) and report["gaps"] >= 1
+              and any("flapped mid-read" in n for n in report["notes"]))
+        cursor = state / "cursors.json"
+        anchor = state / "anchors.json"
+        check("R6 " + mode + " leaves no claimed cursor or anchor content",
+              (not cursor.exists() or not json.loads(cursor.read_text()))
+              and (not anchor.exists() or not json.loads(anchor.read_text()))
+              and src.read_bytes() == original)
+        shutil.rmtree(w)
+
+
 def main():
     t_r1_swap_before_open()
     t_r2_swap_after_read()
     t_r3_truncate_mid_read()
     t_r4_read_restore_byte_identical_aba()
     t_r5_restore_different_bytes_aba()
+    t_r6_actual_read_metadata()
     t_c1_stable_append_control()
     t_c2_two_lineage_eligibility_control()
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
