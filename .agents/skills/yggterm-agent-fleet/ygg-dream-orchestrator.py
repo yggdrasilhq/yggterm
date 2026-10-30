@@ -1029,7 +1029,9 @@ def queue_observation(rows):
                        or r["status"] not in known for r in rows)
     return {"observed": True, "complete": unclassified == 0,
             "unclassified": unclassified, "total": len(rows),
-            "backlog": sum(r.get("status") in {"queued", "retry_wait", "cooldown_wait"} for r in rows),
+            "backlog": sum(isinstance(r.get("status"), str)
+                           and r["status"] in {"queued", "retry_wait", "cooldown_wait"}
+                           for r in rows),
             **{field: sum(r.get("status") == field for r in rows)
                for field in fields if field != "backlog"}}
 

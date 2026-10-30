@@ -49,12 +49,14 @@ class WatchTests(unittest.TestCase):
         with patch.object(m, "load_cfg", return_value={}), patch.object(m, "load_swarmconfig", return_value=None), patch.object(m, "cmd_status", return_value=3), patch.object(m.sys, "argv", ["watch", "status", "--json"]):
             self.assertEqual(m.main(), 3)
     def test_future_state_is_partial_instead_of_false_empty(self):
-        rc, output = self.status([{"status": "future-state"}], True)
-        q = json.loads(output)["queue"]
-        self.assertEqual(rc, 3)
-        self.assertEqual(q["total"], 1)
-        self.assertEqual(q["unclassified"], 1)
-        self.assertFalse(q["complete"])
+        for value in ["future-state", [], {}, ["running"], 17, None]:
+            with self.subTest(value=value):
+                rc, output = self.status([{"status": value}], True)
+                q = json.loads(output)["queue"]
+                self.assertEqual(rc, 3)
+                self.assertEqual(q["total"], 1)
+                self.assertEqual(q["unclassified"], 1)
+                self.assertFalse(q["complete"])
     def test_unknown_schema_holds_actual_topup_before_staging(self):
         with patch.object(m, "SWCFG", None), patch.object(m, "load_state", return_value={}), patch.object(m, "qjson", return_value=[{"status": "future-state"}]), patch.object(m, "stage_brief") as stage, contextlib.redirect_stdout(io.StringIO()) as output:
             m.cmd_topup({})
