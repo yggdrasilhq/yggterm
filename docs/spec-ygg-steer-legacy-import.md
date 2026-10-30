@@ -87,20 +87,28 @@ digests bound by the plan: any drift between plan and stage HOLDs without
 publishing (replan instead). Publication is a single Linux
 `renameat2(RENAME_NOREPLACE)` from a private temp dir with fsync discipline
 — a platform without a typed renameat2 route HOLDs rather than falling back
-to replacing `rename` — so a partial copy, full-disk failure, or a
+to replacing `rename` — so a pre-rename partial copy, pre-rename full-disk failure, or a
 concurrently created directory at the destination (even an empty one)
 publishes nothing into it: the occupied destination is preserved in place
 and the stage HOLDs. Replay recomputes the candidate ID from the staged
 `descriptor.json` bytes, binds the staged manifest to the descriptor's
 manifest, and revalidates all sealed hashes; it is idempotent (no rewrite)
 and reports the disk manifest digest. After a successful rename the
-candidate is the commit point: a parent-directory fsync failure cannot
-unpublish it, and is reported truthfully as `durable: false` with a typed
-`fsync_error` and a replay recovery contract instead of a false failure
-claim. An existing directory that is incomplete or disagrees with its seal
-HOLDs and is never overwritten. Nothing outside `candidates/<id>` is
-touched: existing policy, `active.json`, target bytes and foreign-memory
-guards stay unchanged.
+candidate is namespace-visible. A subsequent parent-directory fsync failure
+leaves its durability unconfirmed. The result preserves `published` and
+reports `status: VISIBLE_DURABILITY_UNKNOWN`, `durable: false`, a typed
+`fsync_error` and CLI exit 75. This is a retained HOLD, not accepted policy
+or a claim that no directory became visible. Every replay revalidates all
+selected source and candidate bytes and retries that exact parent-directory
+fsync. Persistent failure remains held; only a successful sync returns
+`DURABLE_CANDIDATE` and exit 0. Pre-rename failures publish no candidate.
+No imported candidate activates policy, stamps a harness or authorizes legacy
+deletion. This distinction corrects the earlier campaign-derived requirement
+that conflated namespace visibility with durability; it does not certify that
+earlier requirement. An existing directory that is incomplete or disagrees with its seal
+HOLDs and is never overwritten. Existing policy, `active.json`, target bytes
+and foreign-memory guards stay unchanged; temporary staging and candidate
+namespace metadata are the importer's own effects.
 
 ## Input controls
 

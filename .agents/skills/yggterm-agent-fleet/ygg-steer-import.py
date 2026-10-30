@@ -41,7 +41,7 @@ cspec.loader.exec_module(compiler)
 fs = compiler.fs
 
 SCHEMA = 1
-IMPORTER_VERSION = 1
+IMPORTER_VERSION = 2
 ADAPTER_KIND = "yggsteer-steer-v1"
 STEER_NAME = "steer"
 TARGETS_NAME = "targets.toml"
@@ -234,13 +234,16 @@ def _is_section_read(node):
 
 
 def _is_local_read(node):
-    """(ROOT / t['local']).read_text()"""
+    """(ROOT / t['local']).read_text() — the harness record must come from the
+    recognized config lookup variable t, not from an arbitrary object."""
     return (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
             and node.func.attr == "read_text" and not node.args and not node.keywords
             and isinstance(node.func.value, ast.BinOp)
             and isinstance(node.func.value.op, ast.Div)
             and isinstance(node.func.value.left, ast.Name) and node.func.value.left.id == "ROOT"
             and isinstance(node.func.value.right, ast.Subscript)
+            and isinstance(node.func.value.right.value, ast.Name)
+            and node.func.value.right.value.id == "t"
             and _constant_str(node.func.value.right.slice) == "local")
 
 
@@ -260,10 +263,27 @@ def _no_arg_call(node):
     return not node.args and not node.keywords
 
 
+def _plain_parameters(fn, names, defaults=0):
+    """Pin the complete recognized parameter binding: exactly these positional
+    names in order with the stated number of literal-typed default slots, and
+    no decorators, positional-only, keyword-only, vararg or kwarg surface.
+    Anything else — a decorator that would rebind the function, an extra
+    default, star-args — is outside the recognized grammar and HOLDs."""
+    if fn.decorator_list:
+        raise fs.Held("recognized legacy functions carry no decorators")
+    args = fn.args
+    if ([a.arg for a in args.posonlyargs] or [a.arg for a in args.args] != names
+            or len(args.defaults) != defaults or args.vararg is not None
+            or args.kwonlyargs or args.kwarg is not None):
+        raise fs.Held("recognized legacy function parameters must be exactly "
+                      f"({', '.join(names)}) with {defaults} default(s)")
+
+
 def _match_guarded_fn(fn):
     """The wrapper must byte-match the accepted compiler's guarded chunk:
     f'<!-- BEGIN {name} -->\\n{body.rstrip()}\\n<!-- END {name} -->\\n' with
     plain format fields over the wrapper's own name/body parameters."""
+    _plain_parameters(fn, ["name", "body"])
     body = [s for s in fn.body if not _is_docstring(s)]
     if len(body) != 1 or not isinstance(body[0], ast.Return) or not isinstance(body[0].value, ast.JoinedStr):
         raise fs.Held("legacy wrapper is not a single literal guard format string")
@@ -290,6 +310,7 @@ def _match_guarded_fn(fn):
 
 
 def _match_extract_foreign(fn):
+    _plain_parameters(fn, ["text", "tag"], defaults=1)
     tag = _constant_str(fn.args.defaults[-1]) if fn.args.defaults else None
     if not tag:
         raise fs.Held("legacy foreign-owner tag is not a literal default")
@@ -306,23 +327,40 @@ def _match_extract_foreign(fn):
             and len(bind.value.args) >= 2):
         raise fs.Held("unsupported legacy foreign-owner extractor match shape")
     pattern = bind.value.args[0]
-    if not (isinstance(pattern, ast.JoinedStr)
-            and any(isinstance(value, ast.FormattedValue)
-                    and isinstance(value.value, ast.Name) and value.value.id == "tag"
-                    for value in pattern.values)):
-        raise fs.Held("unsupported legacy foreign-owner extractor pattern "
-                      "does not interpolate the owner tag")
-    for value in pattern.values:
-        if isinstance(value, ast.FormattedValue):
-            _plain_format(value)
+    pattern_values = pattern.values if isinstance(pattern, ast.JoinedStr) else []
+    pattern_constants = [_constant_str(v) for v in pattern_values if isinstance(v, ast.Constant)]
+    pattern_formatted = [v for v in pattern_values if isinstance(v, ast.FormattedValue)]
+    # The recognized grammar pins the exact tagged-region regex operand: the
+    # region delimiters and lazy body are grammar, the tag interpolation is the
+    # only free operand. The trailing optional newline is the same regex atom
+    # written either as a literal newline or as the \n escape; any other region
+    # expression compiles a different projection and HOLDs.
+    trailing_ok = (pattern_constants[2:] == [" -->\n?"]
+                   or pattern_constants[2:] == [" -->\\n?"])
+    if (len(pattern_constants) != 3 or pattern_constants[0] != "<!-- BEGIN "
+            or pattern_constants[1] != " -->.*?<!-- END " or not trailing_ok
+            or len(pattern_formatted) != 2
+            or not all(isinstance(v.value, ast.Name) and v.value.id == "tag"
+                       for v in pattern_formatted)):
+        raise fs.Held("unsupported legacy foreign-owner extractor pattern: the recognized "
+                      "grammar pins the exact tagged BEGIN/END region regex over tag")
+    for value in pattern_formatted:
+        _plain_format(value)
     text_arg = bind.value.args[1]
-    flags_ok = all(isinstance(a, ast.Attribute) and isinstance(a.value, ast.Name)
-                   and a.value.id == "re" for a in bind.value.args[2:])
-    keywords_ok = all(k.arg == "flags" and isinstance(k.value, ast.Attribute)
-                      and isinstance(k.value.value, ast.Name) and k.value.value.id == "re"
-                      for k in bind.value.keywords)
-    if not (isinstance(text_arg, ast.Name) and flags_ok and keywords_ok):
-        raise fs.Held("unsupported legacy foreign-owner extractor arguments")
+    # The recognized call is re.search(pattern, text, re.S): the text operand is
+    # the extractor's own parameter, flags are the positional DOTALL attribute,
+    # and no keyword flags exist in the grammar.
+    if not (len(bind.value.args) == 3 and isinstance(text_arg, ast.Name)
+            and text_arg.id == "text"):
+        raise fs.Held("unsupported legacy foreign-owner extractor text operand: "
+                      "the recognized grammar searches the text parameter")
+    if (bind.value.keywords
+            or not (isinstance(bind.value.args[2], ast.Attribute)
+                    and isinstance(bind.value.args[2].value, ast.Name)
+                    and bind.value.args[2].value.id == "re"
+                    and bind.value.args[2].attr == "S")):
+        raise fs.Held("unsupported legacy foreign-owner extractor flags: the recognized "
+                      "grammar pins re.search(pattern, text, re.S) with no keyword flags")
     outcome = stmts[1]
     if not (isinstance(outcome, ast.Return) and isinstance(outcome.value, ast.IfExp)
             and isinstance(outcome.value.test, ast.Name) and outcome.value.test.id == "m"
@@ -341,6 +379,7 @@ def _match_extract_foreign(fn):
 
 
 def _match_assemble(fn, constants):
+    _plain_parameters(fn, ["harness", "live_text"])
     stmts = [s for s in fn.body if not _is_docstring(s)]
     if len(stmts) < 6:
         raise fs.Held("unsupported legacy assembly: too few statements")
@@ -353,15 +392,20 @@ def _match_assemble(fn, constants):
         return node
 
     node = take()
+    # The harness record must be looked up from CFG with the assembler's own
+    # harness parameter, bound to the recognized variable t.
     if not (isinstance(node, ast.Assign) and isinstance(node.value, ast.Subscript)
             and isinstance(node.value.value, ast.Name) and node.value.value.id == "CFG"
-            and isinstance(node.value.slice, ast.Name)
+            and isinstance(node.value.slice, ast.Name) and node.value.slice.id == "harness"
             and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name)
             and node.targets[0].id == "t"):
         raise fs.Held("unsupported legacy assembly: harness config lookup not recognized")
     node = take()
+    # The core literal must open into the recognized parts accumulator.
     if not (isinstance(node, ast.Assign) and isinstance(node.value, ast.List)
-            and len(node.value.elts) == 1 and _is_core_read(node.value.elts[0])):
+            and len(node.value.elts) == 1 and _is_core_read(node.value.elts[0])
+            and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name)
+            and node.targets[0].id == "parts"):
         raise fs.Held("unsupported legacy assembly: core literal opening not recognized")
     node = take()
     sections = []
@@ -397,20 +441,51 @@ def _match_assemble(fn, constants):
     if _guard_tag(inner.args[0], constants) != constants["HARNESS_GUARD"]:
         raise fs.Held("unsupported legacy assembly: local harness wrap does not use the harness guard constant")
     node = take()
+    # The foreign slot binds the recognized stamp variable: the extraction runs
+    # over the assembler's own live_text parameter, guarded by the same
+    # parameter, and an absent region yields None.
     if not (isinstance(node, ast.Assign) and isinstance(node.value, ast.IfExp)
             and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name)
             and node.targets[0].id == "stamp"
+            and isinstance(node.value.test, ast.Name) and node.value.test.id == "live_text"
             and isinstance(node.value.body, ast.Call)
             and isinstance(node.value.body.func, ast.Name)
             and node.value.body.func.id == "extract_foreign"
             and not node.value.body.keywords and len(node.value.body.args) == 1
+            and isinstance(node.value.body.args[0], ast.Name)
+            and node.value.body.args[0].id == "live_text"
             and isinstance(node.value.orelse, ast.Constant) and node.value.orelse.value is None):
         raise fs.Held("unsupported legacy assembly: foreign-owner extraction not recognized")
     node = take()
-    if not isinstance(node, ast.If) or not isinstance(node.test, ast.Name) or len(node.orelse) == 0:
+    # The append fires only on the extracted stamp, and the else branch is the
+    # permitted single warning: a print of one static string message to stderr.
+    # Any other else body — a policy append, a file write, extra statements —
+    # implements a different projection and HOLDs (it is also never executed:
+    # the adapter reads structure only).
+    if not (isinstance(node, ast.If) and isinstance(node.test, ast.Name)
+            and node.test.id == "stamp"):
         raise fs.Held("unsupported legacy assembly: foreign-owner slot branch not recognized")
     if len(node.body) != 1 or not _is_parts_append(node.body[0]):
         raise fs.Held("unsupported legacy assembly: foreign-owner append not recognized")
+    if len(node.orelse) != 1:
+        raise fs.Held("unsupported legacy assembly: the foreign-owner else branch "
+                      "is not a single warning statement")
+    warning = node.orelse[0]
+    message = warning.value.args[0] if (isinstance(warning, ast.Expr)
+                                        and isinstance(warning.value, ast.Call)
+                                        and warning.value.args) else None
+    message_ok = isinstance(message, (ast.Constant, ast.JoinedStr)) and (
+        not isinstance(message, ast.Constant) or isinstance(message.value, str))
+    if not (isinstance(warning, ast.Expr) and isinstance(warning.value, ast.Call)
+            and isinstance(warning.value.func, ast.Name) and warning.value.func.id == "print"
+            and message_ok and len(warning.value.keywords) == 1
+            and warning.value.keywords[0].arg == "file"
+            and isinstance(warning.value.keywords[0].value, ast.Attribute)
+            and isinstance(warning.value.keywords[0].value.value, ast.Name)
+            and warning.value.keywords[0].value.value.id == "sys"
+            and warning.value.keywords[0].value.attr == "stderr"):
+        raise fs.Held("unsupported legacy assembly: foreign-owner else branch is not the "
+                      "permitted print(message, file=sys.stderr) warning")
     appended = node.body[0].value.args[0]
     if not (len(node.body[0].value.args) == 1
             and isinstance(appended, ast.BinOp) and isinstance(appended.op, ast.Add)
@@ -759,7 +834,13 @@ class _Staging:
 def _validate_existing(candidate_dir, candidate_id):
     """Replay: a complete candidate must match its sealed marker AND the
     candidate identity must be recomputed from the staged bytes, never trusted
-    from the caller's in-memory plan or from the marker alone."""
+    from the caller's in-memory plan or from the marker alone.
+
+    The mandatory file inventory and every source digest derive from the
+    descriptor-bound manifest — the self-declared marker cannot add, drop or
+    rehash a declared source. The on-disk tree must be exactly the sealed
+    inventory plus the marker: no unlisted foreign policy file, no missing or
+    changed payload, no symlink standing in for a staged file."""
     marker_raw, _ = _read_source(candidate_dir, "complete.json", LIMIT_JSON_BYTES)
     try:
         marker = json.loads(marker_raw.decode("utf-8"))
@@ -771,13 +852,6 @@ def _validate_existing(candidate_dir, candidate_id):
     files = marker.get("files")
     if not isinstance(files, dict) or not files:
         raise fs.Held("existing candidate has no sealed file list")
-    for relative, digest in sorted(files.items()):
-        try:
-            raw, _meta = _read_source(candidate_dir, relative, LIMIT_PART_BYTES)
-        except fs.Held as exc:
-            raise fs.Held(f"existing candidate file is unreadable: {relative} ({exc})") from exc
-        if sha(raw) != digest:
-            raise fs.Held(f"existing candidate file differs from its sealed digest: {relative}")
     manifest_raw, _ = _read_source(candidate_dir, "manifest.json", LIMIT_JSON_BYTES)
     if sha(manifest_raw) != marker.get("manifest_sha256"):
         raise fs.Held("existing candidate manifest differs from its sealed digest")
@@ -799,8 +873,80 @@ def _validate_existing(candidate_dir, candidate_id):
     # bound inside the staged descriptor.
     if canonical(descriptor.get("manifest")) != manifest_raw:
         raise fs.Held("existing candidate manifest is not the descriptor's bound manifest")
+    # Mandatory inventory from the descriptor-bound manifest: every declared
+    # policy source plus the sealed metadata. A marker that omits, adds or
+    # rehashes any of them does not describe this candidate.
+    bound_manifest = descriptor.get("manifest")
+    declared_sources = sorted({part["source"]
+                               for target in bound_manifest.get("targets", {}).values()
+                               for part in target.get("parts", [])})
+    required = {"manifest.json", "descriptor.json", "provenance.json"} | {
+        "sources/" + rel for rel in declared_sources}
+    if set(files) != required:
+        raise fs.Held(f"existing candidate sealed inventory disagrees with the descriptor-bound "
+                      f"manifest (missing from marker: {sorted(required - set(files))[:8]}; "
+                      f"unlisted in marker: {sorted(set(files) - required)[:8]})")
+    expected = {rel: "file" for rel in sorted(required | {"complete.json"})}
+    for rel in sorted(required):
+        for ancestor in list(PurePath(rel).parents)[:-1]:
+            expected[ancestor.as_posix()] = "directory"
+    try:
+        actual = _scan_tree(candidate_dir)
+    except fs.Held as exc:
+        raise fs.Held(f"existing candidate tree is not scannable: {exc}") from exc
+    if actual != expected:
+        raise fs.Held(f"existing candidate directory does not match its sealed inventory "
+                      f"(extra entries: {sorted(set(actual) - set(expected))[:8]}; "
+                      f"absent entries: {sorted(set(expected) - set(actual))[:8]}; "
+                      f"wrong kinds: {sorted(rel for rel in set(actual) & set(expected)
+                                             if actual[rel] != expected[rel])[:8]})")
+    # Byte validation of every sealed file against its marker digest, then the
+    # descriptor binding for the declared sources: an independently rehashed
+    # marker entry cannot legitimize changed payload bytes.
+    for relative, digest in sorted(files.items()):
+        try:
+            raw, _meta = _read_source(candidate_dir, relative, LIMIT_PART_BYTES)
+        except fs.Held as exc:
+            raise fs.Held(f"existing candidate file is unreadable: {relative} ({exc})") from exc
+        if sha(raw) != digest:
+            raise fs.Held(f"existing candidate file differs from its sealed digest: {relative}")
+    for target in bound_manifest.get("targets", {}).values():
+        for part in target.get("parts", []):
+            relative = "sources/" + part["source"]
+            if files.get(relative) != part["sha256"]:
+                raise fs.Held(f"existing candidate marker digest was rewritten for a "
+                              f"descriptor-bound source: {relative}")
     return {"manifest_sha256": sha(manifest_raw), "descriptor_sha256": sha(descriptor_raw),
             "descriptor": descriptor}
+
+
+def _retry_parent_fsync(candidates_path):
+    """Recovery contract for a published candidate: retry the candidates-parent
+    fsync on every replay and report the outcome truthfully.
+
+    Returns (durable, error). A failure is never laundered: the rename already
+    committed, so the candidate is published and visible while its rename
+    durability stays unconfirmed until a replay sync succeeds."""
+    try:
+        _fsync_directory(candidates_path)
+        return True, None
+    except OSError as exc:
+        return False, exc
+
+
+def _policy_source_drift_gate(plan, manifest):
+    """Re-read every identity-bound selected policy source and compare it with
+    the manifest digest before anything is staged or replayed. This gate runs
+    before the existing-candidate early return, so replay can never accept a
+    stale plan against drifted legacy sources."""
+    bound = {}
+    for target in manifest["targets"].values():
+        for part in target["parts"]:
+            bound.setdefault(part["source"], part["sha256"])
+    for relative, digest in sorted(bound.items()):
+        raw, _meta = _read_source(plan["legacy_root_resolved"], relative, LIMIT_PART_BYTES)
+        if sha(raw) != digest:
+            raise fs.Held(f"legacy source changed since the plan was made: {relative}")
 
 
 def stage_candidate(plan, manifest, *, home=None, env=None, root=None):
@@ -823,6 +969,9 @@ def stage_candidate(plan, manifest, *, home=None, env=None, root=None):
         raw, _meta = _read_source(plan["legacy_root_resolved"], relative, limit)
         if sha(raw) != bound:
             raise fs.Held(f"legacy {relative} changed since the plan was made; replan before staging")
+    # Policy-source drift gate: the same staleness refusal for every selected
+    # Markdown source, enforced before the existing-candidate early return below.
+    _policy_source_drift_gate(plan, manifest)
     candidates_path = Path(selected["physical_path"]) / "steer" / "candidates"
     candidate_id = candidate_identity(plan, manifest)
     manifest_bytes = canonical(manifest)
@@ -830,9 +979,19 @@ def stage_candidate(plan, manifest, *, home=None, env=None, root=None):
         existing = candidates_path / candidate_id
         if existing.is_dir() and not existing.is_symlink():
             stored = _validate_existing(existing, candidate_id)
-            return {"candidate_id": candidate_id, "path": str(existing.resolve()),
-                    "published": False, "validated": True, "sealed": True,
-                    "manifest_sha256": stored["manifest_sha256"]}
+            durable, sync_error = _retry_parent_fsync(candidates_path)
+            result = {"candidate_id": candidate_id, "path": str(existing.resolve()),
+                      "published": False, "validated": True, "sealed": True,
+                      "durable": durable,
+                      "manifest_sha256": stored["manifest_sha256"]}
+            if sync_error is not None:
+                result["fsync_error"] = (f"errno {sync_error.errno}: the candidates-parent fsync "
+                                         "still fails during replay; the candidate is published "
+                                         "and validated, but its rename durability remains "
+                                         "unconfirmed (recovery contract)")
+            result["status"] = ("VISIBLE_DURABILITY_UNKNOWN" if not durable
+                                else "DURABLE_CANDIDATE")
+            return result
         temp_name = ".staging-" + uuid.uuid4().hex
         staging = _Staging(candidates_fd, candidates_path, temp_name)
         try:
@@ -875,22 +1034,32 @@ def stage_candidate(plan, manifest, *, home=None, env=None, root=None):
             raise
     final = candidates_path / candidate_id
     stored = None
+    durable, sync_error = True, None
     if not published:
         try:
             stored = _validate_existing(final, candidate_id)
         except fs.Held as exc:
             raise fs.Held("candidate destination is occupied by an unrecognized or "
                           f"incomplete directory (preserved in place): {exc}") from exc
+        durable, sync_error = _retry_parent_fsync(candidates_path)
     result = {"candidate_id": candidate_id, "path": str(final.resolve()),
               "published": bool(published), "validated": not published, "sealed": True,
+              "durable": bool(durable),
               "manifest_sha256": sha(manifest_bytes) if published
               else stored["manifest_sha256"]}
+    if not published and sync_error is not None:
+        result["fsync_error"] = (f"errno {sync_error.errno}: the candidates-parent fsync "
+                                 "still fails during replay; the candidate is published "
+                                 "and validated, but its rename durability remains "
+                                 "unconfirmed (recovery contract)")
     if published and fsync_error is not None:
         result["durable"] = False
         result["fsync_error"] = (f"errno {fsync_error.errno}: the parent-directory fsync failed "
                                  "after the rename; the candidate is published and visible, but "
                                  "rename durability is unconfirmed. Re-running stage replays and "
                                  "validates the existing candidate (recovery contract).")
+    result["status"] = ("VISIBLE_DURABILITY_UNKNOWN" if result.get("durable") is False
+                        else "DURABLE_CANDIDATE")
     return result
 
 
@@ -908,9 +1077,11 @@ def cli(argv=None):
     preview = sub.add_parser("preview")
     preview.add_argument("--harness", required=True)
     preview.add_argument("--live", help="optional live target snapshot file")
+    preview.add_argument("--json", action="store_true")
     stage_p = sub.add_parser("stage")
     stage_p.add_argument("--harness", action="append", default=[])
     stage_p.add_argument("--home", help="explicit HOME for the root resolver")
+    stage_p.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
     try:
         plan = plan_import(args.legacy)
@@ -947,7 +1118,7 @@ def cli(argv=None):
                   f"{len(plan['blockers'])} unclassified blockers preserved in place, "
                   f"{len(plan['unknown'])} unknown items, {len(plan['hold_items'])} hold items")
             print(f"  foreign-owner slot: {plan['foreign']['tag']} (required=False)")
-        return 0
+        return 75 if args.verb == "stage" and result.get("durable") is False else 0
     except (fs.Held, OSError, ValueError) as exc:
         print(f"ygg steer import-legacy: HOLD — {exc}", file=sys.stderr)
         return 75

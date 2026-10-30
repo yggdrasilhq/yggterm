@@ -207,8 +207,11 @@ class Import(unittest.TestCase):
             "    else:\n        print('fixture warning: foreign slot empty', file=sys.stderr)",
             "    else:\n        open(r'%s','w').write('boom')" % bomb)
         (self.legacy/'steer').write_text(bombish)
-        plan=self.plan()
-        self.assertEqual(plan['adapter']['kind'],'yggsteer-steer-v1')
+        # The tightened grammar pins the permitted else body to the warning
+        # print, so a file-writing statement is structurally rejected — and it
+        # was never executed either way: the adapter reads structure only.
+        with self.assertRaisesRegex(mod.fs.Held,'foreign-owner else branch'):
+            self.plan()
         self.assertFalse(bomb.exists())
 
     def test_ast_semantic_mutations_hold(self):
@@ -231,6 +234,211 @@ class Import(unittest.TestCase):
                 (self.legacy/'steer').write_text(source)
                 with self.assertRaises(mod.fs.Held):
                     self.plan()
+
+    def test_ast_grammar_pins_full_recognized_semantics(self):
+        """Every mutation of the recognized wrapper/extractor/assembler outside
+        the versioned narrow grammar must HOLD at plan time: parameter bindings,
+        exact regex operands and flags, config lookup operand, parts assignment
+        target, local-read config, foreign extraction operand/condition, append
+        condition and the permitted else body."""
+        variants={
+            # extractor regex operand and flags
+            'regex_matches_different_region':("f'<!-- BEGIN {tag} -->.*?<!-- END {tag} -->\\n?'","f'OTHER REGION {tag}'"),
+            'regex_wrong_flags':('text, re.S)','text, re.I)'),
+            'regex_keyword_flags':('text, re.S)','text, flags=re.S)'),
+            'regex_missing_flag':('text, re.S)','text)'),
+            'regex_flag_multi':('text, re.S)','text, re.S, re.I)'),
+            # wrapper parameter binding and surface
+            'wrapper_swapped_parameters':('def guarded(name, body):','def guarded(body, name):'),
+            'wrapper_decorated':('def guarded(name, body):','@staticmethod\ndef guarded(name, body):'),
+            'wrapper_extra_default':('def guarded(name, body):','def guarded(name, body=None):'),
+            'wrapper_extra_vararg':('def guarded(name, body):','def guarded(name, body, *rest):'),
+            # assembler harness lookup and accumulator targets
+            'harness_lookup_wrong_operand':('t = CFG[harness]','t = CFG[live_text]'),
+            'config_assignment_wrong_variable2':('t = CFG[harness]','harness_record = CFG[harness]'),
+            'core_assigned_to_wrong_variable':('parts = [(ROOT','other = [(ROOT'),
+            # local-harness read config operand
+            'local_read_wrong_config':("ROOT / t['local']","ROOT / CFG['local']"),
+            'local_branch_guarded_else':(
+                "if t.get('local'):\n        parts.append(guarded(HARNESS_GUARD, (ROOT / t['local']).read_text()))",
+                "if t.get('local'):\n        parts.append(guarded(HARNESS_GUARD, (ROOT / t['local']).read_text()))\n    else:\n        parts.append('FALLBACK')"),
+            # foreign extraction operand/condition and group index
+            'foreign_extraction_wrong_argument':('extract_foreign(live_text) if live_text','extract_foreign(harness) if live_text'),
+            'foreign_extraction_wrong_condition':('if live_text else None','if harness else None'),
+            'foreign_group_index_shifted':('m.group(0) if m else None','m.group(1) if m else None'),
+            'foreign_extractor_decorated':('def extract_foreign(text, tag=','@staticmethod\ndef extract_foreign(text, tag='),
+            'foreign_extractor_kwonly':('def extract_foreign(text, tag=','def extract_foreign(text, *, tag='),
+            # foreign append condition and permitted else body
+            'foreign_append_wrong_condition':('    if stamp:','    if harness:'),
+            'foreign_else_changes_policy':("print('fixture warning: foreign slot empty', file=sys.stderr)","parts.append('REPLACEMENT')"),
+            'foreign_else_writes_file':("print('fixture warning: foreign slot empty', file=sys.stderr)","print('warn', file=open('/dev/null','w'))"),
+            'foreign_else_two_statements':("print('fixture warning: foreign slot empty', file=sys.stderr)","print('warn', file=sys.stderr); print('extra', file=sys.stderr)"),
+            'foreign_else_wrong_stream':("print('fixture warning: foreign slot empty', file=sys.stderr)","print('fixture warning: foreign slot empty')"),
+            # assembler signature binding
+            'assemble_decorated':('def assemble(harness, live_text):','@staticmethod\ndef assemble(harness, live_text):'),
+            'assemble_signature_mutated':('def assemble(harness, live_text):','def assemble(harness, other):'),
+            'assemble_default_added':('def assemble(harness, live_text):','def assemble(harness, live_text=None):'),
+            'assemble_vararg_added':('def assemble(harness, live_text):','def assemble(harness, live_text, *extra):'),
+            # guard expression escaping the recognized constants
+            'section_guard_computed':("guarded('fixture-steer:self', (ROOT / 'sections/self-door.md')",
+                                      "guarded('fixture-steer:self'.upper(), (ROOT / 'sections/self-door.md')"),
+        }
+        for name,(old,new) in variants.items():
+            with self.subTest(name=name):
+                source=STEER_SOURCE.replace(old,new)
+                self.assertNotEqual(source,STEER_SOURCE,name)
+                (self.legacy/'steer').write_text(source)
+                with self.assertRaises(mod.fs.Held):
+                    self.plan()
+
+    def test_unlisted_missing_changed_and_linked_payload_replay_holds(self):
+        """Replay validates the actual candidate against the descriptor-bound
+        manifest inventory, not the self-declared marker: rehashed, omitted,
+        unlisted, planted and symlinked payloads must HOLD without rewriting."""
+        plan=self.plan();manifest=mod.build_manifest(plan)
+        rel='sources/core/beta.md'
+
+        def fresh():
+            candidates=self.ygg/'steer'/'candidates'
+            if candidates.exists():
+                shutil.rmtree(candidates)
+            return Path(self.stage(plan,manifest)['path'])
+
+        def rewrite_marker(base, mutate):
+            marker=json.loads((base/'complete.json').read_bytes())
+            mutate(marker)
+            (base/'complete.json').write_bytes(mod.canonical(marker))
+
+        base=fresh();source=base/rel
+        source.write_bytes(b'Invented different policy bytes.\n')
+        rewrite_marker(base,lambda mk:mk['files'].__setitem__(rel,mod.sha(source.read_bytes())))
+        with self.assertRaisesRegex(mod.fs.Held,'descriptor-bound source'):
+            self.stage(plan,manifest)
+
+        base=fresh()
+        (base/rel).unlink()
+        rewrite_marker(base,lambda mk:mk['files'].pop(rel))
+        with self.assertRaisesRegex(mod.fs.Held,'missing from marker'):
+            self.stage(plan,manifest)
+
+        base=fresh()
+        (base/'sources/core/foreign.md').write_bytes(b'unlisted foreign policy bytes\n')
+        with self.assertRaisesRegex(mod.fs.Held,'extra entries'):
+            self.stage(plan,manifest)
+
+        base=fresh()
+        (base/'extra-policy.md').write_bytes(b'unlisted root file\n')
+        with self.assertRaisesRegex(mod.fs.Held,'extra entries'):
+            self.stage(plan,manifest)
+
+        base=fresh()
+        (base/rel).unlink()
+        (base/rel).symlink_to(base/'sources/sections/orders.md')
+        with self.assertRaisesRegex(mod.fs.Held,'wrong kinds'):
+            self.stage(plan,manifest)
+
+        base=fresh()
+        (base/'sources/core/planted').mkdir()
+        with self.assertRaisesRegex(mod.fs.Held,'extra entries'):
+            self.stage(plan,manifest)
+
+        base=fresh()
+        rewrite_marker(base,lambda mk:mk['files'].__setitem__(rel,'f'*64))
+        with self.assertRaisesRegex(mod.fs.Held,'differs from its sealed digest'):
+            self.stage(plan,manifest)
+        # the clean candidate still replays after all rejections
+        base=fresh()
+        result=self.stage(plan,manifest)
+        self.assertFalse(result['published'])
+        self.assertTrue(result['validated'])
+
+    def test_policy_source_drift_holds_replay(self):
+        """The identity-bound selected source hashes are re-checked before the
+        existing-candidate early return: replay cannot accept a stale plan."""
+        plan=self.plan();manifest=mod.build_manifest(plan)
+        self.stage(plan,manifest)
+        (self.legacy/'core/beta.md').write_text('Invented drift since plan.\n')
+        with self.assertRaisesRegex(mod.fs.Held,'changed since the plan'):
+            self.stage(plan,manifest)
+        cid=mod.candidate_identity(plan,manifest)
+        base=self.ygg/'steer'/'candidates'/cid
+        marker=json.loads((base/'complete.json').read_bytes())
+        self.assertTrue(marker['sealed'])
+        rel='sources/core/beta.md'
+        self.assertEqual(hashlib.sha256((base/rel).read_bytes()).hexdigest(),
+                         marker['files'][rel])
+
+    def test_replay_durability_recovery_contract(self):
+        """Replay retries the candidates-parent fsync: uncertainty is retained
+        while the fault persists and cleared (durable) once a replay sync
+        succeeds. It is never laundered into a silent no-publication."""
+        plan=self.plan();manifest=mod.build_manifest(plan)
+        cid=mod.candidate_identity(plan,manifest)
+        real=mod.os.fsync
+        def full_disk(fd):
+            if (os.readlink('/proc/self/fd/%d'%fd).endswith('/steer/candidates')
+                    and (self.ygg/'steer'/'candidates'/cid/'complete.json').exists()):
+                raise OSError(28,'invented persistent directory fsync failure')
+            return real(fd)
+        with mock.patch.object(mod.os,'fsync',full_disk):
+            first=self.stage(plan,manifest)
+            replay_while_fault=self.stage(plan,manifest)
+        self.assertTrue(first['published'])
+        self.assertFalse(first['durable'])
+        self.assertTrue(replay_while_fault['validated'])
+        self.assertFalse(replay_while_fault['published'])
+        self.assertFalse(replay_while_fault['durable'])
+        self.assertIn('durability remains unconfirmed',replay_while_fault['fsync_error'])
+        healthy=self.stage(plan,manifest)
+        self.assertTrue(healthy['validated'])
+        self.assertTrue(healthy['durable'])
+        self.assertNotIn('fsync_error',healthy)
+
+    def test_cli_stage_human_and_json_paths_work(self):
+        """The stage CLI publishes then reports through its human and --json
+        paths without an args.json AttributeError, including the durability
+        warning path."""
+        import io,contextlib
+        output,error=io.StringIO(),io.StringIO()
+        with mock.patch.dict(os.environ,self.env), contextlib.redirect_stdout(output), contextlib.redirect_stderr(error):
+            code=mod.cli(['--legacy',str(self.legacy),'--root',str(self.ygg),
+                          'stage','--home',str(self.home)])
+        self.assertEqual(code,0)
+        self.assertIn('blockers preserved in place',output.getvalue())
+        # durable published run through --json (previously AttributeError)
+        output2,error2=io.StringIO(),io.StringIO()
+        with mock.patch.dict(os.environ,self.env), contextlib.redirect_stdout(output2), contextlib.redirect_stderr(error2):
+            code2=mod.cli(['--legacy',str(self.legacy),'--root',str(self.ygg),
+                           'stage','--home',str(self.home),'--json'])
+        self.assertEqual(code2,0)
+        payload=json.loads(output2.getvalue())
+        self.assertFalse(payload['published'])
+        self.assertTrue(payload['validated'])
+        self.assertTrue(payload['durable'])
+        # fault-persisting replay prints the truthful durability warning
+        real=mod.os.fsync
+        plan=self.plan();manifest=mod.build_manifest(plan)
+        cid=mod.candidate_identity(plan,manifest)
+        def full_disk(fd):
+            if (os.readlink('/proc/self/fd/%d'%fd).endswith('/steer/candidates')
+                    and (self.ygg/'steer'/'candidates'/cid/'complete.json').exists()):
+                raise OSError(28,'invented persistent directory fsync failure')
+            return real(fd)
+        output3,error3=io.StringIO(),io.StringIO()
+        with mock.patch.dict(os.environ,self.env), mock.patch.object(mod.os,'fsync',full_disk), \
+             contextlib.redirect_stdout(output3), contextlib.redirect_stderr(error3):
+            code3=mod.cli(['--legacy',str(self.legacy),'--root',str(self.ygg),
+                           'stage','--home',str(self.home)])
+        self.assertEqual(code3,75)
+        self.assertIn('WARNING durability unconfirmed',error3.getvalue())
+        output4=io.StringIO()
+        with mock.patch.dict(os.environ,self.env), mock.patch.object(mod.os,'fsync',full_disk), \
+             contextlib.redirect_stdout(output4):
+            code4=mod.cli(['--legacy',str(self.legacy),'--root',str(self.ygg),
+                           'stage','--home',str(self.home),'--json'])
+        self.assertEqual(code4,75)
+        self.assertEqual(json.loads(output4.getvalue())['status'],
+                         'VISIBLE_DURABILITY_UNKNOWN')
 
     def test_unknown_toml_fields_captured_and_staging_refused(self):
         (self.legacy/'targets.toml').write_text(
