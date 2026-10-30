@@ -28,6 +28,7 @@ import sys
 import tempfile
 import uuid
 from pathlib import Path
+from unittest.mock import patch
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
@@ -410,6 +411,267 @@ def t_csr07_load_checked_classification():
     shutil.rmtree(w)
 
 
+# =====================================================================
+# CSRSTORE-01..04 — critic round 2 repair unit (bounded findings)
+# =====================================================================
+
+def _csr_old_store(state):
+    """The exact original CSR-04 legacy geometry: two generation-era rows
+    plus a genuinely broken JSON line, written with CRLF/blank byte
+    noise so byte preservation is distinguishable from normalization."""
+    rows = [v1_row("lineage-s1", "g-1"), v1_row("lineage-s1", "g-2")]
+    body = ("".join(json.dumps(r, sort_keys=True) + "\n" for r in rows)
+            + 'CORRUPT-LINE-NEVER-JSON\n \r\n')
+    state.mkdir(parents=True, exist_ok=True)
+    (state / "observations.jsonl").write_bytes(body.encode())
+    return body.encode()
+
+
+def t_csrstore01_archive_fault_holds_whole_tick():
+    """CSRSTORE-01: an archive-fault hold must propagate to the TICK —
+    no source reads, no commits, no meta — and the exact original bytes
+    must be preserved durably without relying on the compromised
+    archive (pre-repair the tick recomputed held state and proceeded)."""
+    w = fresh("csrstore01-tick")
+    state = w / "state"
+    original = _csr_old_store(state)
+    digest = cp._sha(original)
+    adir = state / cp._ARCHIVE_DIR
+    adir.mkdir()
+    (adir / f"{digest}.jsonl").write_bytes(b"compromised archive")
+    src = w / "board.jsonl"
+    src.write_text("NameError: name 'invented' is not defined\n")
+
+    rep = cp.tick({"board": [str(src)]}, state_dir=state, claim_cap=0)
+
+    check("CSRSTORE-01 an archive-fault hold stops the tick before any "
+          "source read (pages_read 0)",
+          rep["pages_read"] == 0, json.dumps(rep)[:160])
+    check("CSRSTORE-01 a held tick commits nothing",
+          rep["observations"] == 0 and rep["backlog_remaining"] == 1,
+          json.dumps(rep)[:160])
+    check("CSRSTORE-01 a held tick leaves the live store byte-identical",
+          store_bytes(state) == original)
+    check("CSRSTORE-01 a held tick writes no identity meta",
+          not (state / "observations.meta.json").exists())
+    recovery = adir / f"{digest}.recovery.jsonl"
+    check("CSRSTORE-01 the hold preserves the exact original bytes "
+          "durably OUTSIDE the compromised archive",
+          recovery.exists() and recovery.read_bytes() == original
+          and any("preserved durably" in n for n in rep["notes"]),
+          json.dumps(rep["notes"])[:200])
+    shutil.rmtree(w)
+
+
+def t_csrstore01_hold_preserves_crlf_blank_bytes_exactly():
+    w = fresh("csrstore01-crlf")
+    state = w / "state"
+    original = _csr_old_store(state)
+    digest = cp._sha(original)
+    adir = state / cp._ARCHIVE_DIR
+    adir.mkdir()
+    (adir / f"{digest}.jsonl").write_bytes(b"compromised archive")
+
+    notes = cp.migrate_observations(state)
+
+    check("CSRSTORE-01 CRLF/blank byte noise is never normalized away on "
+          "a hold — a state file retains the EXACT original bytes",
+          (adir / f"{digest}.recovery.jsonl").read_bytes() == original,
+          json.dumps(notes)[:160])
+    check("CSRSTORE-01 the compromised archive entry is never touched",
+          (adir / f"{digest}.jsonl").read_bytes() == b"compromised archive")
+    check("CSRSTORE-01 the held migration notes the recovery location",
+          any(f"{cp._ARCHIVE_DIR}/{digest}.recovery.jsonl" in n
+              for n in notes), json.dumps(notes)[:200])
+    shutil.rmtree(w)
+
+
+def t_csrstore02_held_store_never_opens_enrolled_source():
+    """CSRSTORE-02: a held-store tick must gate BEFORE the content-
+    reading census — no enrolled source is opened at all (pre-repair
+    census's source_identity opened the source despite pages_read=0)."""
+    w = fresh("csrstore02-noopen")
+    state = w / "state"
+    state.mkdir(parents=True)
+    (state / "observations.meta.json").write_text('{"identity_version": 99}')
+    (state / "observations.jsonl").write_bytes(b"")
+    src = w / "board.jsonl"
+    src.write_bytes(b"NameError: name 'invented' is not defined\n")
+
+    reads = []
+    original_open = Path.open
+
+    def tracked_open(p, *args, **kwargs):
+        if p == src:
+            reads.append(args[0] if args else kwargs.get("mode", "r"))
+        return original_open(p, *args, **kwargs)
+
+    with patch.object(Path, "open", tracked_open):
+        rep = cp.tick({"board": [str(src)]}, state_dir=state, claim_cap=0)
+
+    check("CSRSTORE-02 a held store reports without ANY enrolled-source "
+          "open (gate ahead of the content-reading census)",
+          reads == [], json.dumps(reads))
+    check("CSRSTORE-02 a held tick reads zero pages and defers unread",
+          rep["pages_read"] == 0 and rep["observations"] == 0
+          and any("deferred unread" in n for n in rep["notes"]),
+          json.dumps(rep)[:160])
+    check("CSRSTORE-02 a held tick creates no per-source state",
+          not (state / "cursors.json").exists()
+          and not (state / "anchors.json").exists())
+    shutil.rmtree(w)
+
+
+def t_csrstore03_corrupt_bytes_typed_debt_never_crash():
+    """CSRSTORE-03: non-UTF8 records are typed corrupt debt — held
+    schemas stay opaque, current stores never crash, migration archives
+    the exact bytes (pre-repair each case raised UnicodeDecodeError)."""
+    w = fresh("csrstore03-future")
+    state = w / "state"
+    state.mkdir(parents=True)
+    (state / "observations.meta.json").write_text('{"identity_version": 99}')
+    raw = b"\xfffuture-encoding\n"
+    (state / "observations.jsonl").write_bytes(raw)
+    src = w / "board.jsonl"
+    src.write_bytes(b"NameError: name 'invented' is not defined\n")
+    rep = cp.tick({"board": [str(src)]}, state_dir=state, claim_cap=0)
+    check("CSRSTORE-03 a HELD future schema stays opaque — its non-UTF8 "
+          "bytes are never parsed and never crash the tick",
+          rep["pages_read"] == 0 and store_bytes(state) == raw,
+          json.dumps(rep)[:160])
+    shutil.rmtree(w)
+
+    w = fresh("csrstore03-current")
+    state = w / "state"
+    good = cp.make_observation("sig-nameerror-typo", "medium", "board",
+                               "g-1", "bytes@0", "fp", "lineage-x")
+    corrupt = b"\xffcurrent-corrupt\n"
+    payload = (cp._canonical(good) + "\n").encode() + corrupt
+    state.mkdir(parents=True)
+    (state / "observations.meta.json").write_text('{"identity_version": 2}')
+    (state / "observations.jsonl").write_bytes(payload)
+    src = w / "board.jsonl"
+    src.write_bytes(b"NameError: name 'invented' is not defined\n")
+    rep = cp.tick({"board": [str(src)]}, state_dir=state, claim_cap=0)
+    check("CSRSTORE-03 corrupt non-UTF8 records in a CURRENT store are "
+          "typed corrupt debt — the tick completes, never raises",
+          any("corrupt lines skipped" in n for n in rep["notes"])
+          and rep["pages_read"] >= 1, json.dumps(rep["notes"])[:200])
+    check("CSRSTORE-03 the corrupt bytes survive the tick's append "
+          "verbatim (never a lossy re-encode)",
+          store_bytes(state).startswith(payload)
+          and b"\xffcurrent-corrupt" in store_bytes(state))
+    shutil.rmtree(w)
+
+    w = fresh("csrstore03-legacy")
+    state = w / "state"
+    original = _csr_old_store(state) + b"\xff\n"
+    (state / "observations.jsonl").write_bytes(original)
+    notes = cp.migrate_observations(state)
+    archive = (state / cp._ARCHIVE_DIR / f"{cp._sha(original)}.jsonl")
+    check("CSRSTORE-03 a legacy store with a non-UTF8 record migrates "
+          "without a decoding crash and archives the EXACT bytes",
+          notes and archive.exists()
+          and archive.read_bytes() == original,
+          json.dumps(notes)[:160])
+    shutil.rmtree(w)
+
+
+def t_csrstore04_manifest_staged_before_switch():
+    """CSRSTORE-04: the ledger is staged durably BEFORE the projection/
+    meta switch, so a simulated interruption after staging replays into
+    an existing valid manifest (pre-repair the crash left no ledger)."""
+    w = fresh("csrstore04-crash")
+    state = w / "state"
+    original = _csr_old_store(state)
+    digest = cp._sha(original)
+
+    class SimulatedCrash(BaseException):
+        pass
+
+    with patch.object(cp, "_migration_manifest",
+                      side_effect=SimulatedCrash):
+        raised = False
+        try:
+            cp.migrate_observations(state)
+        except SimulatedCrash:
+            raised = True
+    check("CSRSTORE-04 the interruption propagates (no swallowed crash)",
+          raised)
+    check("CSRSTORE-04 a crash at the ledger boundary leaves the live "
+          "store and meta UNCHANGED (ledger staged before the switch)",
+          store_bytes(state) == original
+          and not (state / "observations.meta.json").exists())
+    check("CSRSTORE-04 the archived provenance already exists at the "
+          "crash boundary",
+          (state / cp._ARCHIVE_DIR / f"{digest}.jsonl").read_bytes()
+          == original)
+
+    notes = cp.migrate_observations(state)
+    manifest = (state / cp._ARCHIVE_DIR / f"{digest}.manifest.json")
+    m = json.loads(manifest.read_text()) if manifest.exists() else {}
+    check("CSRSTORE-04 recovery replays into an existing valid ledger "
+          "(counts durable across the interruption)",
+          manifest.exists() and m.get("rows_parsed") == 2
+          and m.get("corrupt_lines") == 2 and m.get("rekeyed") == 1
+          and m.get("coalesced_generation_duplicates") == 1
+          and json.loads((state / "observations.meta.json").read_text()
+                         ).get("identity_version") == 2,
+          json.dumps(m)[:200])
+    check("CSRSTORE-04 the archived provenance is byte-identical after "
+          "recovery",
+          (state / cp._ARCHIVE_DIR / f"{digest}.jsonl").read_bytes()
+          == original and any("migrated" in n for n in notes))
+    shutil.rmtree(w)
+
+
+def t_csrstore04_replay_validates_manifest_never_trusts():
+    """CSRSTORE-04: an exact-digest replay VALIDATES the existing ledger;
+    a damaged ledger's bytes are quarantined and a valid ledger rebuilt
+    (pre-repair any existing manifest was accepted unread)."""
+    w = fresh("csrstore04-corrupt")
+    state = w / "state"
+    original = _csr_old_store(state)
+    digest = cp._sha(original)
+    cp.migrate_observations(state)
+    mpath = state / cp._ARCHIVE_DIR / f"{digest}.manifest.json"
+    damaged = b"NOT JSON: damaged manifest"
+    mpath.write_bytes(damaged)
+    (state / "observations.jsonl").write_bytes(original)
+    (state / "observations.meta.json").unlink()
+
+    notes = cp.migrate_observations(state)
+
+    m = json.loads(mpath.read_text())
+    check("CSRSTORE-04 replay rebuilds a VALID ledger after detecting "
+          "the damage (validated, not silently accepted)",
+          m.get("sha256") == digest and m.get("rows_parsed") == 2
+          and m.get("corrupt_lines") == 2
+          and any("ledger" in n and "damaged" in n for n in notes),
+          json.dumps(notes)[:200])
+    sides = list((state / cp._ARCHIVE_DIR).glob(
+        f"{digest}.manifest.damaged-*.json"))
+    check("CSRSTORE-04 the damaged ledger's exact bytes are quarantined "
+          "beside it (never silently discarded)",
+          len(sides) == 1 and sides[0].read_bytes() == damaged,
+          json.dumps([p.name for p in sides]))
+    check("CSRSTORE-04 the immutable archived provenance is untouched by "
+          "the ledger repair",
+          (state / cp._ARCHIVE_DIR / f"{digest}.jsonl").read_bytes()
+          == original
+          and json.loads((state / "observations.meta.json").read_text()
+                         ).get("identity_version") == 2)
+
+    # a VALID ledger on replay is left byte-identical (validated, not
+    # rewritten)
+    manifest_then = mpath.read_bytes()
+    (state / "observations.meta.json").unlink()
+    cp.migrate_observations(state)
+    check("CSRSTORE-04 a validated ledger is never rewritten on replay",
+          mpath.read_bytes() == manifest_then)
+    shutil.rmtree(w)
+
+
 def main():
     t_csr04_archive_byte_identical()
     t_csr04_quarantine_malformed_on_migration()
@@ -421,6 +683,12 @@ def main():
     t_csr07_debt_note_cap()
     t_csr07_commit_survives_malformed_stored_row()
     t_csr07_load_checked_classification()
+    t_csrstore01_archive_fault_holds_whole_tick()
+    t_csrstore01_hold_preserves_crlf_blank_bytes_exactly()
+    t_csrstore02_held_store_never_opens_enrolled_source()
+    t_csrstore03_corrupt_bytes_typed_debt_never_crash()
+    t_csrstore04_manifest_staged_before_switch()
+    t_csrstore04_replay_validates_manifest_never_trusts()
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
     if FAIL:
         print("FAILED:", *FAIL, sep="\n  - ")

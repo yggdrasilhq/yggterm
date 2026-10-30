@@ -681,17 +681,25 @@ def read_page(path, cursor=0, max_bytes=262144):
 # ------------------------------------------------------------ store
 
 def load_observations_report(state_dir=None):
-    """(rows, corrupt_lines, foreign_version_rows). Corrupt store lines
-    are counted and reported by the tick — never silently skipped
-    (acceptance 3); foreign-detector-version rows are kept verbatim."""
+    """(rows, corrupt_lines, foreign_version_rows). BYTE-SAFE record
+    classification (CSRSTORE-03): records are framed in RAW bytes (LF,
+    CRLF, bare CR) and decoded per record — a record that is not valid
+    UTF-8, or not valid JSON, is a COUNTED corrupt line held verbatim in
+    the store, never a UnicodeDecodeError and never a lossy re-encode
+    (acceptance 3). Foreign-detector-version rows are kept verbatim."""
     path = (Path(state_dir).expanduser() if state_dir
             else DEFAULT_STATE.expanduser()) / "observations.jsonl"
     if not path.exists():
         return [], 0, 0
     out, corrupt, foreign = [], 0, 0
-    for line in path.read_text().splitlines():
+    for seg in path.read_bytes().splitlines(keepends=True):
         try:
-            row = json.loads(line)
+            text = seg.decode("utf-8")  # strict: corrupt bytes stay typed
+        except UnicodeDecodeError:
+            corrupt += 1  # non-UTF8 record: typed corrupt debt, held verbatim
+            continue
+        try:
+            row = json.loads(text)
         except Exception:
             corrupt += 1
             continue
@@ -731,20 +739,24 @@ def _atomic_write_jsonl(path, rows):
 
 
 def _atomic_append_jsonl(path, rows):
-    """Atomic read-merge-write — the EXISTING rows are read back and
-    rewritten with the new ones under the tick lock; a fresh-file
-    append-temp that would lose rows is never used (acceptance 4)."""
+    """Atomic read-merge-write at the BYTE level (CSRSTORE-03): the
+    existing raw bytes are carried over EXACTLY — CRLF records, blank
+    lines and corrupt non-UTF8 lines included, an append is never a
+    lossy re-encode of held evidence — and the new canonical rows are
+    appended after them. A fresh-file append-temp that would lose rows
+    is never used (acceptance 4)."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    existing = []
+    existing = b""
     if path.exists():
-        existing = [ln for ln in path.read_text().splitlines() if ln.strip()]
+        existing = path.read_bytes()
+        if existing and not existing.endswith(b"\n"):
+            existing += b"\n"  # separator only; original bytes stay a prefix
     tmp = path.with_name(path.name + f".tmp{os.getpid()}")
-    with tmp.open("w") as f:
-        for ln in existing:
-            f.write(ln + "\n")
+    with tmp.open("wb") as f:
+        f.write(existing)
         for row in rows:
-            f.write(_canonical(row) + "\n")
+            f.write((_canonical(row) + "\n").encode())
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp, path)
@@ -845,56 +857,149 @@ def _archive_store_snapshot(state, raw):
     return digest
 
 
+def _preserve_held_bytes(state, raw):
+    """Durable NON-archive preservation of the exact original store bytes
+    (CSRSTORE-01): when the content-addressed archive entry is itself
+    compromised, the hold must not rely on evidence that fault just
+    discredited — the raw bytes are fsynced beside it under a
+    non-colliding recovery name BEFORE the tick holds. Returns the
+    recovery file name."""
+    digest = _sha(raw)
+    adir = Path(state).expanduser() / _ARCHIVE_DIR
+    adir.mkdir(parents=True, exist_ok=True)
+    for n in range(1, 9):
+        target = adir / (f"{digest}.recovery.jsonl" if n == 1
+                         else f"{digest}.recovery-{n}.jsonl")
+        if target.exists():
+            if _sha(target.read_bytes()) == digest:
+                return target.name  # already durably preserved, byte-exact
+            continue  # colliding junk: never overwrite, try the next rung
+        tmp = target.with_name(target.name + f".tmp{os.getpid()}")
+        with tmp.open("wb") as f:
+            f.write(raw)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, target)
+        _fsync_dir(adir)
+        return target.name
+    raise RuntimeError(
+        f"no free recovery slot for digest {digest[:16]} — refusing to "
+        "overwrite an existing recovery file")
+
+
+_COUNT_KEYS = ("rows_parsed", "rekeyed", "coalesced_generation_duplicates",
+               "quarantined_malformed", "corrupt_lines",
+               "foreign_version_rows")
+
+
+def _manifest_fault(body, digest, byte_count):
+    """Validation fault of an EXISTING migration ledger, or None when it
+    is well-formed and matches this exact-digest replay (CSRSTORE-04):
+    schema, archive path, digest, byte count and every typed count are
+    checked — a replay never trusts a ledger it has not validated."""
+    if not isinstance(body, dict):
+        return "not a JSON object"
+    for key in ("archive", "sha256", "bytes", "recorded_at",
+                "prior_meta_raw") + _COUNT_KEYS:
+        if key not in body:
+            return f"missing field {key}"
+    if body["archive"] != f"{_ARCHIVE_DIR}/{digest}.jsonl":
+        return "archive path mismatch"
+    if body["sha256"] != digest:
+        return "digest mismatch"
+    if type(body["bytes"]) is not int or body["bytes"] != byte_count:
+        return "byte count mismatch"
+    for key in _COUNT_KEYS:
+        if type(body[key]) is not int or body[key] < 0:
+            return f"count field {key} not a nonnegative int"
+    faults = body.get("quarantine_faults")
+    if not isinstance(faults, list) or not all(
+            isinstance(f, str) for f in faults):
+        return "quarantine_faults is not a list of strings"
+    return None
+
+
 def _migration_manifest(state, digest, byte_count, prior_meta_raw, counts):
-    """Typed ledger for one archived snapshot (CSR-04): the ARCHIVE FILE
-    carries the immutable original bytes (provenance); the MANIFEST
-    carries the migration's logical counts — duplicates coalesced, rows
-    quarantined, corrupt lines — separately from that provenance. Written
-    once per snapshot; a replay of the same digest never rewrites it."""
-    mpath = (Path(state).expanduser() / _ARCHIVE_DIR /
-             f"{digest}.manifest.json")
-    if mpath.exists():
-        return
+    """Typed ledger for one archived snapshot (CSR-04/CSRSTORE-04): the
+    ARCHIVE FILE carries the immutable original bytes (provenance); the
+    MANIFEST carries the migration's logical counts — duplicates
+    coalesced, rows quarantined, corrupt lines — separately from that
+    provenance. The ledger is STAGED DURABLY BEFORE the live index or
+    meta is switched, so a crash at any later boundary replays into an
+    existing ledger. An exact-digest replay VALIDATES the existing
+    ledger (schema, digest, byte count, counts) instead of trusting it:
+    a valid ledger is left byte-identical; a damaged ledger's exact
+    bytes are quarantined beside it and a valid ledger is rebuilt —
+    never silent acceptance, never provenance destruction. Returns the
+    notes list."""
+    adir = Path(state).expanduser() / _ARCHIVE_DIR
+    adir.mkdir(parents=True, exist_ok=True)
+    mpath = adir / f"{digest}.manifest.json"
     body = {"archive": f"{_ARCHIVE_DIR}/{digest}.jsonl", "sha256": digest,
             "bytes": byte_count, "prior_meta_raw": prior_meta_raw,
             "recorded_at": _now(), **counts}
+    if mpath.exists():
+        damaged = mpath.read_bytes()
+        try:
+            fault = _manifest_fault(json.loads(damaged), digest, byte_count)
+        except Exception:
+            fault = "not valid JSON"
+        if fault is None:
+            return []  # validated ledger — left byte-for-byte untouched
+        side = adir / (f"{digest}.manifest.damaged-"
+                       f"{_sha(damaged)[:12]}.json")
+        if not side.exists() or _sha(side.read_bytes()) != _sha(damaged):
+            tmp = side.with_name(side.name + f".tmp{os.getpid()}")
+            with tmp.open("wb") as f:
+                f.write(damaged)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, side)
+            _fsync_dir(adir)
+        _atomic_write_json(mpath, body)
+        return [f"observation store: migration ledger at "
+                f"{_ARCHIVE_DIR}/{digest}.manifest.json was damaged "
+                f"({fault}) — exact damaged bytes quarantined at "
+                f"{side.name}, valid ledger rebuilt (never trusted "
+                "blindly, never silently discarded)"]
     _atomic_write_json(mpath, body)
+    return []
 
 
-def migrate_observations(state_dir):
-    """One-time EXPLICIT identity migration (acceptance 2; CSR-04/07
-    hardened): v1 stores embedded the generation in the dedupe identity,
-    so the same logical fault re-minted a row per generation (audit F2).
-    Under v2 the rows are rekeyed by observation_identity;
-    generation-era duplicates (same logical occurrence, different
-    generations) coalesce to the EARLIEST row — provenance lives on the
-    kept row, the counts land in the tick notes and the snapshot
-    manifest. BEFORE anything is replaced, the EXACT original store bytes
-    are archived under a non-overwriting content-addressed path owned by
-    the composer and fsynced ahead of the index switch (CSR-04): every
-    generation row, every old key, every corrupt line stays recoverable
-    byte-for-byte, and any crash replays without destroying anything.
-    Structurally malformed current rows are QUARANTINED as typed debt
-    (archived, counted — never rekeyed under an identity fabricated from
-    missing fields). Foreign-detector-version rows are preserved
-    verbatim. A store whose identity metadata is unknown, newer, or
-    malformed is HELD: never rewritten, never downgraded (CSR-07). Never
-    a silent discard; never a faked identity."""
+def _migrate_observations(state_dir):
+    """(notes, held) — migrate_observations with a TYPED outcome (CSRSTORE-01):
+    held=True means the whole tick must fail closed BEFORE any enrolled-
+    source content read or state mutation — an archive-fault hold is a
+    tick hold, never a note the tick recomputes away."""
     state = Path(state_dir).expanduser()
     held, hold_note = _observation_store_held(state)
     if held:
-        return [hold_note]
+        return [hold_note], True
     meta_path = state / _STORE_META
     if meta_path.exists() and json.loads(meta_path.read_text()).get(
             "identity_version") == _OBS_IDENTITY_VERSION:
-        return []
+        return [], False
     opath = state / "observations.jsonl"
     raw = opath.read_bytes() if opath.exists() else b""
     prior_meta_raw = meta_path.read_text() if meta_path.exists() else None
     try:
         digest = _archive_store_snapshot(state, raw)
     except RuntimeError as exc:
-        return [f"observation store HELD: {exc} (typed hold)"]
+        preserved = None
+        if raw:
+            try:
+                preserved = _preserve_held_bytes(state, raw)
+            except RuntimeError as pexc:
+                preserved = str(pexc)
+        note = f"observation store HELD: {exc} (typed hold)"
+        if preserved and raw:
+            note += (f"; exact original {len(raw)} bytes preserved "
+                     f"durably at {_ARCHIVE_DIR}/{preserved} pending "
+                     "archive repair")
+        elif raw:
+            note += ("; PRESERVATION FAILED — store bytes left untouched "
+                     "in place")
+        return [note], True
     rows, corrupt, foreign = load_observations_report(state)
     rekeyed = coalesced = quarantined = 0
     quarantine_faults = []
@@ -917,6 +1022,17 @@ def migrate_observations(state_dir):
         seen.add(k)
         kept.append(dict(o, dedupe_key=k))
         rekeyed += 1
+    # STAGE THE LEDGER BEFORE THE SWITCH (CSRSTORE-04): the validated
+    # logical counts land durably in the manifest BEFORE any projection
+    # or meta change, so an interruption at any later boundary replays
+    # into an existing ledger instead of losing the counts.
+    manifest_notes = _migration_manifest(state, digest, len(raw),
+                                         prior_meta_raw, {
+        "rows_parsed": len(rows), "rekeyed": rekeyed,
+        "coalesced_generation_duplicates": coalesced,
+        "quarantined_malformed": quarantined,
+        "corrupt_lines": corrupt, "foreign_version_rows": foreign,
+        "quarantine_faults": quarantine_faults})
     if opath.exists():
         _atomic_write_jsonl(opath, kept)
     _atomic_write_json(meta_path, {
@@ -924,12 +1040,6 @@ def migrate_observations(state_dir):
         "dedupe_identity": "v2 (source_kind, lineage, span, detector, "
                            "version, fingerprint) — generation excluded",
         "migrated_at": _now()})
-    _migration_manifest(state, digest, len(raw), prior_meta_raw, {
-        "rows_parsed": len(rows), "rekeyed": rekeyed,
-        "coalesced_generation_duplicates": coalesced,
-        "quarantined_malformed": quarantined,
-        "corrupt_lines": corrupt, "foreign_version_rows": foreign,
-        "quarantine_faults": quarantine_faults})
     bits = []
     if rekeyed:
         bits.append(f"rekeyed {rekeyed} rows")
@@ -948,8 +1058,38 @@ def migrate_observations(state_dir):
     if raw:
         bits.append(f"original store bytes archived (sha256 {digest[:16]}…"
                     f", {_ARCHIVE_DIR}/, non-overwriting)")
-    return [f"observation store migrated to identity v2: " + "; ".join(bits)] \
-        if bits else []
+    notes = [f"observation store migrated to identity v2: "
+             + "; ".join(bits)] if bits else []
+    return notes + manifest_notes, False
+
+
+def migrate_observations(state_dir):
+    """One-time EXPLICIT identity migration (acceptance 2; CSR-04/07
+    hardened): v1 stores embedded the generation in the dedupe identity,
+    so the same logical fault re-minted a row per generation (audit F2).
+    Under v2 the rows are rekeyed by observation_identity;
+    generation-era duplicates (same logical occurrence, different
+    generations) coalesce to the EARLIEST row — provenance lives on the
+    kept row, the counts land in the tick notes and the snapshot
+    manifest. BEFORE anything is replaced, the EXACT original store bytes
+    are archived under a non-overwriting content-addressed path owned by
+    the composer and fsynced ahead of the index switch (CSR-04): every
+    generation row, every old key, every corrupt line stays recoverable
+    byte-for-byte, and any crash replays without destroying anything.
+    The typed ledger is STAGED durably BEFORE the projection/meta switch
+    and every replay VALIDATES it (CSRSTORE-04). Structurally malformed
+    current rows are QUARANTINED as typed debt (archived, counted —
+    never rekeyed under an identity fabricated from missing fields).
+    Corrupt non-UTF8 records are typed corrupt debt held verbatim, never
+    a decoding crash (CSRSTORE-03). Foreign-detector-version rows are
+    preserved verbatim. A store whose identity metadata is unknown,
+    newer, or malformed is HELD, and an archive fault HOLDS THE WHOLE
+    TICK (CSRSTORE-01): never rewritten, never downgraded, and the
+    exact original bytes are preserved durably without relying on the
+    compromised archive. Never a silent discard; never a faked identity.
+    Returns the notes list; the typed (notes, held) outcome the tick
+    gate consumes is _migrate_observations."""
+    return _migrate_observations(state_dir)[0]
 
 
 def load_observations_checked(state_dir=None):
@@ -1466,12 +1606,29 @@ def tick(sources, state_dir=None, max_bytes_per_source=262144,
               "coverage_complete": 0, "new_tail_bytes": 0,
               "prefix_verified_bytes": 0, "notes": []}
     with _state_lock(state):
-        report["notes"].extend(migrate_observations(state))
-        # CSR-07 typed hold: an unknown/malformed identity version makes
-        # the store READ-ONLY — no source is read and nothing is committed
-        # until the version question settles, so a future-version store is
-        # never rewritten and no evidence is consumed into it.
+        mig_notes, mig_held = _migrate_observations(state)
+        report["notes"].extend(mig_notes)
+        # CSR-07 + CSRSTORE-01/02 typed hold: an unknown/malformed identity
+        # version, or an archive fault on the migration path, fails the
+        # whole tick CLOSED before ANY enrolled-source content read or
+        # state mutation — census itself opens and reads sources
+        # (source_identity), so a held tick never reaches it: the held
+        # store is reported from identity metadata alone, and a migration
+        # hold is a tick hold, never a note the tick recomputes away.
         store_held, _hold_note = _observation_store_held(state)
+        if mig_held or store_held:
+            enrolled = [(kind, p) for kind, paths in (sources or {}).items()
+                        for p in (paths or [])]
+            for _kind, path in enrolled:
+                report["notes"].append(
+                    f"source {path} deferred unread — observation store "
+                    "HELD (identity metadata unknown/malformed, or "
+                    "archive fault): no reads, no commits, store bytes "
+                    "preserved")
+            report["gaps"] = len(enrolled)
+            report["backlog_remaining"] = len(enrolled)
+            report["notes"].append("pass bounded: 0 pages this pass")
+            return report
         manifest = census(sources, state_dir=state)
         report["census_sources"] = len(manifest["sources"])
         report["gaps"] = len(manifest["gaps"])
