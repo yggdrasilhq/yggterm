@@ -27,10 +27,23 @@ sys.path.insert(0, str(KERNEL_DIR))
 import composer  # noqa: E402
 
 
+def enrolled_sources(sources):
+    """Timer enrollments are append streams unless explicitly closed.
+
+    Legacy plain paths in the operational manifest name live corpora, not
+    immutable snapshots. Preserve the kernel's historical plain-path API
+    for offline callers while making this operational boundary explicit.
+    """
+    return {kind: [({"path": str(item), "closed": False}
+                    if isinstance(item, (str, Path)) else item)
+                   for item in entries]
+            for kind, entries in (sources or {}).items()}
+
+
 def main():
     m = json.loads(MANIFEST.read_text())
     rep = composer.tick(
-        m.get("sources"), state_dir=str(STATE),
+        enrolled_sources(m.get("sources")), state_dir=str(STATE),
         max_bytes_per_source=m.get("bounds", {}).get("max_bytes_per_source", 262144),
         claim_cap=m.get("bounds", {}).get("claim_cap", 5),
         max_pages=m.get("bounds", {}).get("max_pages", 10),
