@@ -93,3 +93,29 @@ sccache fails silently into un-cached builds (daemon death, unparseable flags) �
 1. **Delta verdict per build.** `builds/<project>--<ts>--<sha>.json` records (success AND failure) carry a `sccache` block: `{verdict, requests, hits, misses, hit_rate}` where verdict is `ok` (cache served the compiles), `idle` (nothing compiled — docs-only ticks), `bypassed` (cargo printed `Compiling` but the wrapper/binary wire is absent — fires a `cache_bypassed` CI event), `non-cacheable` (compiles ran but every call was one sccache refuses — crate-type/incremental; fires `cache_noncacheable`; the pre-2026-10-16 `STALE` verdict claimed a broken wire for both shapes — [11.240]), or `absent` (no readable sccache on the build host). Deltas come from `--show-stats` snapshots before/after the build — never `--zero-stats`, which would stomp parallel seats sharing the host cache.
 2. **`ygg-ci.py cache [--host h1,h2] [--tail N] [--json]`** — per-host cache health (counters, hit rate, size, location) plus the verdict digest of the last N build records. Hosts default to dev, oc, guihost, practice; remote probes run over ssh. Note: cumulative counters reset when the idle sccache server restarts — per-build deltas are the truth; the verb's value is the digest and the absent/size check.
 3. **`tune`-time provisioning check** — after any `ygg-ci.py tune`, the target host is probed for the §2.1 wire (`rustc-wrapper` in `~/.cargo/config.toml`, sccache binary reachable); an incomplete wire logs a warning naming §2.1. A MISSING BINARY with the wrapper line present is a hard build failure for wrapped builds, so it warns loudly.
+# Current verification and watcher identity
+
+`ygg ci verify --project <name>` reruns the configured build and gates against
+that project's current clean main checkout. It holds the same Git repository
+lease as integration, records the source commit and individual exit codes, and
+checks that the tracked subject stayed unchanged. It performs no fetch, merge,
+push or deployment. Default output is readable; `--json` emits a versioned
+verification result with its receipt. Busy, blocked, unconfigured or uncertain
+receipt storage is held, never verified. Example:
+
+```sh
+ygg ci verify --project example
+ygg ci verify --project example --json
+```
+
+Configured checks run for Markdown changes too: documentation can be embedded
+payload or policy, and a failed attempt cannot establish a validated baseline.
+An unpublished local integration remains queued work. Failed validation does
+not consume its subscription.
+
+Watcher identity requires the actual Python script and `watch` subcommand in
+the process argument list. A shell merely mentioning that text is not an owner.
+Unreadable identity is unknown and prevents a duplicate spawn. Status exposes
+global or project scope; project-scoped ownership does not establish supervision
+of other projects. Subscribing normally requests the shared global owner.
+
