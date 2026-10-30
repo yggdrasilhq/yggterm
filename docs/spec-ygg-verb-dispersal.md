@@ -73,6 +73,25 @@ shipments dereference it into standalone bytes; remote replicas cannot
 depend on links escaping the shipment tree. The command tree's first user
 is documented in [swarm-introspection.md](swarm-introspection.md).
 
+Compatibility installations also invalidate producer-owned CPython bytecode
+for declared shipped modules. Restoring source bytes is insufficient when
+an archive preserves the same source size and timestamp: an older valid
+timestamp cache can otherwise execute after verification reports matching
+source hashes. Local install and remote finalize retire only the declared
+module names' recognized CPython cache objects, using owned directory
+handles without following a cache-directory or leaf link. Unknown cache
+objects remain untouched; unsafe ownership, type or changed identities
+refuse completion. Existing interpreter processes retain their loaded code.
+The enrolled cache mappings include adjacent caches and the active
+`sys.pycache_prefix` (including `PYTHONPYCACHEPREFIX`) for both lexical and
+canonical payload source paths. Unused historical cache-prefix locations
+are outside this operation; selecting another prefix requires reinstalling
+under that runtime configuration or using a qualified immutable generation.
+This operation is package-cache invalidation, not rootwide garbage
+collection or an atomic whole-generation activation guarantee. Native
+immutable generation installation and non-CPython cache conventions have
+separate qualification.
+
 On ANY fleet host, fresh or old: `~/.yggterm/bin/ygg/` carries the verbs,
 `ygg-auth.py status` works from PATH without hand-staging, and
 `ygg-disperse.py verify` is green.

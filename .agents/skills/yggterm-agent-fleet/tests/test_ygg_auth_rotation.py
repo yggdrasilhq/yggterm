@@ -72,16 +72,24 @@ def make_record(email, account_id, plan="plus", exp_offset=86400, refresh_epoch=
 
 class Sandbox:
     def __init__(self, script):
-        self.tmp = tempfile.mkdtemp(prefix="ygg-auth-test-")
+        scratch = os.environ.get("YGG_AUTH_TEST_SCRATCH") or os.path.expanduser("~/.yggterm/scratchpad/auth-tests")
+        os.makedirs(scratch, exist_ok=True)
+        self.tmp = tempfile.mkdtemp(prefix="ygg-auth-test-", dir=scratch)
         self.home = os.path.join(self.tmp, "home")
         self.store = os.path.join(self.tmp, "store")
         self.codex = os.path.join(self.home, ".codex")
         os.makedirs(self.codex)
         self.script = script
+        self.bin = os.path.join(self.tmp, "bin")
+        os.makedirs(self.bin)
+        ssh = os.path.join(self.bin, "ssh")
+        with open(ssh, "w") as f:
+            f.write("#!/bin/sh\nexit 255\n")
+        os.chmod(ssh, 0o700)
 
     def env(self):
         e = dict(os.environ)
-        e.update({"HOME": self.home, "YGG_AUTH_HOME": self.store, "CODEX_HOME": self.codex})
+        e.update({"HOME": self.home, "YGG_AUTH_HOME": self.store, "CODEX_HOME": self.codex, "YGG_AUTH_NO_PREFRESH": "1", "PATH": self.bin + os.pathsep + e.get("PATH", "")})
         return e
 
     def run(self, *args):
@@ -195,7 +203,7 @@ def s_redaction():
     assert S.run("switch", "a@x.io").returncode == 0
 
 
-@screen("rotate skips the cooling account; third rotate warns when all cooling")
+@screen("rotate skips the cooling account; third rotate refuses when all cooling")
 def s_rotate_cooldown():
     S.reset()
     for email, acct in (("a@x.io", "acct-a"), ("b@x.io", "acct-b"), ("c@x.io", "acct-c")):
@@ -206,14 +214,14 @@ def s_rotate_cooldown():
     assert r1.returncode == 0, f"rotate1 exit {r1.returncode}: {r1.stderr}"
     first = json.loads(r1.stdout)["switched_to"]
     assert first == "b_x.io", f"rotate1 picked {first}, want b_x.io (a just vacated, cooling)"
-    r2 = S.run("rotate", "--json")
+    r2 = S.run("rotate", "--fast", "--json")
     assert r2.returncode == 0, f"rotate2 exit {r2.returncode}: {r2.stderr}"
     second = json.loads(r2.stdout)["switched_to"]
     assert second == "c_x.io", (
         f"rotate2 picked {second}, want c@x.io — rotation cycled toward cooling accounts")
-    r3 = S.run("rotate", "--json")
-    assert r3.returncode == 0, f"rotate3 exit {r3.returncode}: {r3.stderr}"
-    assert "cooling" in r3.stderr, "no warning when the picker dips into cooling profiles"
+    r3 = S.run("rotate", "--fast", "--json")
+    assert r3.returncode == 2, f"rotate3 exit {r3.returncode}, want refusal"
+    assert json.loads(r3.stdout)["error"]["counts"]["cooling"] == 2
     st = json.loads(S.run("status", "--json").stdout)
     a = next(p for p in st["profiles"] if p["slug"] == "a_x.io")
     assert a["cooldown_minutes_left"] > 0, "status does not surface the cooldown"
@@ -339,7 +347,7 @@ def s_unit_rank_and_convert():
                                 "refresh_token": "rt", "account_id": "acct-c"}, \
         "conversion mangled the grants"
     assert nested["auth_mode"] == "chatgpt"
-    # scoring: measured-ok beats measured-limited beats unmeasurable
+    # scoring: measured available beats unknown; measured exhausted is excluded
     def fake_snapshot(record):
         aid = record["tokens"]["account_id"]
         if aid == "acct-good":
@@ -357,7 +365,7 @@ def s_unit_rank_and_convert():
             json.dump({"tokens": {"account_id": aid}}, f)
         ranked.append({"slug": aid, "path": path, "expired": False})
     ranked = sorted(ranked, key=lambda p: mod.rotate_score(p, measure=True))
-    assert [p["slug"] for p in ranked] == ["acct-good", "acct-full", "acct-dead"], \
+    assert [p["slug"] for p in ranked] == ["acct-good", "acct-dead", "acct-full"], \
         f"ranked {[p['slug'] for p in ranked]} — headroom did not lead"
     # provenance + dest memory helpers round-trip inside the sandbox
     mod.stamp_provenance("codex", "unit-test", writer="somewhere", source="fetch")
@@ -389,12 +397,37 @@ def s_fleet_doctor_offline():
     assert findings.get("a_x.io") == "writer-litellm", findings
 
 
+@screen("corrupt sidecar metadata fails closed at the CLI (cooldown, lineage)")
+def s_corrupt_metadata_fail_closed():
+    S.reset()
+    S.write_live(make_record("a@x.io", "acct-a"))
+    assert S.run("capture").returncode == 0
+    S.write_live(make_record("b@x.io", "acct-b"))
+    assert S.run("capture").returncode == 0
+    with open(os.path.join(S.store, "codex", ".cooldown.json"), "w") as f:
+        f.write("{")
+    r = S.run("rotate", "--fast", "--json")
+    assert r.returncode == 5, f"rotate with corrupt cooldown exit {r.returncode}, want 5"
+    assert json.loads(r.stdout)["error"]["reason"] == "invalid_metadata", \
+        f"rotation did not name the metadata refusal: {r.stdout}"
+    assert S.read_live()["tokens"]["account_id"] == "acct-b", \
+        "rotation mutated the live file despite corrupt metadata"
+    # lineage: corrupt provenance refuses a refresh BEFORE any grant call —
+    # corruption never reads as 'no writer'.
+    with open(os.path.join(S.store, "codex", ".provenance.json"), "w") as f:
+        f.write("{")
+    r = S.run("refresh", "--json")
+    assert r.returncode == 5, f"refresh with corrupt provenance exit {r.returncode}, want 5"
+    assert json.loads(r.stdout)["error"]["reason"] == "invalid_metadata", \
+        f"refresh did not name the metadata refusal: {r.stdout}"
+
+
 @screen("usage errors: unknown slug exit 6; capture without live file exit 3")
 def s_usage_errors():
     r = S.run("switch", "nosuch@x.io")
     assert r.returncode == 6, f"unknown slug exit {r.returncode}, want 6"
     e = S.env()
-    ghost = tempfile.mkdtemp(prefix="ygg-auth-ghost-")
+    ghost = tempfile.mkdtemp(prefix="ygg-auth-ghost-", dir=S.tmp)
     e["CODEX_HOME"] = ghost
     r = subprocess.run([sys.executable, S.script, "capture"], env=e, capture_output=True, text=True)
     assert r.returncode == 3, f"missing live file exit {r.returncode}, want 3"
@@ -407,6 +440,9 @@ def main():
         os.path.dirname(os.path.abspath(__file__)), os.pardir, "ygg-auth.py"))
     args = parser.parse_args()
     S = Sandbox(args.script)
+    import atexit
+    import shutil
+    atexit.register(shutil.rmtree, S.tmp, ignore_errors=True)
 
     print("ygg-auth rotation screens:")
     s_capture_verbatim()
@@ -420,6 +456,7 @@ def main():
     s_provenance()
     s_unit_rank_and_convert()
     s_fleet_doctor_offline()
+    s_corrupt_metadata_fail_closed()
     s_usage_errors()
 
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
