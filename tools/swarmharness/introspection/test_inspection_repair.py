@@ -1235,3 +1235,19 @@ class ObservationFixFalsifiers(unittest.TestCase):
                 frame=old_frame, root=self.root)
         self.assertEqual(code, 3)
         self.assertIn("not in the selected snapshot", result["error"])
+
+
+class QueueYieldLifecycle(unittest.TestCase):
+    def test_transport_yields_preserve_unaccepted_work_states(self):
+        for state in ("review_pending", "submitted", "retained_partial"):
+            with self.subTest(state=state):
+                tasks = [{"id": "invented-task", "status": state, "attempts": 1}]
+                for recorded in (state, "completed"):
+                    events = [{"ev": "dispatch", "id": "invented-task", "event_id": "attempt-one", "t": NOW - 2},
+                              {"ev": "done", "id": "invented-task", "outcome": recorded, "t": NOW - 1}]
+                    work, attempts = model.queue_records(tasks, events, {}, "fixture", "worker-a", NOW)
+                    self.assertEqual(work[0]["state"], state)
+                    self.assertEqual(attempts[0]["state"],
+                                     "interrupted" if state == "retained_partial" else state)
+                    self.assertEqual(attempts[0]["review"], "unreviewed")
+                    self.assertNotEqual(attempts[0]["state"], "completed")
