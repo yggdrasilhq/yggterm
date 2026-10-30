@@ -210,7 +210,7 @@ class Import(unittest.TestCase):
         # The tightened grammar pins the permitted else body to the warning
         # print, so a file-writing statement is structurally rejected — and it
         # was never executed either way: the adapter reads structure only.
-        with self.assertRaisesRegex(mod.fs.Held,'foreign-owner else branch'):
+        with self.assertRaisesRegex(mod.fs.Held,'unsupported legacy assembly'):
             self.plan()
         self.assertFalse(bomb.exists())
 
@@ -323,22 +323,24 @@ class Import(unittest.TestCase):
 
         base=fresh()
         (base/'sources/core/foreign.md').write_bytes(b'unlisted foreign policy bytes\n')
+        (base/'sources/core/foreign.md').chmod(0o600)
         with self.assertRaisesRegex(mod.fs.Held,'extra entries'):
             self.stage(plan,manifest)
 
         base=fresh()
         (base/'extra-policy.md').write_bytes(b'unlisted root file\n')
+        (base/'extra-policy.md').chmod(0o600)
         with self.assertRaisesRegex(mod.fs.Held,'extra entries'):
             self.stage(plan,manifest)
 
         base=fresh()
         (base/rel).unlink()
         (base/rel).symlink_to(base/'sources/sections/orders.md')
-        with self.assertRaisesRegex(mod.fs.Held,'wrong kinds'):
+        with self.assertRaisesRegex(mod.fs.Held,'wrong kinds|linked or unsupported metadata'):
             self.stage(plan,manifest)
 
         base=fresh()
-        (base/'sources/core/planted').mkdir()
+        (base/'sources/core/planted').mkdir(mode=0o700)
         with self.assertRaisesRegex(mod.fs.Held,'extra entries'):
             self.stage(plan,manifest)
 
@@ -558,6 +560,7 @@ class Import(unittest.TestCase):
         (occupied/'complete.json').write_text(json.dumps(
             {'schema':1,'candidate_id':first['candidate_id'],'sealed':True,
              'manifest_sha256':'0'*64,'files':{}}))
+        (occupied/'complete.json').chmod(0o600)
         with self.assertRaisesRegex(mod.fs.Held,'sealed file list'):self.stage()
 
     def test_source_change_between_plan_and_stage(self):
@@ -710,6 +713,38 @@ class Import(unittest.TestCase):
         candidates=self.ygg/'steer'/'candidates'
         self.assertFalse((candidates/cid).exists())
         self.assertEqual([p for p in candidates.iterdir() if p.name.startswith('.staging-')],[])
+
+    def test_complete_call_arity_and_inert_warning_grammar(self):
+        variants = [
+            ("print('fixture warning: foreign slot empty', file=sys.stderr)", "print(f'{parts.clear()}', file=sys.stderr)"),
+            ("print('fixture warning: foreign slot empty', file=sys.stderr)", "print('warning', parts.clear(), file=sys.stderr)"),
+            ("return '\\n\\n'.join(parts)", "return '\\n\\n'.join('WRONG', parts)"),
+            ("return '\\n\\n'.join(parts)", "return '\\n\\n'.join(parts, unexpected=True)"),
+            ("t.get('local')", "t.get('local', unexpected=True)"),
+            ("parts.append(stamp.rstrip() + '\\n')", "parts.append(stamp.rstrip() + '\\n', unexpected=True)"),
+        ]
+        for old, new in variants:
+            with self.subTest(mutation=new):
+                self.assertIn(old, STEER_SOURCE)
+                (self.legacy/'steer').write_text(STEER_SOURCE.replace(old,new))
+                with self.assertRaises(mod.fs.Held): self.plan()
+        (self.legacy/'steer').write_text(STEER_SOURCE)
+        self.assertEqual(self.plan()['adapter']['kind'],'yggsteer-steer-v1')
+
+    def test_replay_rejects_widened_private_metadata_without_chmod(self):
+        result = self.stage()
+        base = Path(result['path'])
+        for relative, widened, original in [('.',0o755,0o700),('sources',0o755,0o700),('sources/core/beta.md',0o644,0o600),('complete.json',0o644,0o600)]:
+            with self.subTest(relative=relative):
+                path = base/relative
+                before = path.read_bytes() if path.is_file() else None
+                path.chmod(widened)
+                with self.assertRaisesRegex(mod.fs.Held,'metadata is not private'):
+                    self.stage()
+                self.assertEqual(stat.S_IMODE(path.stat().st_mode),widened)
+                if before is not None:self.assertEqual(path.read_bytes(),before)
+                path.chmod(original)
+        self.assertTrue(self.stage()['validated'])
 
     def test_real_legacy_checkout_smoke(self):
         real=Path.home()/'git'/'yggsteer'

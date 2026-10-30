@@ -94,7 +94,7 @@ def _slurp(stream, limit):
     return stream.read(limit + 1)
 
 
-def _read_source(root, relative, limit):
+def _read_source(root, relative, limit, *, private=False):
     """One-handle read of a bounded regular legacy file with pre/post identity.
 
     Rejects symlink leaves/components, non-regular files, unknown owners,
@@ -129,6 +129,10 @@ def _read_source(root, relative, limit):
                 raise fs.Held("declared legacy source exceeds the bounded import input")
             raw = _slurp(stream, limit)
             after = os.fstat(stream.fileno())
+            if private and any(info.st_uid != os.getuid()
+                               or stat.S_IMODE(info.st_mode) != 0o600
+                               for info in (before, after)):
+                raise fs.Held("existing candidate file metadata is not private0600")
     except fs.Held:
         raise
     except OSError as exc:
@@ -380,6 +384,15 @@ def _match_extract_foreign(fn):
 
 def _match_assemble(fn, constants):
     _plain_parameters(fn, ["harness", "live_text"])
+    arity = {"read_text": 0, "rstrip": 0, "append": 1, "get": 1,
+             "join": 1, "guarded": 2, "extract_foreign": 1, "print": 1}
+    for call in (node for node in ast.walk(fn) if isinstance(node, ast.Call)):
+        name = (call.func.id if isinstance(call.func, ast.Name)
+                else call.func.attr if isinstance(call.func, ast.Attribute) else None)
+        if name not in arity or len(call.args) != arity[name]:
+            raise fs.Held("unsupported legacy assembly call shape")
+        if name != "print" and call.keywords:
+            raise fs.Held("unsupported legacy assembly call keywords")
     stmts = [s for s in fn.body if not _is_docstring(s)]
     if len(stmts) < 6:
         raise fs.Held("unsupported legacy assembly: too few statements")
@@ -474,8 +487,14 @@ def _match_assemble(fn, constants):
     message = warning.value.args[0] if (isinstance(warning, ast.Expr)
                                         and isinstance(warning.value, ast.Call)
                                         and warning.value.args) else None
-    message_ok = isinstance(message, (ast.Constant, ast.JoinedStr)) and (
-        not isinstance(message, ast.Constant) or isinstance(message.value, str))
+    message_ok = isinstance(message, ast.Constant) and isinstance(message.value, str)
+    if isinstance(message, ast.JoinedStr):
+        message_ok = all(
+            (isinstance(value, ast.Constant) and isinstance(value.value, str))
+            or (isinstance(value, ast.FormattedValue)
+                and isinstance(value.value, ast.Name) and value.value.id == "harness"
+                and value.conversion == -1 and value.format_spec is None)
+            for value in message.values)
     if not (isinstance(warning, ast.Expr) and isinstance(warning.value, ast.Call)
             and isinstance(warning.value.func, ast.Name) and warning.value.func.id == "print"
             and message_ok and len(warning.value.keywords) == 1
@@ -831,6 +850,39 @@ class _Staging:
         shutil.rmtree(self.path, ignore_errors=True)
 
 
+def _private_replay_metadata(candidate_dir):
+    """Check the complete private tree through no-follow handles."""
+    count = 0
+    def walk(fd, depth):
+        nonlocal count
+        info = os.fstat(fd)
+        if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o700:
+            raise fs.Held("existing candidate directory metadata is not private0700")
+        if depth > LIMIT_TREE_DEPTH:
+            raise fs.Held("existing candidate tree exceeds metadata depth bound")
+        for name in os.listdir(fd):
+            count += 1
+            if count > LIMIT_TREE_ENTRIES:
+                raise fs.Held("existing candidate tree exceeds metadata entry bound")
+            info = os.stat(name, dir_fd=fd, follow_symlinks=False)
+            if stat.S_ISDIR(info.st_mode):
+                child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+                try: walk(child, depth + 1)
+                finally: os.close(child)
+            elif stat.S_ISREG(info.st_mode):
+                child = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
+                try:
+                    actual = os.fstat(child)
+                    if (not stat.S_ISREG(actual.st_mode) or actual.st_uid != os.getuid()
+                            or stat.S_IMODE(actual.st_mode) != 0o600):
+                        raise fs.Held("existing candidate file metadata is not private0600")
+                finally: os.close(child)
+            else:
+                raise fs.Held("existing candidate has linked or unsupported metadata")
+    with _input_directory(candidate_dir) as fd:
+        walk(fd, 0)
+
+
 def _validate_existing(candidate_dir, candidate_id):
     """Replay: a complete candidate must match its sealed marker AND the
     candidate identity must be recomputed from the staged bytes, never trusted
@@ -841,7 +893,8 @@ def _validate_existing(candidate_dir, candidate_id):
     rehash a declared source. The on-disk tree must be exactly the sealed
     inventory plus the marker: no unlisted foreign policy file, no missing or
     changed payload, no symlink standing in for a staged file."""
-    marker_raw, _ = _read_source(candidate_dir, "complete.json", LIMIT_JSON_BYTES)
+    _private_replay_metadata(candidate_dir)
+    marker_raw, _ = _read_source(candidate_dir, "complete.json", LIMIT_JSON_BYTES, private=True)
     try:
         marker = json.loads(marker_raw.decode("utf-8"))
     except (UnicodeDecodeError, ValueError) as exc:
@@ -852,10 +905,10 @@ def _validate_existing(candidate_dir, candidate_id):
     files = marker.get("files")
     if not isinstance(files, dict) or not files:
         raise fs.Held("existing candidate has no sealed file list")
-    manifest_raw, _ = _read_source(candidate_dir, "manifest.json", LIMIT_JSON_BYTES)
+    manifest_raw, _ = _read_source(candidate_dir, "manifest.json", LIMIT_JSON_BYTES, private=True)
     if sha(manifest_raw) != marker.get("manifest_sha256"):
         raise fs.Held("existing candidate manifest differs from its sealed digest")
-    descriptor_raw, _ = _read_source(candidate_dir, "descriptor.json", LIMIT_JSON_BYTES)
+    descriptor_raw, _ = _read_source(candidate_dir, "descriptor.json", LIMIT_JSON_BYTES, private=True)
     if sha(descriptor_raw) != marker.get("descriptor_sha256"):
         raise fs.Held("existing candidate descriptor differs from its sealed digest")
     # Content identity recomputed from the staged descriptor: the directory
@@ -905,7 +958,7 @@ def _validate_existing(candidate_dir, candidate_id):
     # marker entry cannot legitimize changed payload bytes.
     for relative, digest in sorted(files.items()):
         try:
-            raw, _meta = _read_source(candidate_dir, relative, LIMIT_PART_BYTES)
+            raw, _meta = _read_source(candidate_dir, relative, LIMIT_PART_BYTES, private=True)
         except fs.Held as exc:
             raise fs.Held(f"existing candidate file is unreadable: {relative} ({exc})") from exc
         if sha(raw) != digest:
@@ -916,6 +969,7 @@ def _validate_existing(candidate_dir, candidate_id):
             if files.get(relative) != part["sha256"]:
                 raise fs.Held(f"existing candidate marker digest was rewritten for a "
                               f"descriptor-bound source: {relative}")
+    _private_replay_metadata(candidate_dir)
     return {"manifest_sha256": sha(manifest_raw), "descriptor_sha256": sha(descriptor_raw),
             "descriptor": descriptor}
 
