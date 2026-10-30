@@ -7,7 +7,7 @@ argument contract. Help never invokes either kind.
 """
 import argparse
 import difflib
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 
 
 @dataclass(frozen=True)
@@ -17,6 +17,7 @@ class Option:
     action: str = "store"
     choices: tuple = ()
     default: object = None
+    int_range: tuple = ()
 
 
 @dataclass(frozen=True)
@@ -39,160 +40,104 @@ class Command:
     # Strict compatibility leaves (such as topup) must not ignore typos.
     strict: bool = True
     hidden: bool = False
+    component: str = ""
+    operands: tuple = ()
+    passthrough: bool = False
+    # Planned families are declared and taught locally; anything beyond
+    # local help is an explicit unsupported-role refusal, never silence.
+    role: str = ""
+    native: str = ""
+    require_one_of: tuple = ()
+    conflicts: tuple = ()
+    operand_choices: tuple = ()
+    required_options: tuple = ()
 
 
-def opt(flag, help, action="store", choices=(), default=None):
-    return Option((flag,), help, action, tuple(choices), default)
+class PlannedFamily(ValueError):
+    """A declared-but-unimplemented family: local help works, effects refuse."""
 
 
-JSON = opt("--json", "Emit a versioned machine-readable result.", "store_true")
-COMMON = (JSON, opt("--host", "Host name or all (configured enrollment only)."),
-          opt("--since", "Relative age, such as 7d, or an absolute timestamp."),
-          opt("--until", "Absolute timestamp or future duration, such as +7d."),
-          opt("--limit", "Maximum result rows.", default="50"),
-          opt("--cursor", "Continue a page of the same snapshot."),
-          opt("--snapshot", "Read an immutable retained snapshot ID."))
-STATES = ("planned", "scheduled", "queued", "running", "failed", "completed",
-          "cancelled", "interrupted", "unknown", "retry_wait", "cooldown_wait")
-FILTER = (opt("--state", "Match attempt states; repeats are OR.", "append", STATES),
-          opt("--review", "Composer disposition.", choices=("unreviewed", "investigating",
-              "repair-proposed", "repair-running", "awaiting-verification", "verified",
-              "false-positive", "deferred")))
+def _load_tree():
+    # This is local command data, never a fleet/authority source read.
+    import hashlib
+    import json
+    from pathlib import Path
+    data_path = Path(__file__).resolve().with_name("commands.json")
+    raw = data_path.read_bytes()
+    document = json.loads(raw)
+    if document.get("schema_version") != 1:
+        raise ValueError("unsupported command contract schema")
+    option_sets = document["option_sets"]
+    components = document.get("components", {})
+    known_components = set(components)
+    wired = document.get("wired_adapters", {})
+    known_roles = {"", "planned"}
+    families = {path[0] for path in
+                (tuple(r["path"]) for r in document["commands"]) if path}
+    if any(name not in families for name in wired):
+        raise ValueError("wired adapter names an unknown family")
+    definitions = {}
+    for record in document["commands"]:
+        path = tuple(record["path"])
+        if path in definitions or any(not isinstance(x, str) for x in path):
+            raise ValueError("invalid/duplicate command path")
+        if record.get("role", "") not in known_roles:
+            raise ValueError("unsupported command role: " + str(record.get("role")))
+        if "component" in record:
+            component = record["component"]
+            if component not in known_components:
+                raise ValueError("command names an undeclared component: " + str(path))
+            if record.get("handler") == "legacy":
+                target = record["legacy"][0].lstrip("@")
+                declared = components[component]
+                roster = {declared["runner"], *declared.get("aliases", [])}
+                if target not in roster:
+                    raise ValueError("command target is not owned by its component: " + str(path))
+        definitions[path] = record
+    tree = {}
+    def options(records, stack=()):
+        expanded = []
+        for entry in records:
+            if "$ref" in entry:
+                key = entry["$ref"]
+                if key in stack or key not in option_sets:
+                    raise ValueError("cyclic/unknown option set")
+                expanded.extend(options(option_sets[key], stack + (key,)))
+            else:
+                fields = dict(entry)
+                fields["flags"] = tuple(fields["flags"])
+                fields["choices"] = tuple(fields.get("choices", ()))
+                expanded.append(Option(**fields))
+        return tuple(expanded)
+    def resolve(path, stack=()):
+        if path in tree:
+            return tree[path]
+        if path in stack or path not in definitions:
+            raise ValueError("cyclic/unknown command alias")
+        record = definitions[path]
+        if "alias_of" in record:
+            base = resolve(tuple(record["alias_of"]), stack + (path,))
+            fields = dict(base.__dict__)
+        else:
+            fields = {}
+        fields.update({k:v for k,v in record.items() if k not in ("path", "alias_of")})
+        if "options" in record:
+            fields["options"] = options(record["options"])
+        if "examples" in record:
+            fields["examples"] = tuple(Example(**e) for e in record["examples"])
+        for key in ("legacy", "operands"):
+            if key in record:
+                fields[key] = tuple(record[key])
+        tree[path] = Command(**fields)
+        return tree[path]
+    for path in definitions:
+        resolve(path)
+    if () not in tree or any(p and p[:-1] not in tree for p in tree):
+        raise ValueError("command contract has missing parent")
+    return tree, hashlib.sha256(raw).hexdigest(), components, wired
 
 
-TREE = {
-    (): Command("Inspect and operate the swarm. Type a noun to learn the next word."),
-    ("dream",): Command("Inspect autonomous work, attempts and their evidence."),
-    ("dream", "ps"): Command("Show active dream attempts.", handler="query", options=COMMON),
-    ("dream", "ls"): Command("Browse planned, current and historical dreams.", handler="query",
-        options=COMMON + FILTER + (opt("--all", "Include retained attempt history.", "store_true"),),
-        examples=(Example("Find failed dreams not examined by the composer",
-            "ygg dream ls --all --state failed --review unreviewed --since 7d", "failures history composer"),)),
-    ("dream", "inspect"): Command("Explain a work item, its retries and repair history.", handler="query",
-        operand="id", options=COMMON + (opt("--attempts", "Include every retained attempt.", "store_true"),
-            opt("--repairs", "Include linked composer notes and repair outcomes.", "store_true")),
-        examples=(Example("Trace a failed work item through retries and repairs",
-            "ygg dream inspect dream-42 --attempts --repairs", "history evidence"),)),
-    ("dream", "logs"): Command("Read evidence for an exact dream attempt.", handler="query",
-        operand="id", options=COMMON + (opt("--attempt", "Exact attempt ID."),),
-        examples=(Example("Read the failed attempt, not a later retry",
-            "ygg dream logs dream-42 --attempt attempt-3", "failure logs"),)),
-    ("dream", "open"): Command("Select and inspect a live session or read-only transcript.",
-        handler="open", effect="attach", operand="id", optional_operand=True,
-        options=COMMON + FILTER + (opt("--pick", "Choose interactively; never resumes work.", "store_true"),
-                                  opt("--attempt", "Exact attempt ID.")),
-        examples=(Example("Select a failed attempt for human inspection",
-            "ygg dream open --pick --state failed", "picker session harness"),)),
-    ("dream", "status"): Command("Existing orchestrator status (compatibility).", handler="legacy",
-        options=(JSON,), legacy=("ygg-dream-orchestrator.py", "status"),
-        examples=(Example("Read the existing spawner ledger", "ygg dream status --json"),)),
-    ("dream", "topup"): Command("Stage work through existing permission and arming gates.",
-        handler="legacy", effect="dispatch", options=(JSON,), legacy=("ygg-dream-orchestrator.py", "topup")),
-    ("dream", "supervise"): Command("Run the existing gated supervision pass.",
-        handler="legacy", effect="change", options=(JSON,), legacy=("ygg-dream-orchestrator.py", "supervise")),
-    ("service",): Command("Locate expected and observed swarm services and resources."),
-    ("service", "ps"): Command("Compare expected services with observed instances.", handler="query",
-        options=COMMON, examples=(Example("Find where each service runs", "ygg service ps --host all", "placement missing duplicate"),)),
-    ("service", "inspect"): Command("Inspect one service's identity and health.", handler="query",
-        operand="id", options=COMMON,
-        examples=(Example("Inspect a service on its owning host", "ygg service inspect service-12 --host worker-a"),)),
-    ("service", "top"): Command("Show compute ownership without counting shared resources twice.",
-        handler="query", options=COMMON + (opt("--by", "Group resource ownership.", choices=("dream", "service", "host"), default="dream"),),
-        examples=(Example("Compare dreamer compute", "ygg service top --by dream", "cpu memory resources"),)),
-    ("service", "logs"): Command("Read bounded service diagnostics.", handler="query", operand="id", options=COMMON,
-        examples=(Example("Read an hour of service failures", "ygg service logs service-12 --host worker-a --since 1h"),)),
-    ("schedule",): Command("Read periodic jobs and revisable conditional commitments."),
-    ("schedule", "ls"): Command("List planned work with its conditions and next checks.", handler="query",
-        options=COMMON + (opt("--due", "Due boundary, such as before:month-end."),),
-        examples=(Example("Find work to evaluate before month end", "ygg schedule ls --due before:month-end", "monthly conditional plans"),)),
-    ("schedule", "inspect"): Command("Read a commitment's source, conditions and authority.", handler="query", operand="id", options=COMMON,
-        examples=(Example("Inspect the transcription priority conditions", "ygg schedule inspect month-end-transcription"),)),
-    ("schedule", "why"): Command("Explain why planned work is due, held or awaiting evaluation.", handler="query", operand="id", options=COMMON,
-        examples=(Example("Explain a deferred monthly sweep", "ygg schedule why month-end-transcription", "blocked prerequisites"),)),
-    ("schedule", "history"): Command("Read previous decisions and reasons for changing them.", handler="query", operand="id", options=COMMON,
-        examples=(Example("See how a future commitment changed", "ygg schedule history month-end-transcription", "opinions revisions"),)),
-    ("swarm",): Command("Scan heartbeat, capacity balance and operational evidence."),
-    ("swarm", "status"): Command("Summarize state and observation coverage.", handler="query", options=COMMON,
-        examples=(Example("Start a system inspection", "ygg swarm status", "overview health"),)),
-    ("swarm", "heartbeat"): Command("Separate service pulse, observer freshness and useful progress.", handler="query",
-        options=COMMON + (opt("--layers", "Show each progress layer.", "store_true"),),
-        examples=(Example("Find a live service doing no useful work", "ygg swarm heartbeat --layers", "stalled pulse"),)),
-    ("swarm", "pressure"): Command("Explain usable funding, eligible work and execution bottlenecks.", handler="query",
-        options=COMMON + (opt("--by", "Group capacity by native funding or execution scope.", choices=("plan", "host", "plane"), default="plan"),
-                          opt("--explain", "Include constraints and unknown inputs.", "store_true")),
-        examples=(Example("Explain unused quota and idle capacity", "ygg swarm pressure --by plan --explain", "unused quota capacity idle funding balance"),)),
-    ("swarm", "events"): Command("Read retained operational events and repair dispositions.", handler="query",
-        options=COMMON + (opt("--subsystem", "Subsystem name.", "append"),
-                          opt("--severity", "Minimum event severity.", choices=("debug", "info", "warning", "error", "critical"))),
-        examples=(Example("Inspect yesterday's memory warnings", "ygg swarm events --subsystem memory --severity warning --since 1d", "maintenance journal failures"),)),
-    ("swarm", "check"): Command("Falsify named health assertions; unknown evidence never passes.", handler="query",
-        options=COMMON + (opt("--scope", "Assertion family.", choices=("all", "dispatch", "services", "funding", "memory"), default="all"),),
-        examples=(Example("Check whether dispatch is working", "ygg swarm check --scope dispatch", "assertions falsify"),)),
-    ("help",): Command("Read local command help and search complete examples."),
-    ("help", "examples"): Command("Find a complete command by the task you want to perform.", handler="examples",
-        options=(JSON, opt("--search", "Words in the example's task, tags or command.")),
-        examples=(Example("Find commands about spare funding", 'ygg help examples --search "unused quota"'),)),
-    ("completion",): Command("Print shell completion setup (local; no fleet probes).", handler="completion",
-        operand="shell", examples=(Example("Install Bash completion in the current shell", "ygg completion bash"),)),
-    ("complete",): Command("Return local next-word candidates for shell completion.", handler="complete"),
-    ("version",): Command("Print the command contract version.", handler="version"),
-    ("agents",): Command("Existing agent registry compatibility view."),
-    ("agents", "ps"): Command("Read the existing agent registry; coverage is backend-defined.",
-        handler="legacy", options=(JSON,), legacy=("ygg-fleet.py", "agents", "ps")),
-    ("fleet",): Command("Existing fleet compatibility views."),
-    ("fleet", "pressure"): Command("Read the existing fleet pressure view.", handler="legacy",
-        options=(JSON,), legacy=("ygg-fleet.py", "fleet", "pressure")),
-    ("board",): Command("Read topic boards, or access the existing row-board view."),
-    ("board", "scan"): Command("Find unmaterialized feature dreams.", handler="legacy",
-        options=(JSON,), legacy=("ygg-fleet.py", "board", "scan")),
-}
-
-# These validators already live in the owned tools. Do not replace their
-# argument contracts with guessed partial copies. Help is always local.
-for name, target, summary, example, effect in (
-    ("memory", "ygg-memory", "Cross-harness semantic memory.", "ygg memory status --harness codex --ns=-home-user-project --json", "legacy"),
-    ("auth", "ygg-auth.py", "Existing local account-policy tools.", "ygg auth status", "legacy"),
-    ("ci", "ygg-ci.py", "Single integration build plane.", "ygg ci status --json", "legacy"),
-    ("init", "ygg-init.sh", "Deterministic onboarding.", "ygg init --tier 0", "legacy"),
-    ("doctor", "ygg-init.sh", "Existing deterministic node diagnostics.", "ygg doctor", "legacy"),
-):
-    TREE[(name,)] = Command(summary, handler="legacy", effect=effect,
-        legacy=(target, name) if name in ("init", "doctor") else (target,),
-        strict=False, examples=(Example("Use the existing owned tool", example),))
-for name in ("row", "bridge", "spawn", "deliver", "fold", "land", "claim", "panic", "booter", "monitor", "babysit"):
-    target = {"row": "ygg_row.py", "bridge": "ygg_bridge.py", "claim": "ygg-claim.sh"}.get(name, "ygg-" + name + ".py")
-    TREE[(name,)] = Command("Existing " + name + " compatibility tool.", effect="legacy",
-        handler="legacy", legacy=(target,), strict=False)
-TREE[("board", "rows")] = Command("Existing row-board view and row metadata operations.",
-    effect="legacy", handler="legacy", legacy=("ygg-board.py",), strict=False)
-for verb in ("read", "list", "summary", "post", "answer", "graduate"):
-    TREE[("board", verb)] = Command("Topic-board " + verb + " through msgboard.",
-        handler="legacy", effect="read" if verb in ("read", "list", "summary") else "change",
-        legacy=("@msgboard", verb), strict=False)
-
-# Preserve the old direct-script spelling only for known owned tools. Never
-# resolve arbitrary paths or execute a merely similar filename.
-for target in {n.legacy[0] for n in TREE.values() if n.legacy and not n.legacy[0].startswith("@")}:
-    TREE[(target,)] = Command("Direct owned-tool compatibility spelling.", effect="legacy",
-        handler="legacy", legacy=(target,), strict=False, hidden=True)
-
-# The old ad-hoc tools silently ignored unknown arguments. Both their noun
-# forms and their direct-script spellings now reject unsupported flags before
-# effects; direct spellings must not bypass the canonical validator.
-target = "ygg-dream-orchestrator.py"
-TREE[(target,)] = Command("Compatibility spelling of ygg dream.", hidden=True)
-for verb in ("status", "topup", "supervise"):
-    TREE[(target, verb)] = replace(TREE[("dream", verb)], examples=())
-target = "ygg-fleet.py"
-TREE[(target,)] = Command("Compatibility fleet views.", hidden=True)
-for verb, child, canonical in (("agents", "ps", ("agents", "ps")),
-                                ("fleet", "pressure", ("fleet", "pressure")),
-                                ("board", "scan", ("board", "scan"))):
-    n = TREE[canonical]
-    TREE[(target, verb)] = replace(n, legacy=(target, verb), examples=())
-    TREE[(target, verb, child)] = replace(n, examples=())
-TREE[(target, "pressure")] = replace(TREE[("fleet", "pressure")],
-                                      legacy=(target, "pressure"), examples=())
+TREE, CONTRACT_HASH, COMPONENTS, WIRED_ADAPTERS = _load_tree()
 
 
 def children(path):
@@ -208,6 +153,10 @@ def context(words):
     return path
 
 
+def _dest(option):
+    return option.flags[0].lstrip("-").replace("-", "_")
+
+
 def parser_for(path):
     node = TREE[path]
     parser = argparse.ArgumentParser(prog="ygg" + (" " + " ".join(path) if path else ""),
@@ -221,8 +170,10 @@ def parser_for(path):
         if o.default is not None:
             kw["default"] = o.default
         parser.add_argument(*o.flags, **kw)
-    if node.operand:
-        parser.add_argument(node.operand, **({"nargs": "?"} if node.optional_operand else {}))
+    for name in node.operands or ((node.operand,) if node.operand else ()):
+        parser.add_argument(name, **({"nargs": "?"} if node.optional_operand else {}))
+    if node.passthrough:
+        parser.add_argument("harness_args", nargs=argparse.REMAINDER)
     return parser
 
 
@@ -266,24 +217,42 @@ def parse(words):
         raise ValueError("unknown command " + repr(word) + ("; try: " + ", ".join(near) if near else "; try ygg help"))
     node = TREE[path]
     rest = words[len(path):]
+    if node.role == "planned":
+        raise PlannedFamily("ygg " + " ".join(path) + ": planned family, not implemented in this generation; local help only (ygg " + " ".join(path) + " --help)")
     if node.handler == "group":
         raise ValueError("unknown next word/options for ygg " + " ".join(path) + "; choose: " + ", ".join(children(path)))
     if node.handler == "legacy" and not node.strict:
         return path, argparse.Namespace(), rest
     args = parser_for(path).parse_args(rest)
-    if path == ("dream", "open") and not (args.id or args.pick):
-        parser_for(path).error("provide an exact ID or --pick")
-    if path == ("dream", "open") and args.id and args.pick:
-        parser_for(path).error("choose either an exact ID or --pick, not both")
-    if hasattr(args, "limit"):
+    # Validation lives in the one JSON contract; no front end keeps its own.
+    for o in node.options:
+        if not o.int_range or not hasattr(args, _dest(o)):
+            continue
+        raw = getattr(args, _dest(o))
         try:
-            args.limit = int(args.limit)
-            if not 1 <= args.limit <= 1000:
+            value = int(raw)
+            lo, hi = o.int_range
+            if not lo <= value <= hi:
                 raise ValueError()
-        except ValueError:
-            parser_for(path).error("--limit must be an integer from 1 to 1000")
-    if path == ("completion",) and args.shell != "bash":
-        parser_for(path).error("supported shell: bash")
+        except (TypeError, ValueError):
+            parser_for(path).error(o.flags[0] + " must be an integer from %d to %d" % tuple(o.int_range))
+        setattr(args, _dest(o), value)
+    dests = vars(args)
+    if node.require_one_of:
+        for name in node.require_one_of:
+            if dests.get(name):
+                break
+        else:
+            parser_for(path).error("provide " + " or ".join("--" + n for n in node.require_one_of))
+    for group in node.conflicts:
+        if sum(1 for n in group if dests.get(n)) > 1:
+            parser_for(path).error("choose either " + " or ".join("--" + n for n in group) + ", not both")
+    if node.operand_choices and getattr(args, node.operand) not in (None,) + tuple(node.operand_choices):
+        parser_for(path).error("supported " + node.operand + ": " + ", ".join(node.operand_choices))
+    for name in node.required_options:
+        if not dests.get(name):
+            parser_for(path).error("--" + name.replace("_", "-") + " is required")
+    return path, args, rest
     return path, args, rest
 
 

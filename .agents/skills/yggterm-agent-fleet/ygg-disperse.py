@@ -29,12 +29,16 @@ Replicas are never hand-edited: the repo SSOT wins, drift is fixed by
 re-running install.
 """
 import argparse
+from contextlib import ExitStack
 import hashlib
+import importlib.util
 import io
 import json
 import os
+import re
 import shutil
 import socket
+import stat
 import subprocess
 import sys
 import tarfile
@@ -207,6 +211,67 @@ def normalize_modes(spec, files):
         os.chmod(bin_dir / name, EXEC_MODE if name in spec["executable"] else DATA_MODE)
 
 
+def invalidate_owned_bytecode(files, out):
+    """Retire this payload's derived CPython cache, never arbitrary caches.
+
+    copy2 preserves source size/mtime. A legitimate older timestamp cache
+    can therefore survive a same-size metadata-preserving source upgrade.
+    Only cache objects generated for declared shipped Python module names
+    are enrolled here. Unknown files remain untouched; unsafe parents or
+    nonregular/foreign-owned enrolled objects refuse completion.
+    """
+    directories = {}
+    for name in files:
+        source = replica_dir() / name
+        if source.suffix == ".py":
+            # The entrypoint and an approved payload alias can use lexical
+            # or canonical source paths. Prefix caches key those paths even
+            # when both resolve to one source inode.
+            for spelling in {source.absolute(), source.resolve()}:
+                candidates = [spelling.parent / "__pycache__"]
+                if sys.pycache_prefix is not None:
+                    candidates.append(Path(importlib.util.cache_from_source(str(spelling))).parent)
+                for directory in candidates:
+                    directory = directory.parent.resolve() / directory.name
+                    directories.setdefault(directory, set()).add(source.stem)
+    enrolled = []
+    with ExitStack() as handles:
+        for directory, stems in directories.items():
+            if not os.path.lexists(directory):
+                continue
+            # The selected payload root may be an approved location alias;
+            # its cache child must never redirect into another store.
+            parent = os.open(directory.parent.resolve(), os.O_RDONLY | os.O_DIRECTORY)
+            handles.callback(os.close, parent)
+            try:
+                cache = os.open(directory.name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                                dir_fd=parent)
+            except OSError:
+                die("bytecode cache parent cannot be opened without following links")
+            handles.callback(os.close, cache)
+            cache_info = os.fstat(cache)
+            if cache_info.st_uid != os.getuid():
+                die("bytecode cache parent is not owned; no cache objects removed")
+            for name in os.listdir(cache):
+                if not any(re.fullmatch(re.escape(stem) + r"\.cpython-[0-9]+(?:\.opt-[0-9]+)?\.pyc", name)
+                           for stem in stems):
+                    continue
+                info = os.stat(name, dir_fd=cache, follow_symlinks=False)
+                if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+                    die("enrolled bytecode cache is not an owned regular file; no cache objects removed")
+                enrolled.append((parent, directory.name, cache, cache_info, name, info))
+        for parent, directory, cache, cache_info, name, before in enrolled:
+            current_dir = os.stat(directory, dir_fd=parent, follow_symlinks=False)
+            current = os.stat(name, dir_fd=cache, follow_symlinks=False)
+            if ((current_dir.st_dev, current_dir.st_ino) != (cache_info.st_dev, cache_info.st_ino)
+                    or (current.st_dev, current.st_ino) != (before.st_dev, before.st_ino)
+                    or not stat.S_ISREG(current.st_mode)):
+                die("bytecode cache changed during invalidation; retain and retry installation")
+            os.unlink(name, dir_fd=cache)
+            os.fsync(cache)
+    out["bytecode_invalidated"] = len(enrolled)
+
+
 def adopt_root_copies(files, out, owner_managed=()):
     """bin/ root hand-staged copies of shipment names become links into bin/ygg/.
 
@@ -250,6 +315,7 @@ def install_local(args):
     for name in files:
         shutil.copy2(ssot / name, bin_dir / name)
     shutil.copy2(ssot / LIST_NAME, bin_dir / LIST_NAME)
+    invalidate_owned_bytecode(files, out)
     normalize_modes(spec, files)
     adopt_root_copies(files, out, spec.get("owner_managed", ()))
     out["installed"] = len(files)
@@ -268,6 +334,7 @@ def cmd_finalize(args):
     spec, files = load_shipment(replica_dir())
     normalize_modes(spec, files)
     out = {"host": hostname(), "commit": args.commit, "installed": len(files)}
+    invalidate_owned_bytecode(files, out)
     adopt_root_copies(files, out, spec.get("owner_managed", ()))
     write_manifest(build_manifest(spec, files, replica_dir(), args.commit))
     install_links(spec, replica_dir(), out, source_dir=replica_dir())
