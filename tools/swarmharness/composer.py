@@ -119,6 +119,28 @@ budget left, so the reconcile is one-time and crash-replay idempotent.
 Bytes that changed while unobserved stay distinct evidence at their own
 offsets.
 
+Live-tail contract (CSR-06 repair, 2026-10-30): closedness of a source
+is an EXPLICIT per-source declaration, never an inference from
+idleness. A plain path in the sources mapping enrolls the historical
+FINITE immutable snapshot (closed=True): its trailing unterminated
+record at eof is its FINAL tail and is emitted, exactly as before. A
+live append stream — logs, append boards — can never be CLOSED: its
+EOF is merely the CURRENT EOF, so it must DECLARE itself with
+{"path": ..., "closed": False}. Under that declaration read_page
+carries closed=False: a trailing record without its terminator is
+PENDING — no observation is minted from incomplete bytes, the cursor
+is retained at the record's start byte (a bounded unfinished POSITION
+— the raw bytes are never persisted), and a later append that
+terminates the record mines it EXACTLY ONCE with its full raw span,
+byte-identical to what the static final bytes yield. The anchor, its
+frontier checkpoint and coverage accounting all stop at the consumed
+frontier — they never silently validate or claim the unconsumed
+pending bytes, and the tick names the pending tail in its report. A
+record that is never terminated stays pending honestly: no fault, no
+false coverage claim, no busy loop. An entry that is neither a plain
+path nor {"path": str, "closed": bool} is a typed census gap — the
+contract is never guessed.
+
 Observation identity v2 (F2 repair, 2026-10-29): the dedupe identity is
 (source_kind, lineage, span, detector, detector_version, fingerprint) —
 generation EXCLUDED. The same logical occurrence (same bytes at the same
@@ -532,8 +554,32 @@ def census(sources, cutoff=None, state_dir=None):
                 {"source_kind": kind, "status": "unsupported_kind"})
             continue
         for path in paths:
-            p = Path(path).expanduser()
-            entry = {"source_kind": kind, "path": str(p)}
+            # the closed-source contract is EXPLICIT and per source
+            # (CSR-06): a plain path enrolls the historical finite
+            # immutable snapshot (closed=True — trailing unterminated
+            # record is its final tail); a live append stream — whose
+            # EOF is merely the current EOF — must DECLARE itself with
+            # {"path": ..., "closed": False}. Closedness is never
+            # inferred from idleness or file shape.
+            if isinstance(path, dict):
+                p = path.get("path")
+                closed = path.get("closed")
+                if not isinstance(p, str) or not p \
+                        or not isinstance(closed, bool):
+                    manifest["gaps"].append(
+                        {"source_kind": kind, "status":
+                         "invalid-source-spec: entry must be a path "
+                         "string or {'path': str, 'closed': bool}"})
+                    continue
+                p = Path(p).expanduser()
+            elif isinstance(path, (str, Path)):
+                p = Path(path).expanduser()
+                closed = True
+            else:
+                manifest["gaps"].append(
+                    {"source_kind": kind, "status": "invalid-source-spec"})
+                continue
+            entry = {"source_kind": kind, "path": str(p), "closed": closed}
             if not p.exists():
                 entry["status"] = "missing"
                 manifest["gaps"].append(entry)
@@ -574,7 +620,7 @@ class _Page(tuple):
         return self
 
 
-def read_page(path, cursor=0, max_bytes=262144):
+def read_page(path, cursor=0, max_bytes=262144, closed=True):
     """Bounded page of COMPLETE records. Bytes are buffered RAW, framed by
     the BYTE splitlines grammar (LF, CRLF and bare CR all terminate a
     record — sol t33 F33.4), and decoded once per emitted block; cursor
@@ -582,7 +628,16 @@ def read_page(path, cursor=0, max_bytes=262144):
     bytes (progress guaranteed, sol t28 V3-N1). The oversized bound applies
     to the individual leading unfinished record. Returns (text,
     next_cursor, done, line_offs) — RAW-BYTE start offsets of the emitted
-    complete records (sol t31 F31.4)."""
+    complete records (sol t31 F31.4).
+
+    closed is an EXPLICIT trusted contract, never an inference (CSR-06):
+    closed=True asserts the handle is a finite immutable snapshot, so a
+    trailing unterminated record at EOF is its FINAL tail and is emitted.
+    closed=False is the LIVE append-stream contract: EOF is merely the
+    current EOF, the trailing unterminated record stays PENDING — not
+    emitted, not decoded, not detected — and next_cursor retains its
+    start byte so a later append that completes the record is read whole
+    and mined exactly once, byte-identical to the static final bytes."""
     if not isinstance(max_bytes, int) or isinstance(max_bytes, bool) \
             or max_bytes <= 0:
         raise ValueError(
@@ -621,8 +676,14 @@ def read_page(path, cursor=0, max_bytes=262144):
             partial = pieces[-1]
             pieces = pieces[:-1]
         complete = pieces
-    if eof and partial:
-        # the trailing unterminated record is the FINAL tail — emit it now
+    if eof and partial and closed:
+        # trusted closed-snapshot contract only (CSR-06): the caller
+        # asserts this handle is a finite, immutable snapshot, so the
+        # trailing unterminated record is its FINAL tail — emit it now.
+        # A live source keeps the record pending: emitting it at a
+        # temporary EOF would consume bytes the writer has not finished,
+        # and the completing append would then be read as a separate
+        # record, losing the fault the static final bytes show.
         complete.append(partial)
         partial = b""
     emitted = b"".join(complete)
@@ -1510,7 +1571,16 @@ def tick(sources, state_dir=None, max_bytes_per_source=262144,
             src_bytes = 0
             utf8_hits = 0
             while pages < max_pages and cur < size:
-                page = read_page(p, cur, max_bytes_per_source)
+                # the source's EXPLICIT closed declaration decides the
+                # tail contract (CSR-06): a declared live append stream
+                # (closed=False) holds a trailing unterminated record
+                # PENDING at its start byte until a later append
+                # terminates it, then it is mined once with its full
+                # span; a plain enrolled finite snapshot (closed=True,
+                # the historical contract) emits that record as its
+                # final tail at eof exactly as before.
+                page = read_page(p, cur, max_bytes_per_source,
+                                 closed=entry.get("closed", True))
                 text, nxt, done, line_offs = page
                 if not text:
                     break
@@ -1549,6 +1619,18 @@ def tick(sources, state_dir=None, max_bytes_per_source=262144,
                 cur = nxt
                 if done:
                     break
+            if not deferred and cur < size and pages < max_pages \
+                    and not entry.get("closed", True):
+                # the only loop exit with budget left and bytes unconsumed
+                # is a PENDING live tail (CSR-06): name it honestly — the
+                # cursor retains the bounded unfinished byte position, the
+                # raw bytes are never persisted, no observation was minted
+                # from incomplete bytes, and no coverage is claimed.
+                report["notes"].append(
+                    f"live tail pending on {entry['path']}: record at "
+                    f"bytes@{cur} ({size - cur} unfinished bytes) awaits "
+                    "termination — position retained, bytes unconsumed, "
+                    "no coverage claimed (CSR-06)")
             if read_any:
                 scanned.add(lineage)
                 report["new_tail_bytes"] += src_bytes
