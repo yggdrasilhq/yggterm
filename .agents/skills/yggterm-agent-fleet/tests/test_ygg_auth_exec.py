@@ -25,6 +25,31 @@ SECRET = 'fixture-secret-token-do-not-print'
 
 
 class AuthExecTests(unittest.TestCase):
+    def test_refresh_race_cannot_admit_credential_free_rebound(self):
+        m = self.m
+        a = self.profile('a', expired=True, live=True)
+        b = self.profile('b', token='')
+
+        def native_rewrites_during_refresh(*args):
+            m.atomic_write_json(m.HARNESSES['codex']['auth_file']('codex'), b)
+            return dict(a, expires_at=time.time() + 10000)
+
+        with patch.object(m, 'refresh_grant', side_effect=native_rewrites_during_refresh):
+            with self.assertRaises(m.AuthError) as error:
+                m.cmd_exec(self.args())
+        self.assertEqual(error.exception.details['reason'], 'grant_unproven')
+        self.assertEqual(m.live_record('codex'), b)
+        self.assertFalse(self.spawns)
+
+    def test_unusable_refresh_response_cannot_replace_native_grant(self):
+        m = self.m
+        a = self.profile('a', expired=True, live=True)
+        with patch.object(m, 'refresh_grant', return_value={'expires_at': time.time() + 10000}):
+            with self.assertRaises(m.AuthError):
+                m.cmd_exec(self.args())
+        self.assertEqual(m.live_record('codex'), a)
+        self.assertFalse(self.spawns)
+
     def test_policy_is_validated_after_waiting_for_serialization(self):
         m = self.m
         self.profile('a', expired=True, live=True)

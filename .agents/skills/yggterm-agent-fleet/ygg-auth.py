@@ -1345,6 +1345,9 @@ def _exec_gate(harness, allow_refresh):
     # ONE bounded refresh through the canonical adapter. refresh_profile
     # records refresh_invalid on a typed rejection; there is no retry loop.
     fresh = refresh_profile(harness, slug, record)
+    if not usable_record(fresh, harness):
+        raise AuthError(5, "refresh returned an unusable grant; holding the launch",
+                        {"reason": "grant_unproven", **gate})
     pre_refresh_hash = gate["record_hash"]
     # fresh-P3: the fleet lock cannot serialize a NATIVE writer. Re-read the
     # live file before persisting: if a native owner rewrote the grant while
@@ -1372,6 +1375,9 @@ def _exec_gate(harness, allow_refresh):
         record = fresh
     gate.update(record_hash=record_hash(record), refreshed_once=True,
                 health_state="unknown", refresh_persisted=not raced)
+    if not usable_record(record, harness):
+        raise AuthError(5, "native rebound grant is unusable; holding the launch",
+                        {"reason": "grant_unproven", **gate})
     # fresh-P5: recompute expiry with the canonical identity rules on the
     # record that will actually be launched — a hardcoded expired=False would
     # admit a dead grant. A grant still expired after its one refresh is held.
