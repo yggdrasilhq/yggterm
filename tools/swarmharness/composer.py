@@ -134,6 +134,21 @@ explicit: rekeyed under v2, generation-era duplicates coalesced to the
 earliest row with the counts reported in the tick notes, foreign-version
 rows preserved verbatim — no silent discard, no faked identity.
 
+Store-repair law (CSR-04/CSR-07, 2026-10-30): BEFORE a migration replaces
+the live index, the EXACT original store bytes — every generation row,
+every old key, every corrupt line — are archived under a NON-OVERWRITING
+content-addressed snapshot owned by the composer
+(state/observations-archive/<sha256>.jsonl), fsynced ahead of the
+switch, with a typed manifest carrying the migration's LOGICAL counts
+separately from that immutable provenance; a crash at any boundary
+replays without destroying anything. A store whose identity metadata
+names a newer or unrecognized version, or is malformed, is HELD —
+read-only, never rewritten, never downgraded (a future schema is never
+reinterpreted as v1) — and held stores defer their sources unread. Rows
+are classified BEFORE grouping: a malformed current row (missing
+detector_id, wrong types, forged key) is typed observable debt held
+verbatim in the store, never a KeyError and never a fabricated identity.
+
 Durability (acceptance 4): every tick body runs under a per-state-dir
 flock — concurrent ticks serialize, a crashed holder releases by process
 death, and observation/cursor writes stay ordered observations-first so
@@ -166,9 +181,11 @@ _ANCHOR_FULL_LIMIT = 131072  # windows cover the whole prefix up to here
 _MAX_ANCHOR_CHUNKS = 1024    # per-source chunk cap (~266 MiB at 256 KiB pages)
 _ANCHOR_FILE = "anchors.json"
 
-# ---- observation identity version (F2 repair) ----
+# ---- observation identity version (F2 repair; CSR-04/07 store repair) ----
 _OBS_IDENTITY_VERSION = 2
 _STORE_META = "observations.meta.json"
+_ARCHIVE_DIR = "observations-archive"  # owned, content-addressed snapshots
+_MAX_DEBT_NOTES = 8  # typed debt notes per tick (finite-bounds law)
 
 # ---- fair cohort scheduling (CSR-02 repair) ----
 _SCHEDULER_FILE = "scheduler.json"
@@ -342,6 +359,28 @@ def make_observation(detector_id, severity, source_kind, gen, span, fp,
 _OBS_KEYS = {"detector_id", "detector_version", "severity", "status",
              "source_kind", "generation", "lineage_id", "span",
              "fingerprint", "at", "dedupe_key"}
+
+
+def _row_shape_fault(obs):
+    """Structural fault of an observation row WITHOUT the recomputed-key
+    check (CSR-07): the dedupe key is VERSIONED — a v1 row legitimately
+    carries a v1 key until it is rekeyed — so migration classifies rows by
+    shape alone and a malformed row is quarantined as typed debt instead
+    of being rekeyed under an identity fabricated from missing fields."""
+    if not isinstance(obs, dict) or set(obs) != _OBS_KEYS:
+        missing = _OBS_KEYS - set(obs or {})
+        extra = set(obs or {}) - _OBS_KEYS
+        return (f"schema violation: missing={sorted(missing)} "
+                f"extra={sorted(extra)}")
+    if obs["severity"] not in _SEVERITIES:
+        return f"invalid severity {obs['severity']!r}"
+    if obs["status"] not in ("verified-symptom", "unverified-symptom"):
+        return f"invalid status {obs['status']!r}"
+    for k in ("detector_id", "source_kind", "generation", "span",
+              "fingerprint", "at", "dedupe_key", "lineage_id"):
+        if not isinstance(obs[k], str) or not obs[k]:
+            return f"{k} must be a nonempty string"
+    return None
 
 
 def validate_observation(obs):
@@ -742,36 +781,136 @@ def _state_lock(state):
             os.close(fd)
 
 
+def _observation_store_held(state):
+    """Typed non-destructive HOLD gate (CSR-07). A store whose identity
+    metadata names a NEWER composer version, an unrecognized version, or
+    whose metadata is unreadable/malformed is HELD: never rewritten, never
+    migrated down, never reinterpreted — a future schema is never
+    downgraded to v1 and a corrupt marker never authorizes destroying the
+    store it describes. Returns (held, note); note is None when the store
+    is recognized (legacy-absent, v1, or current v2)."""
+    meta_path = Path(state).expanduser() / _STORE_META
+    if not meta_path.exists():
+        return False, None  # legacy store: the explicit migration owns it
+    try:
+        meta = json.loads(meta_path.read_text())
+    except Exception:
+        return True, ("observation store HELD: identity meta unreadable — "
+                      "never rewritten, never reinterpreted (typed hold)")
+    if not isinstance(meta, dict) \
+            or type(meta.get("identity_version")) is not int:
+        return True, ("observation store HELD: identity meta malformed — "
+                      "never rewritten, never reinterpreted (typed hold)")
+    version = meta["identity_version"]
+    if version == _OBS_IDENTITY_VERSION:
+        return False, None
+    if version == 1:
+        return False, None  # recognized predecessor: explicit migration
+    if version > _OBS_IDENTITY_VERSION:
+        return True, (f"observation store HELD: identity_version {version} "
+                      "is from a NEWER composer — read-only, never "
+                      "rewritten, never downgraded (typed hold)")
+    return True, (f"observation store HELD: identity_version {version} is "
+                  "not a recognized version — never rewritten, never "
+                  "reinterpreted (typed hold)")
+
+
+def _archive_store_snapshot(state, raw):
+    """Non-overwriting CONTENT-ADDRESSED archive of the EXACT original
+    store bytes (CSR-04): every generation row, every old key, every
+    corrupt line survives byte-for-byte under
+    observations-archive/<sha256>.jsonl BEFORE the live index is switched.
+    fsync(file) -> rename -> fsync(dir) orders the snapshot durably ahead
+    of any replacement, so a crash at any later boundary replays without
+    destroying the original. An existing entry is verified byte-identical
+    and NEVER overwritten; a compromised entry holds the store instead.
+    Returns the snapshot digest."""
+    digest = _sha(raw)
+    adir = Path(state).expanduser() / _ARCHIVE_DIR
+    adir.mkdir(parents=True, exist_ok=True)
+    target = adir / f"{digest}.jsonl"
+    if target.exists():
+        if _sha(target.read_bytes()) != digest:
+            raise RuntimeError(
+                f"archive entry {digest[:16]} exists with different "
+                "content — refusing to overwrite an owned archive")
+        return digest
+    tmp = target.with_name(target.name + f".tmp{os.getpid()}")
+    with tmp.open("wb") as f:
+        f.write(raw)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, target)
+    _fsync_dir(adir)
+    return digest
+
+
+def _migration_manifest(state, digest, byte_count, prior_meta_raw, counts):
+    """Typed ledger for one archived snapshot (CSR-04): the ARCHIVE FILE
+    carries the immutable original bytes (provenance); the MANIFEST
+    carries the migration's logical counts — duplicates coalesced, rows
+    quarantined, corrupt lines — separately from that provenance. Written
+    once per snapshot; a replay of the same digest never rewrites it."""
+    mpath = (Path(state).expanduser() / _ARCHIVE_DIR /
+             f"{digest}.manifest.json")
+    if mpath.exists():
+        return
+    body = {"archive": f"{_ARCHIVE_DIR}/{digest}.jsonl", "sha256": digest,
+            "bytes": byte_count, "prior_meta_raw": prior_meta_raw,
+            "recorded_at": _now(), **counts}
+    _atomic_write_json(mpath, body)
+
+
 def migrate_observations(state_dir):
-    """One-time EXPLICIT identity migration (acceptance 2): v1 stores
-    embedded the generation in the dedupe identity, so the same logical
-    fault re-minted a row per generation (audit F2). Under v2 the rows
-    are rekeyed by observation_identity; generation-era duplicates
-    (same logical occurrence, different generations) coalesce to the
-    EARLIEST row — provenance lives on the kept row, the counts land in
-    the tick notes. Foreign-detector-version rows are preserved
-    verbatim. Never a silent discard; never a faked identity."""
+    """One-time EXPLICIT identity migration (acceptance 2; CSR-04/07
+    hardened): v1 stores embedded the generation in the dedupe identity,
+    so the same logical fault re-minted a row per generation (audit F2).
+    Under v2 the rows are rekeyed by observation_identity;
+    generation-era duplicates (same logical occurrence, different
+    generations) coalesce to the EARLIEST row — provenance lives on the
+    kept row, the counts land in the tick notes and the snapshot
+    manifest. BEFORE anything is replaced, the EXACT original store bytes
+    are archived under a non-overwriting content-addressed path owned by
+    the composer and fsynced ahead of the index switch (CSR-04): every
+    generation row, every old key, every corrupt line stays recoverable
+    byte-for-byte, and any crash replays without destroying anything.
+    Structurally malformed current rows are QUARANTINED as typed debt
+    (archived, counted — never rekeyed under an identity fabricated from
+    missing fields). Foreign-detector-version rows are preserved
+    verbatim. A store whose identity metadata is unknown, newer, or
+    malformed is HELD: never rewritten, never downgraded (CSR-07). Never
+    a silent discard; never a faked identity."""
     state = Path(state_dir).expanduser()
+    held, hold_note = _observation_store_held(state)
+    if held:
+        return [hold_note]
     meta_path = state / _STORE_META
-    if meta_path.exists():
-        try:
-            if json.loads(meta_path.read_text()).get(
-                    "identity_version") == _OBS_IDENTITY_VERSION:
-                return []
-        except Exception:
-            pass  # unreadable meta: re-migrate deterministically below
+    if meta_path.exists() and json.loads(meta_path.read_text()).get(
+            "identity_version") == _OBS_IDENTITY_VERSION:
+        return []
     opath = state / "observations.jsonl"
+    raw = opath.read_bytes() if opath.exists() else b""
+    prior_meta_raw = meta_path.read_text() if meta_path.exists() else None
+    try:
+        digest = _archive_store_snapshot(state, raw)
+    except RuntimeError as exc:
+        return [f"observation store HELD: {exc} (typed hold)"]
     rows, corrupt, foreign = load_observations_report(state)
-    rekeyed = coalesced = 0
+    rekeyed = coalesced = quarantined = 0
+    quarantine_faults = []
     seen, kept = set(), []
     for o in rows:
         if o.get("detector_version") != DETECTOR_VERSION:
             kept.append(o)  # foreign rows verbatim — identity preserved
             continue
-        k = observation_identity(o.get("source_kind"), o.get("lineage_id"),
-                                 o.get("span"), o.get("detector_id"),
-                                 o.get("detector_version"),
-                                 o.get("fingerprint"))
+        fault = _row_shape_fault(o)
+        if fault is not None:
+            quarantined += 1
+            quarantine_faults.append(fault)
+            continue  # typed debt — never a fabricated v2 identity
+        k = observation_identity(o["source_kind"], o["lineage_id"],
+                                 o["span"], o["detector_id"],
+                                 o["detector_version"], o["fingerprint"])
         if k in seen:
             coalesced += 1
             continue
@@ -785,19 +924,54 @@ def migrate_observations(state_dir):
         "dedupe_identity": "v2 (source_kind, lineage, span, detector, "
                            "version, fingerprint) — generation excluded",
         "migrated_at": _now()})
+    _migration_manifest(state, digest, len(raw), prior_meta_raw, {
+        "rows_parsed": len(rows), "rekeyed": rekeyed,
+        "coalesced_generation_duplicates": coalesced,
+        "quarantined_malformed": quarantined,
+        "corrupt_lines": corrupt, "foreign_version_rows": foreign,
+        "quarantine_faults": quarantine_faults})
     bits = []
     if rekeyed:
         bits.append(f"rekeyed {rekeyed} rows")
     if coalesced:
         bits.append(f"coalesced {coalesced} generation-era duplicates "
                     "(earliest kept — provenance lives on the kept row)")
+    if quarantined:
+        bits.append(f"{quarantined} malformed current rows quarantined "
+                    "(archived verbatim; typed debt, never a fabricated "
+                    "identity)")
     if corrupt:
         bits.append(f"{corrupt} corrupt store lines skipped (pre-existing, "
                     "counted, not silent)")
     if foreign:
         bits.append(f"{foreign} foreign-version rows preserved verbatim")
+    if raw:
+        bits.append(f"original store bytes archived (sha256 {digest[:16]}…"
+                    f", {_ARCHIVE_DIR}/, non-overwriting)")
     return [f"observation store migrated to identity v2: " + "; ".join(bits)] \
         if bits else []
+
+
+def load_observations_checked(state_dir=None):
+    """(groupable_rows, debt_notes, corrupt_count) — CSR-07: every stored
+    row is classified BEFORE grouping. A current-version row failing the
+    closed schema (missing detector_id, wrong-typed field, forged key) is
+    TYPED OBSERVABLE DEBT — counted, held verbatim in the store, never
+    silently grouped, never an exception. Foreign-version rows never
+    group (versions never mix) and stay preserved verbatim. Corrupt
+    lines keep their counted note."""
+    rows, corrupt, _foreign = load_observations_report(state_dir)
+    groupable, debts = [], []
+    for row in rows:
+        if row.get("detector_version") != DETECTOR_VERSION:
+            continue  # foreign rows never group; preserved verbatim
+        fault = validate_observation(row)
+        if fault is None:
+            groupable.append(row)
+        else:
+            debts.append(f"observation debt: malformed current row held "
+                         f"— {fault}")
+    return groupable, debts, corrupt
 
 
 def commit_batch(state_dir, entry, observations, cursor, stats):
@@ -806,7 +980,13 @@ def commit_batch(state_dir, entry, observations, cursor, stats):
     same-key record is an integrity error (sol t25 #2/#11)."""
     state = Path(state_dir).expanduser()
     state.mkdir(parents=True, exist_ok=True)
-    existing = {o["dedupe_key"]: o for o in load_observations(state)}
+    # keyed rows only: a malformed stored row (no usable key) is typed
+    # debt handled by the loaders — it can never key the uniqueness map
+    existing = {}
+    for o in load_observations(state):
+        k = o.get("dedupe_key")
+        if isinstance(k, str) and k:
+            existing[k] = o
     to_append = []
     for obs in observations:
         fault = validate_observation(obs)
@@ -1287,6 +1467,11 @@ def tick(sources, state_dir=None, max_bytes_per_source=262144,
               "prefix_verified_bytes": 0, "notes": []}
     with _state_lock(state):
         report["notes"].extend(migrate_observations(state))
+        # CSR-07 typed hold: an unknown/malformed identity version makes
+        # the store READ-ONLY — no source is read and nothing is committed
+        # until the version question settles, so a future-version store is
+        # never rewritten and no evidence is consumed into it.
+        store_held, _hold_note = _observation_store_held(state)
         manifest = census(sources, state_dir=state)
         report["census_sources"] = len(manifest["sources"])
         report["gaps"] = len(manifest["gaps"])
@@ -1336,6 +1521,13 @@ def tick(sources, state_dir=None, max_bytes_per_source=262144,
         served = 0
         for entry in order:
             if entry.get("status") != "ok":
+                continue
+            if store_held:
+                backlog += 1
+                report["notes"].append(
+                    f"source {entry['path']} deferred unread — observation "
+                    "store HELD (identity metadata unknown/malformed): no "
+                    "reads, no commits, store bytes preserved")
                 continue
             if pages >= max_pages:
                 backlog += 1
@@ -1612,7 +1804,18 @@ def tick(sources, state_dir=None, max_bytes_per_source=262144,
         _atomic_write_json(state / "scanned.json", sorted(scanned))
         report["scanned_lineages"] = len(scanned)
         report["enrolled_lineages"] = manifest.get("lineages", 0)
-        obs_rows, corrupt_n, _foreign = load_observations_report(state)
+        # CSR-07: rows are classified BEFORE grouping — a malformed
+        # current row is typed observable debt, never a KeyError out of
+        # the pattern grouper; foreign rows never group (versions never
+        # mix). Debt notes are capped (finite-bounds law).
+        obs_rows, debts, corrupt_n = load_observations_checked(state)
+        shown = debts[:_MAX_DEBT_NOTES]
+        if shown:
+            report["notes"].extend(shown)
+        if len(debts) > _MAX_DEBT_NOTES:
+            report["notes"].append(
+                f"observation debt: {len(debts) - _MAX_DEBT_NOTES} more "
+                "malformed current rows held (note cap)")
         if corrupt_n:
             report["notes"].append(
                 f"observation store: {corrupt_n} corrupt lines skipped "
