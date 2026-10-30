@@ -613,6 +613,48 @@ def t_c06_crlf_carried_hunt():
     shutil.rmtree(w)
 
 
+def t_c06_repeated_cr_framing_matrix():
+    import itertools
+    w = fresh("framing-matrix")
+    source = w / "source"
+    mismatches = []
+    for length in range(1, 6):
+        for symbols in itertools.product((b"x", b"\r", b"\n"), repeat=length):
+            payload = b"".join(symbols)
+            source.write_bytes(payload)
+            for bound in (1, 2, 3):
+                cursor, records = 0, []
+                for _ in range(len(payload) + 2):
+                    page = cp.read_page(source, cursor, bound, closed=True)
+                    records.extend(page.raw.splitlines(keepends=True))
+                    if page[2]: break
+                    if page[1] <= cursor:
+                        mismatches.append((payload, bound, "stuck")); break
+                    cursor = page[1]
+                if records != payload.splitlines(keepends=True):
+                    mismatches.append((payload, bound, records))
+    check("CRCRLF framing matrix preserves finite raw records at every page join",
+          not mismatches, repr(mismatches[:3]))
+    prefix = b"$ build\r\n$ build\r\r"
+    suffix = b"\nnoise-one\r\nNameError: name 'widget' is not defined\r\n"
+    source.write_bytes(prefix)
+    live, static = w / "live-state", w / "static-state"
+    first = cp.tick({"queue_run": live_src(source)}, state_dir=live,
+                    max_bytes_per_source=8, max_pages=20)
+    check("CRCRLF live ambiguous final CR does not claim full coverage",
+          first["coverage_complete"] == 0)
+    with source.open("ab") as stream: stream.write(suffix)
+    cp.tick({"queue_run": live_src(source)}, state_dir=live,
+            max_bytes_per_source=8, max_pages=20)
+    cp.tick({"queue_run": [str(source)]}, state_dir=static)
+    def records(state):
+        return sorted((o["detector_id"], o["span"], o["fingerprint"])
+                      for o in cp.load_observations(state))
+    check("CRCRLF live carried hunt equals identical same-inode static bytes",
+          records(live) == records(static) and len(records(live)) == 2)
+    shutil.rmtree(w)
+
+
 def main():
     t_c06_live_tail_completed_matches_static()
     t_c06_multiple_appends()
@@ -625,6 +667,7 @@ def main():
     t_c06_anchor_frontier_honesty()
     t_c06_operational_manifest()
     t_c06_crlf_carried_hunt()
+    t_c06_repeated_cr_framing_matrix()
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
     if FAIL:
         print("FAILED:", *FAIL, sep="\n  - ")

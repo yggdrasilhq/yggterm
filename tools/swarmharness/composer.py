@@ -764,8 +764,7 @@ def read_page(path, cursor=0, max_bytes=262144, closed=True):
                 if following:
                     raw += following
                     pos += len(following)
-                elif not closed:
-                    pending_cr = True
+                pending_cr = raw.endswith(b"\r") and (not closed or pos < size)
             pieces = raw.splitlines(keepends=True)  # byte record grammar
             if pieces and (pieces[0].endswith(b"\n")
                            or pieces[0].endswith(b"\r")):
