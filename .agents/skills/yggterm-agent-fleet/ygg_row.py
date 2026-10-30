@@ -224,6 +224,8 @@ def _claim_locked(a, store, n, name):
 def find_own(store, n=None):
     for p in sorted((store / "claims").glob("*.json")):
         c = load_json(p, {}) or {}
+        if not isinstance(c, dict):
+            continue  # opaque occupied seat; allocation reserves its filename
         if c.get("session") == this_session() and (n is None or c.get("n") == n):
             return c
     return None

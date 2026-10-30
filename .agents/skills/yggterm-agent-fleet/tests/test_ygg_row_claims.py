@@ -63,6 +63,16 @@ class ClaimTests(unittest.TestCase):
         p.symlink_to("absent")
         self.assertNotEqual(self.run_claim("new", "--id", "7.3").returncode, 0)
         self.assertTrue(p.is_symlink())
+    def test_nonobject_occupied_json_is_opaque(self):
+        for value in [[], ["future"], "future", 9, True, None]:
+            with self.subTest(value=value):
+                p = self.claims / "7.1.json"
+                raw = json.dumps(value).encode()
+                p.write_bytes(raw)
+                self.assertEqual(self.run_claim("new").returncode, 0)
+                self.assertEqual(p.read_bytes(), raw)
+                self.assertTrue((self.claims / "7.2.json").exists())
+                (self.claims / "7.2.json").unlink()
 
 if __name__ == "__main__":
     unittest.main()
