@@ -1,7 +1,8 @@
 # Composer logical observations and immutable evidence versions
 
-Status: proposed source contract for CSR09; no implementation or empirical
-benefit is claimed here. This note refines the existing swarmharness2 law
+Status: source contract for CSR09 with the canonical typed encodings an
+implementation must follow; no empirical benefit is claimed. The store
+implementation is tools/swarmharness/evidence_versions.py (schema 1). This note refines the existing swarmharness2 law
 that independent evidence, rather than repeated correlated representations,
 controls repair eligibility. It must receive architecture review before an
 implementation is delegated.
@@ -63,3 +64,76 @@ raw-offset, stream, tail, source-race, store and kernel controls must remain
 valid. This does not prove evaluator improvement, repair execution or system
 convergence. Those require the separate externally observed outcomes in the
 research evaluation protocol.
+
+## Canonical typed encodings (implementation contract, schema 1)
+
+Canonical serialization is `json.dumps(obj, sort_keys=True, separators=(",", ":"))`
+encoded UTF-8; H(x) is the lowercase hex SHA-256 of those bytes. Timestamps are
+provenance columns only and never enter any identity. Identities use the `L-`,
+`W-`, `C-`, `V-`, `U-`, `G-` prefixes followed by 64 hex characters.
+
+- **Logical occurrence L** = `L-` + H([source_kind, lineage_id, span,
+  detector_id, detector_version, fingerprint]) — the same six elements as the
+  composer's v2 logical identity, computed by the store so the store does not
+  import composer.py. Generation is never an element of L.
+- **Window W** = `W-` + H([source_kind, lineage_id, generation, start, end,
+  H(B)]) for a page of raw bytes B over the half-open interval [start, end).
+  When raw is None (an oversized or otherwise uncaptured page) the content
+  element is the literal sentinel string `"UNKNOWN"` — a typed gap — never a
+  fabricated byte digest. The window row stores `page_digest` = H(B) or the
+  sentinel and `raw_sha256` = H(B) or NULL, plus source_kind, lineage_id,
+  generation, start, end, created_at. For a typed gap the stored interval is
+  `[start, start)` — the uncaptured length is unknown and never invented.
+  Raw page text itself is never stored;
+  the digest is the durable binding. A window fact is written for every
+  consumed page, including pages that yield no observation.
+- **Context C** = `C-` + H(context_value), where context_value is the carried
+  detector context or `None` when the observation carries no context. A
+  context value must be bounded JSON (dict/list/scalars only, depth ≤ 4,
+  ≤ 64 nodes, strings ≤ 512 chars) or the call is refused; there is no
+  arbitrary-body serialization.
+- **References E** are the observation's explicit list of which bytes were
+  actually observed: always the current page's own window
+  (`{"kind": "window", "window_id": W}`) plus each explicit caller ref,
+  each ref one of exactly two closed shapes:
+  - `{"kind": "window", "window_id": W[, "expected_digest": hex64]}` — a
+    reference to a durable window that MUST already exist (or be the current
+    page's window). A missing window, or a supplied expected_digest that
+    contradicts the stored window digest, HOLDS the whole call
+    (EvidenceHeld): references never invent prior raw content.
+  - `{"kind": "unbound", "unbound_value": str|bytes}` — carried context with
+    no source-byte binding. It is hashed to `U-` + H(unbound_value) and only
+    the `{"kind": "unbound", "unbound_id": U}` encoding is persisted; the
+    unbound_value itself is never stored and never presented as a byte
+    digest. This is the typed UNKNOWN evidence.
+  E is ordered by the canonical encoding of its refs for identity purposes.
+- **Version V** = `V-` + H([L, sorted(E-canonical-encodings), C-digest]) —
+  an immutable evidence version of one observation over referenced windows.
+  The version row stores V, L, the observation's own window_id, context_id,
+  detector_id, detector_version, severity, status, span, fingerprint,
+  created_at, and its refs in a child table (one row per ref, in E order).
+- **Legacy record G** = `G-` + H(canonical(legacy row)). A legacy row is a
+  historical normalized observation (the composer's closed eleven-field row
+  shape) lacking original byte evidence; its `record_digest` is the digest of
+  the serialized normalized fields and is explicitly NOT a raw-source hash.
+  Its `raw_evidence` is the constant `unavailable`. Generation is taken from
+  the row or stored as `"UNKNOWN"`; none is backfilled.
+- **Source descriptor**: record_page accepts the current census entry
+  (project, source_kind, lineage_id, generation). Only source_kind,
+  lineage_id and generation are persisted; the project field — which is a
+  path — is validated and dropped, never stored.
+
+**Writes and holds.** record_page and record_legacy apply every insert inside
+one SQLite transaction (BEGIN IMMEDIATE, WAL); any validation, missing-window,
+digest-contradiction, storage or integrity fault raises EvidenceHeld and rolls
+the whole call back — original evidence is preserved and no cursor may advance
+on a held call. Exact replays create nothing (same IDs, zero created counts,
+timestamps untouched). A colliding ID with different stored payload is held,
+never overwritten. preflight opens read-only (`query_only`): absent store
+returns `{"status": "absent", "schema_version": None}` without creating or
+writing anything; a ready store returns schema_version; a corrupt, unreadable,
+or unknown/future-schema store raises EvidenceHeld and is never modified.
+read_summary returns bounded counts and at most `limit` recent window/version
+metadata rows for verification; it never contains raw page, prompt, token or
+credential text. Row counts are storage facts, never logical incident or
+lineage counts.
