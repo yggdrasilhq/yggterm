@@ -161,6 +161,7 @@ import hashlib
 import json
 import os
 import re
+import tempfile
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -892,7 +893,7 @@ _COUNT_KEYS = ("rows_parsed", "rekeyed", "coalesced_generation_duplicates",
                "foreign_version_rows")
 
 
-def _manifest_fault(body, digest, byte_count):
+def _manifest_fault(body, digest, byte_count, expected_counts=None):
     """Validation fault of an EXISTING migration ledger, or None when it
     is well-formed and matches this exact-digest replay (CSRSTORE-04):
     schema, archive path, digest, byte count and every typed count are
@@ -916,7 +917,40 @@ def _manifest_fault(body, digest, byte_count):
     if not isinstance(faults, list) or not all(
             isinstance(f, str) for f in faults):
         return "quarantine_faults is not a list of strings"
+    if expected_counts is not None:
+        for key in _COUNT_KEYS + ("quarantine_faults",):
+            if body[key] != expected_counts[key]:
+                return f"{key} contradicts archived records"
     return None
+
+
+def _quarantine_manifest(adir, digest, damaged):
+    """Publish complete evidence without replacing any occupied slot."""
+    content_digest = _sha(damaged)
+    for number in range(8):
+        suffix = "" if number == 0 else f"-{number}"
+        side = adir / f"{digest}.manifest.damaged-{content_digest}{suffix}.json"
+        if os.path.lexists(side):
+            if not side.is_symlink() and side.is_file() \
+                    and side.read_bytes() == damaged:
+                return side
+            continue
+        fd, temporary = tempfile.mkstemp(prefix=".quarantine-", dir=adir)
+        try:
+            with os.fdopen(fd, "wb") as stream:
+                stream.write(damaged)
+                stream.flush()
+                os.fsync(stream.fileno())
+            try:
+                os.link(temporary, side)
+            except FileExistsError:
+                continue
+            _fsync_dir(adir)
+            return side
+        finally:
+            os.unlink(temporary)
+    raise RuntimeError("all damaged-ledger recovery slots occupied; "
+                       "existing evidence retained, migration held")
 
 
 def _migration_manifest(state, digest, byte_count, prior_meta_raw, counts):
@@ -941,21 +975,13 @@ def _migration_manifest(state, digest, byte_count, prior_meta_raw, counts):
     if mpath.exists():
         damaged = mpath.read_bytes()
         try:
-            fault = _manifest_fault(json.loads(damaged), digest, byte_count)
+            fault = _manifest_fault(json.loads(damaged), digest, byte_count,
+                                    counts)
         except Exception:
             fault = "not valid JSON"
         if fault is None:
             return []  # validated ledger — left byte-for-byte untouched
-        side = adir / (f"{digest}.manifest.damaged-"
-                       f"{_sha(damaged)[:12]}.json")
-        if not side.exists() or _sha(side.read_bytes()) != _sha(damaged):
-            tmp = side.with_name(side.name + f".tmp{os.getpid()}")
-            with tmp.open("wb") as f:
-                f.write(damaged)
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(tmp, side)
-            _fsync_dir(adir)
+        side = _quarantine_manifest(adir, digest, damaged)
         _atomic_write_json(mpath, body)
         return [f"observation store: migration ledger at "
                 f"{_ARCHIVE_DIR}/{digest}.manifest.json was damaged "
@@ -1026,13 +1052,18 @@ def _migrate_observations(state_dir):
     # logical counts land durably in the manifest BEFORE any projection
     # or meta change, so an interruption at any later boundary replays
     # into an existing ledger instead of losing the counts.
-    manifest_notes = _migration_manifest(state, digest, len(raw),
-                                         prior_meta_raw, {
-        "rows_parsed": len(rows), "rekeyed": rekeyed,
-        "coalesced_generation_duplicates": coalesced,
-        "quarantined_malformed": quarantined,
-        "corrupt_lines": corrupt, "foreign_version_rows": foreign,
-        "quarantine_faults": quarantine_faults})
+    try:
+        manifest_notes = _migration_manifest(state, digest, len(raw),
+                                             prior_meta_raw, {
+            "rows_parsed": len(rows), "rekeyed": rekeyed,
+            "coalesced_generation_duplicates": coalesced,
+            "quarantined_malformed": quarantined,
+            "corrupt_lines": corrupt, "foreign_version_rows": foreign,
+            "quarantine_faults": quarantine_faults})
+    except (RuntimeError, OSError) as exc:
+        return [f"observation store HELD: migration ledger preservation "
+                f"failed ({type(exc).__name__}: {exc}); original store "
+                "and identity metadata unchanged"], True
     if opath.exists():
         _atomic_write_jsonl(opath, kept)
     _atomic_write_json(meta_path, {

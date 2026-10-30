@@ -672,6 +672,68 @@ def t_csrstore04_replay_validates_manifest_never_trusts():
     shutil.rmtree(w)
 
 
+def t_csrstore04_counts_and_quarantine_collisions():
+    w = fresh("counts-collisions")
+    state = w / "state"
+    rows = [v1_row("invented", "g1"), v1_row("invented", "g2")]
+    write_store(state, rows)
+    original = store_bytes(state)
+    cp.migrate_observations(state)
+    digest = cp._sha(original)
+    adir = state / cp._ARCHIVE_DIR
+    mp = adir / (digest + ".manifest.json")
+    valid = json.loads(mp.read_text())
+    invalid = dict(valid, rows_parsed=999, rekeyed=666,
+                   coalesced_generation_duplicates=888,
+                   quarantine_faults=["invented incompatible fact"])
+    damaged = json.dumps(invalid).encode()
+    mp.write_bytes(damaged)
+    # Both the old truncated name and new full-content-address slot are
+    # occupied by unrelated immutable bytes. Neither can be overwritten.
+    names = [adir / (digest + ".manifest.damaged-" +
+                     cp._sha(damaged)[:12] + ".json"),
+             adir / (digest + ".manifest.damaged-" +
+                     cp._sha(damaged) + ".json")]
+    for n, path in enumerate(names):
+        path.write_bytes(("existing evidence " + str(n)).encode())
+    before = {path: path.read_bytes() for path in names}
+    (state / "observations.jsonl").write_bytes(original)
+    (state / cp._STORE_META).unlink()
+    notes = cp.migrate_observations(state)
+    actual = json.loads(mp.read_text())
+    check("CSRSTORE-04 replay derives exact counts from archived rows",
+          all(actual[k] == valid[k] for k in cp._COUNT_KEYS)
+          and actual["quarantine_faults"] == valid["quarantine_faults"]
+          and any("contradicts archived" in n for n in notes))
+    check("CSRSTORE-05 occupied quarantine evidence is never overwritten",
+          all(path.read_bytes() == raw for path, raw in before.items()))
+    check("CSRSTORE-05 new exact damaged bytes survive under another slot",
+          any(path.read_bytes() == damaged
+              for path in adir.glob("*.manifest.damaged-*.json")))
+    preserved = {path: path.read_bytes() for path in adir.iterdir()
+                 if path.is_file()}
+    cp.migrate_observations(state)
+    check("CSRSTORE-05 healthy replay preserves every archive object",
+          all(path.read_bytes() == raw for path, raw in preserved.items()))
+    (state / "observations.jsonl").write_bytes(original)
+    (state / cp._STORE_META).unlink()
+    mp.write_bytes(damaged)
+    for number in range(8):
+        suffix = "" if number == 0 else "-" + str(number)
+        (adir / (digest + ".manifest.damaged-" + cp._sha(damaged)
+                 + suffix + ".json")).write_bytes(
+                     ("occupied slot " + str(number)).encode())
+    objects = {path: path.read_bytes() for path in adir.iterdir()
+               if path.is_file()}
+    notes, held = cp._migrate_observations(state)
+    check("CSRSTORE-05 exhausted recovery slots hold without evidence loss",
+          held and store_bytes(state) == original
+          and not (state / cp._STORE_META).exists()
+          and all(path.read_bytes() == raw for path, raw in objects.items())
+          and any("HELD" in n for n in notes))
+    shutil.rmtree(w)
+
+
 def main():
     t_csr04_archive_byte_identical()
     t_csr04_quarantine_malformed_on_migration()
@@ -689,6 +751,7 @@ def main():
     t_csrstore03_corrupt_bytes_typed_debt_never_crash()
     t_csrstore04_manifest_staged_before_switch()
     t_csrstore04_replay_validates_manifest_never_trusts()
+    t_csrstore04_counts_and_quarantine_collisions()
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
     if FAIL:
         print("FAILED:", *FAIL, sep="\n  - ")
