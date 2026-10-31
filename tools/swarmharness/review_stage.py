@@ -16,6 +16,7 @@ The staging receipt grants no launch permission. Controller policy/quota/budget/
 deny-latch checks remain mandatory future work. Fences contain local IO only.
 """
 from dataclasses import asdict, dataclass
+from contextlib import contextmanager
 import fcntl
 import json
 import os
@@ -25,7 +26,7 @@ import stat
 from . import review_jobs as jobs
 from . import review_snapshot as capture
 from .review_completion import Admission, Job, _parse, binding_digest
-from .session_review import SessionReview, _subject_identity
+from .session_review import SessionReview, _subject_identity, _now
 
 PROTOCOL = 'review-dispatch-v1'
 
@@ -59,6 +60,22 @@ class Bridge:
     def _checkpoint(self, phase):
         """Local fault-injection seam only; production does nothing."""
 
+    @contextmanager
+    def _review_lock(self, review):
+        fd = os.open(str(review.path) + '.lock',
+                     os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+        try:
+            info = os.fstat(fd)
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                    or info.st_nlink != 1 or info.st_mode & 0o022
+                    or info.st_size != 0):
+                raise Hold('unsafe_review_lock')
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            capture._syncdir(review.path.parent)
+            yield
+        finally:
+            os.close(fd)
+
     def stage(self, store, *, expected_revision, token, generation, operation_id,
               repo, request, editor_binding, config_digest, tier,
               completion_claim):
@@ -86,6 +103,9 @@ class Bridge:
     def _stage(self, store, revision, token, generation, operation, repo, request,
                binding, config, tier, claim):
         jobs._uuid(operation)
+        job_root = Path(store.root).resolve(strict=True)
+        if job_root == self.workspace or self.workspace in job_root.parents:
+            raise Hold('job_storage_inside_worker_workspace')
         s = store.get().state
         e = s['envelope']
         jobs._envelope(e)
@@ -156,51 +176,48 @@ class Bridge:
             acceptance_criteria=list(a.criteria), tier=tier,
             exemption_receipt=None, config_digest=a.config_digest,
             editor_binding=binding)
-        if not os.path.lexists(review.path):
-            if s['state'] != 'claimed':
-                raise Hold('missing_canonical_review')
-            review = SessionReview.create(base=base, review_id=s['review_id'],
-                worker=opened['worker'], acceptance_criteria=list(a.criteria),
-                tier=tier, config_digest=a.config_digest, editor_binding=binding)
-        capture._syncdir(base)
-        rows = review.rows
-        def body(row):
-            if (not isinstance(row.get('at'), str)
-                    or set(row) != set(opened if row.get('kind') == 'review_opened'
-                        else staged) | {'at', 'seq', 'prev_hash', 'record_hash'}):
-                raise Hold('unknown_chain_shape')
-            return {k: v for k, v in row.items()
-                    if k not in ('at', 'seq', 'prev_hash', 'record_hash')}
-        if not rows or body(rows[0]) != opened or len(rows) > 2:
-            raise Hold('conflicting_or_later_review')
-        self._checkpoint('after_open')
-        subject_digest, manifest = _subject_identity(snapshot.files)
-        local_job = Job(1, a.digest, subject_digest, s['review_id'])
-        mapping = dict(schema=1, artifact_id=snapshot.artifact_id,
-            local_job=asdict(local_job), local_job_digest=local_job.digest,
-            materialization=snapshot.materialization,
-            provenance_receipt=snapshot.provenance_receipt,
-            original_request_sha256=e['original_request_sha256'],
-            parent_ref=e['parent_ref'], plan_digest=jobs.digest(plan))
-        staged = dict(kind='snapshot_staged', round=1,
-            subject_digest=subject_digest, subject_manifest=manifest,
-            base_revision=request['commit'], evidence_manifest=mapping,
-            completion_claim=claim)
-        if len(rows) == 1:
-            if s['state'] != 'claimed':
-                raise Hold('missing_staged_chain')
-            review.stage_snapshot(subject=snapshot.files,
+        with self._review_lock(review):
+            # Public create/stage helpers reacquire a blocking lock. Use the
+            # canonical appender under this already-held, bounded fence for
+            # these two trusted controller events only; never editor verdicts.
+            if not os.path.lexists(review.path):
+                if s['state'] != 'claimed':
+                    raise Hold('missing_canonical_review')
+                review._chain_append(dict(opened, at=_now()))
+            capture._syncdir(base)
+            rows = review.rows
+            def body(row):
+                if (not isinstance(row.get('at'), str)
+                        or set(row) != set(opened if row.get('kind') == 'review_opened'
+                            else staged) | {'at', 'seq', 'prev_hash', 'record_hash'}):
+                    raise Hold('unknown_chain_shape')
+                return {k: v for k, v in row.items()
+                        if k not in ('at', 'seq', 'prev_hash', 'record_hash')}
+            if not rows or body(rows[0]) != opened or len(rows) > 2:
+                raise Hold('conflicting_or_later_review')
+            self._checkpoint('after_open')
+            subject_digest, manifest = _subject_identity(snapshot.files)
+            local_job = Job(1, a.digest, subject_digest, s['review_id'])
+            mapping = dict(schema=1, artifact_id=snapshot.artifact_id,
+                local_job=asdict(local_job), local_job_digest=local_job.digest,
+                materialization=snapshot.materialization,
+                provenance_receipt=snapshot.provenance_receipt,
+                original_request_sha256=e['original_request_sha256'],
+                parent_ref=e['parent_ref'], plan_digest=jobs.digest(plan))
+            staged = dict(kind='snapshot_staged', round=1,
+                subject_digest=subject_digest, subject_manifest=manifest,
                 base_revision=request['commit'], evidence_manifest=mapping,
                 completion_claim=claim)
-            rows = review.rows
-        if len(rows) != 2 or body(rows[1]) != staged:
-            raise Hold('conflicting_snapshot')
-        capture._syncdir(base)
-        self._checkpoint('after_stage')
-        # Job store shares its own stop fence; original CAS is never refreshed.
-        fd = os.open(str(review.path) + '.lock', os.O_RDWR | os.O_NOFOLLOW)
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            if len(rows) == 1:
+                if s['state'] != 'claimed':
+                    raise Hold('missing_staged_chain')
+                review._chain_append(dict(staged, at=_now()))
+                rows = review.rows
+            if len(rows) != 2 or body(rows[1]) != staged:
+                raise Hold('conflicting_snapshot')
+            capture._syncdir(base)
+            self._checkpoint('after_stage')
+            # Stop uses the job store fence; preserve the original stage CAS.
             final_rows = review.rows
             if (len(final_rows) != 2 or body(final_rows[0]) != opened
                     or body(final_rows[1]) != staged
@@ -209,8 +226,6 @@ class Bridge:
             receipt = store.change('stage', operation_id=operation,
                 expected_revision=revision, generation=generation, token=token,
                 data=dict(local_subject_digest=subject_digest))
-        finally:
-            os.close(fd)
         self._checkpoint('after_cas')
         current = receipt.state
         if (current['state'] != 'staged' or current['stopped']

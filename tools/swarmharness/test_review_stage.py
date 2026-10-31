@@ -1,7 +1,9 @@
 """Hermetic staging joins using real Git, job, snapshot and review components."""
 from dataclasses import asdict
+import fcntl
 import multiprocessing
 import os
+import shutil
 from pathlib import Path
 import subprocess
 import tempfile
@@ -117,6 +119,50 @@ class StageTest(unittest.TestCase):
         self.assertTrue(self.stage().reconciled)
         self.assertEqual(self.review().rows, rows)
 
+    def _assert_review_lock_refuses_and_recovers(self, phase):
+        def fault(current):
+            if current == phase:
+                raise RuntimeError('invented interrupted staging')
+        self.bridge._checkpoint = fault
+        with self.assertRaises(Hold):
+            self.stage()
+        self.bridge._checkpoint = lambda current: None
+        base = self.root / 'reviews'
+        base.mkdir(mode=0o700, exist_ok=True)
+        review = self.review()
+        before = review.path.read_bytes() if review.path.exists() else None
+        lock = Path(str(review.path) + '.lock')
+        descriptor = os.open(lock, os.O_RDWR | os.O_CREAT, 0o600)
+        context = multiprocessing.get_context('spawn')
+        output = context.Queue()
+        process = context.Process(target=run_bridge, args=(self.root,
+            self.snapshot_root, self.repo, self.store.root, self.args,
+            None, None, output))
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            inode = lock.stat().st_ino
+            process.start()
+            process.join(3)
+            self.assertFalse(process.is_alive(), 'canonical lock wait exceeded bound')
+            self.assertEqual(output.get(timeout=1), 'held')
+            self.assertEqual(lock.stat().st_ino, inode)
+            self.assertEqual(self.store.get().state['state'], 'claimed')
+            self.assertEqual(review.path.read_bytes() if review.path.exists() else None,
+                             before)
+        finally:
+            if process.is_alive():
+                process.terminate()
+                process.join(3)
+            os.close(descriptor)
+        self.assertEqual(self.stage().job_state['state'], 'staged')
+        self.assertEqual(len(self.review().rows), 2)
+
+    def test_held_review_creation_lock_refuses_and_recovers(self):
+        self._assert_review_lock_refuses_and_recovers('after_intent')
+
+    def test_held_existing_review_lock_refuses_and_recovers(self):
+        self._assert_review_lock_refuses_and_recovers('after_open')
+
     def test_preflight_mismatches_read_no_source(self):
         variants = [dict(token=uid()), dict(expected_revision=0), dict(generation=1),
             dict(config_digest='9' * 64), dict(editor_binding=dict(identity='other')),
@@ -126,6 +172,17 @@ class StageTest(unittest.TestCase):
             for variant in variants:
                 with self.subTest(variant=variant), self.assertRaises(Hold):
                     self.stage(**variant)
+        self.assertFalse((self.root / 'intent.json').exists())
+
+    def test_worker_owned_job_authority_is_refused_before_read_or_capture(self):
+        inside = self.repo / 'worker-owned-job'
+        shutil.copytree(self.store.root, inside)
+        store = jobs.Store(inside)
+        with patch.object(store, 'get', side_effect=AssertionError('authority read')):
+            with patch.object(self.snapshots, 'stage', side_effect=AssertionError('capture')):
+                with self.assertRaisesRegex(Hold, 'job_storage_inside_worker_workspace'):
+                    self.bridge.stage(store, **self.args)
+        self.assertEqual(store.get().state['state'], 'claimed')
         self.assertFalse((self.root / 'intent.json').exists())
 
     def test_identical_content_new_commit_retains_provenance(self):
