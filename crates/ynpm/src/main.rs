@@ -8636,6 +8636,7 @@ mod tests {
 // one skill over another, or that a skill is disabled but kept installed.
 
 #[derive(Serialize, Deserialize, Clone, Default)]
+#[serde(deny_unknown_fields)]
 struct SkillRecord {
     name: String,
     #[serde(default)]
@@ -8655,6 +8656,7 @@ struct SkillRecord {
 }
 
 #[derive(Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 struct SkillRegistry {
     version: u32,
     #[serde(default)]
@@ -8689,32 +8691,160 @@ fn today_stamp() -> String {
     format!("{y:04}-{m:02}-{d:02}")
 }
 
-fn load_skill_registry(paths: &Paths) -> SkillRegistry {
-    let path = skills_registry_file(paths);
-    if !path.exists() {
-        return SkillRegistry {
-            version: 1,
-            skills: Vec::new(),
-        };
+fn skill_file_metadata(path: &Path) -> anyhow::Result<Option<fs::Metadata>> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(value) => value,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => bail!("skill registry metadata unavailable; original retained"),
+    };
+    if !metadata.file_type().is_file() {
+        bail!("skill registry path is not an ordinary file; original retained");
     }
-    match std::fs::read(&path) {
-        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|_| SkillRegistry {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        // Logical root aliases are supported; a registry/lock file alias is
+        // not. These are cooperating-writer checks, not a same-UID sandbox.
+        let home = home_dir_from_environment().context("skill registry owner unavailable")?;
+        if metadata.uid() != fs::metadata(home)?.uid() || metadata.mode() & 0o022 != 0 {
+            bail!("skill registry file has unsafe ownership or permissions; retained");
+        }
+    }
+    Ok(Some(metadata))
+}
+
+fn skill_same_file(a: &fs::Metadata, b: &fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        a.dev() == b.dev() && a.ino() == b.ino()
+    }
+    #[cfg(not(unix))]
+    {
+        a.is_file() && b.is_file() && a.len() == b.len()
+            && a.modified().ok() == b.modified().ok()
+    }
+}
+
+fn validate_skill_registry(registry: &SkillRegistry) -> anyhow::Result<()> {
+    if registry.version != 1 {
+        bail!("unsupported skill registry version; original retained");
+    }
+    let mut names = std::collections::BTreeSet::new();
+    for record in &registry.skills {
+        if record.name.trim().is_empty() || matches!(record.name.as_str(), "." | "..")
+            || record.name.contains(['/', '\\', '\0']) || !names.insert(&record.name)
+        {
+            bail!("skill registry has ambiguous record identities; original retained");
+        }
+    }
+    Ok(())
+}
+
+fn load_skill_registry(paths: &Paths) -> anyhow::Result<SkillRegistry> {
+    let path = skills_registry_file(paths);
+    let Some(before) = skill_file_metadata(&path)? else {
+        return Ok(SkillRegistry {
             version: 1,
             skills: Vec::new(),
-        }),
-        Err(_) => SkillRegistry {
-            version: 1,
-            skills: Vec::new(),
-        },
+        });
+    };
+    let file = fs::File::open(&path).context("skill registry cannot be opened; retained")?;
+    if !skill_same_file(&before, &file.metadata()?) {
+        bail!("skill registry changed while opening; retained");
+    }
+    const LIMIT: u64 = 16 * 1024 * 1024;
+    let mut bytes = Vec::new();
+    file.take(LIMIT + 1).read_to_end(&mut bytes)
+        .context("skill registry read failed; original retained")?;
+    let after = skill_file_metadata(&path)?.context("skill registry disappeared; retained")?;
+    if bytes.len() as u64 > LIMIT || !skill_same_file(&before, &after)
+        || before.len() != after.len() || before.modified().ok() != after.modified().ok()
+    {
+        bail!("skill registry oversized or changed while reading; retained");
+    }
+    // Do not echo parser diagnostics: even malformed field names may contain
+    // private payload. Only absent storage can become an empty inventory.
+    let registry: SkillRegistry = serde_json::from_slice(&bytes)
+        .map_err(|_| anyhow::anyhow!("skill registry malformed or has unknown fields; original retained"))?;
+    validate_skill_registry(&registry)?;
+    Ok(registry)
+}
+
+fn lock_skill_registry(paths: &Paths, timeout: Duration) -> anyhow::Result<fs::File> {
+    fs::create_dir_all(skills_root(paths))?;
+    let path = skills_root(paths).join("registry.lock");
+    let before = skill_file_metadata(&path)?;
+    let mut options = fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options.open(&path).context("skill registry lock unavailable")?;
+    let current = skill_file_metadata(&path)?.context("skill registry lock disappeared")?;
+    if !skill_same_file(&current, &file.metadata()?)
+        || before.as_ref().is_some_and(|old| !skill_same_file(old, &current))
+    {
+        bail!("skill registry lock changed; refusing mutation");
+    }
+    let start = Instant::now();
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(fs::TryLockError::WouldBlock) if start.elapsed() < timeout => {
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Err(fs::TryLockError::WouldBlock) => bail!("skill registry busy; no mutation"),
+            Err(_) => bail!("skill registry locking unavailable; no mutation"),
+        }
     }
 }
 
 fn save_skill_registry(paths: &Paths, registry: &SkillRegistry) -> anyhow::Result<()> {
+    publish_skill_registry(paths, registry, |_| Ok(()))
+}
+
+fn publish_skill_registry(
+    paths: &Paths,
+    registry: &SkillRegistry,
+    mut boundary: impl FnMut(&str) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    validate_skill_registry(registry)?;
     let path = skills_registry_file(paths);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+    skill_file_metadata(&path)?;
+    let parent = path.parent().context("skill registry parent absent")?;
+    fs::create_dir_all(parent)?;
+    let temporary = parent.join(format!(".registry-{}-{}.tmp", std::process::id(), now_ms()));
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
     }
-    std::fs::write(&path, serde_json::to_vec_pretty(registry)?)?;
+    // A failed create does not own the occupied temporary path.
+    let mut file = options.open(&temporary)?;
+    let result = (|| -> anyhow::Result<()> {
+        boundary("before-write")?;
+        file.write_all(&serde_json::to_vec_pretty(registry)?)?;
+        file.sync_all()?;
+        drop(file);
+        boundary("before-rename")?;
+        skill_file_metadata(&path)?;
+        fs::rename(&temporary, &path)?;
+        boundary("after-rename")
+            .context("skill registry published but durability unconfirmed; retain and inspect before retry")?;
+        fs::File::open(parent).and_then(|directory| directory.sync_all())
+            .context("skill registry published but directory durability unconfirmed; retain and inspect before retry")?;
+        Ok(())
+    })();
+    // Never unlink the stable lock or a published generation. On failure the
+    // old registry remains, or the explicit durability error describes the
+    // visible new registry. Legacy binaries ignoring the lock are unqualified.
+    let _ = fs::remove_file(&temporary);
+    result?;
     Ok(())
 }
 
@@ -8861,7 +8991,12 @@ fn verb_skills(paths: &Paths, args: &[String]) -> anyhow::Result<()> {
             "skills needs a subcommand: scan | list [--json] | info <name> | register <name> --home PATH [--summary S] [--notes N] [--tag T] | install <name> | note <name> <text> | enable <name> | disable <name> | check"
         );
     };
-    let mut registry = load_skill_registry(paths);
+    let _registry_lock = if matches!(sub.as_str(), "scan" | "register" | "install" | "note" | "enable" | "disable") {
+        Some(lock_skill_registry(paths, Duration::from_secs(3))?)
+    } else {
+        None
+    };
+    let mut registry = load_skill_registry(paths)?;
     match sub.as_str() {
         "scan" => {
             let mut dirs = Vec::new();
@@ -9290,6 +9425,156 @@ mod f9_retention_tests {
         assert!(middle.exists(), "eviction stops once under the cap");
         assert!(fresh.exists(), "fresh content is never the first evicted");
         assert_eq!(outcome.reclaimed_bytes, 100);
+    }
+
+    fn registry_fixture() -> SkillRegistry {
+        SkillRegistry { version: 1, skills: vec![SkillRecord {
+            name: "fixture-route".to_string(), home: "".to_string(),
+            summary: "fixture summary".to_string(), notes: "retained notes".to_string(),
+            tags: vec!["fixture".to_string()], disabled: true,
+            installed: vec!["fixture-copy".to_string()], updated: "fixture-date".to_string(),
+        }] }
+    }
+
+    #[test]
+    fn skill_registry_only_absent_state_becomes_empty() {
+        let sandbox = Sandbox::new("skill-absent");
+        let paths = sandbox.paths();
+        let empty = load_skill_registry(&paths).unwrap();
+        assert_eq!(empty.version, 1);
+        assert!(empty.skills.is_empty());
+        assert!(!skills_registry_file(&paths).exists());
+    }
+
+    #[test]
+    fn skill_registry_corrupt_future_and_unknown_data_are_retained() {
+        let sandbox = Sandbox::new("skill-unknown");
+        let paths = sandbox.paths();
+        fs::create_dir_all(skills_root(&paths)).unwrap();
+        let file = skills_registry_file(&paths);
+        for bytes in [
+            "not-json PRIVATE-SENTINEL", "", "null", "[]", "false", "{}",
+            r#"{"version":99,"skills":[]}"#,
+            r#"{"version":1,"version":1,"skills":[]}"#,
+            r#"{"version":1,"skills":[],"PRIVATE-SENTINEL":true}"#,
+            r#"{"version":1,"skills":[{"name":"fixture","PRIVATE-SENTINEL":true}]}"#,
+            r#"{"version":1,"skills":[{"name":"duplicate"},{"name":"duplicate"}]}"#,
+            r#"{"version":1,"skills":[{"name":"../outside"}]}"#,
+        ] {
+            fs::write(&file, bytes).unwrap();
+            let error = load_skill_registry(&paths).err().expect("must refuse");
+            assert!(!format!("{error:#}").contains("PRIVATE-SENTINEL"));
+            assert_eq!(fs::read(&file).unwrap(), bytes.as_bytes());
+            assert!(verb_skills(&paths, &["note".into(), "fixture".into(), "change".into()]).is_err());
+            assert_eq!(fs::read(&file).unwrap(), bytes.as_bytes());
+        }
+    }
+
+    #[test]
+    fn skill_registry_valid_record_roundtrips_all_metadata() {
+        let sandbox = Sandbox::new("skill-roundtrip");
+        let paths = sandbox.paths();
+        let _guard = lock_skill_registry(&paths, Duration::ZERO).unwrap();
+        let registry = registry_fixture();
+        save_skill_registry(&paths, &registry).unwrap();
+        let actual = load_skill_registry(&paths).unwrap();
+        assert_eq!(serde_json::to_value(actual).unwrap(), serde_json::to_value(registry).unwrap());
+    }
+
+    #[test]
+    fn skill_registry_contention_refuses_without_replacing_lock_or_data() {
+        let sandbox = Sandbox::new("skill-contention");
+        let paths = sandbox.paths();
+        let guard = lock_skill_registry(&paths, Duration::ZERO).unwrap();
+        save_skill_registry(&paths, &registry_fixture()).unwrap();
+        let before = fs::read(skills_registry_file(&paths)).unwrap();
+        let lock_before = fs::metadata(skills_root(&paths).join("registry.lock")).unwrap();
+        assert!(lock_skill_registry(&paths, Duration::ZERO).is_err());
+        assert_eq!(fs::read(skills_registry_file(&paths)).unwrap(), before);
+        assert!(skill_same_file(&lock_before, &fs::metadata(skills_root(&paths).join("registry.lock")).unwrap()));
+        drop(guard);
+        assert!(lock_skill_registry(&paths, Duration::ZERO).is_ok());
+    }
+
+    #[test]
+    fn skill_registry_atomic_faults_keep_old_or_explicit_visible_result() {
+        let sandbox = Sandbox::new("skill-faults");
+        let paths = sandbox.paths();
+        let _guard = lock_skill_registry(&paths, Duration::ZERO).unwrap();
+        let mut newer = registry_fixture();
+        newer.skills[0].notes = "new complete notes".to_string();
+        for stop in ["before-write", "before-rename", "after-rename"] {
+            save_skill_registry(&paths, &registry_fixture()).unwrap();
+            let old = fs::read(skills_registry_file(&paths)).unwrap();
+            let error = publish_skill_registry(&paths, &newer, |where_at| {
+                if where_at == stop { bail!("synthetic storage fault"); }
+                Ok(())
+            }).err().unwrap();
+            let actual = fs::read(skills_registry_file(&paths)).unwrap();
+            if stop == "after-rename" {
+                assert!(format!("{error:#}").contains("published but durability unconfirmed"));
+                assert_eq!(actual, serde_json::to_vec_pretty(&newer).unwrap());
+            } else { assert_eq!(actual, old); }
+            assert!(!fs::read_dir(skills_root(&paths)).unwrap().any(|entry|
+                entry.unwrap().file_name().to_string_lossy().ends_with(".tmp")));
+        }
+    }
+
+    #[test]
+    fn skill_registry_parallel_mutations_preserve_distinct_records_and_notes() {
+        let sandbox = Sandbox::new("skill-concurrent");
+        let paths = sandbox.paths();
+        verb_skills(&paths, &["register".into(), "shared".into(), "--home".into(), sandbox.home.display().to_string()]).unwrap();
+        std::thread::scope(|scope| {
+            for index in 0..8 {
+                let home = sandbox.home.clone();
+                scope.spawn(move || {
+                    let paths = Paths::new(home.clone());
+                    verb_skills(&paths, &["register".into(), format!("worker-{index}"), "--home".into(), home.display().to_string()]).unwrap();
+                    verb_skills(&paths, &["note".into(), "shared".into(), format!("note-{index}")]).unwrap();
+                });
+            }
+        });
+        let registry = load_skill_registry(&paths).unwrap();
+        assert_eq!(registry.skills.len(), 9);
+        let shared = registry.skills.iter().find(|record| record.name == "shared").unwrap();
+        for index in 0..8 { assert!(shared.notes.contains(&format!("note-{index}"))); }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn skill_registry_file_and_lock_symlinks_are_retained_not_followed() {
+        use std::os::unix::fs::symlink;
+        let sandbox = Sandbox::new("skill-symlink");
+        let paths = sandbox.paths();
+        fs::create_dir_all(skills_root(&paths)).unwrap();
+        let outside = sandbox.home.join("outside.json");
+        let sentinel = b"PRIVATE fixture original";
+        fs::write(&outside, sentinel).unwrap();
+        let registry = skills_registry_file(&paths);
+        symlink(&outside, &registry).unwrap();
+        assert!(load_skill_registry(&paths).is_err());
+        assert!(save_skill_registry(&paths, &registry_fixture()).is_err());
+        assert_eq!(fs::read(&outside).unwrap(), sentinel);
+        fs::remove_file(&registry).unwrap();
+        symlink(&outside, skills_root(&paths).join("registry.lock")).unwrap();
+        assert!(lock_skill_registry(&paths, Duration::ZERO).is_err());
+        assert_eq!(fs::read(&outside).unwrap(), sentinel);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn skill_registry_supports_logical_root_alias_and_keeps_lock_inode() {
+        use std::os::unix::fs::symlink;
+        let sandbox = Sandbox::new("skill-alias");
+        fs::create_dir_all(sandbox.home.join(".ygg")).unwrap();
+        symlink(".ygg", sandbox.home.join(".yggterm")).unwrap();
+        let paths = sandbox.paths();
+        let guard = lock_skill_registry(&paths, Duration::ZERO).unwrap();
+        let before = guard.metadata().unwrap();
+        save_skill_registry(&paths, &registry_fixture()).unwrap();
+        assert!(sandbox.home.join(".ygg/skills/registry.json").is_file());
+        assert!(skill_same_file(&before, &fs::metadata(skills_root(&paths).join("registry.lock")).unwrap()));
     }
 
     #[test]
