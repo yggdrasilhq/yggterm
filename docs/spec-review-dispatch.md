@@ -63,13 +63,25 @@ claims are recoverable only under the declared serialized recovery contract.
 Owner stop fences claims, launch, verdict intake and task application.
 
 Before the first external submission, durably commit an invocation-intent event
-with its attempt/token and then recheck the launch fence. A crash after that
-intent, including before a result/process receipt is written, means the request
-may have been submitted. Absence of an invocation-started receipt is not proof
-of no call. Recovery requires authoritative reconciliation or remains suspended;
-lease expiry cannot turn that ambiguity into a duplicate launch. After submission,
-owner stop cancels through the native adapter where supported, records unresolved
-remote execution explicitly, and prevents verdict application and new calls.
+with its attempt/token. Submission authorization is a second durable transition,
+serialized on the SAME fence as owner stop: compare the stop generation and
+attempt/token, then commit `submission-authorized`. This commit is the logical
+launch linearization point. If stop commits first, authorization fails and no
+transport call is permitted. If authorization commits first, this attempt is
+already logically in flight; stop cancels it where supported, even if network
+emission has not yet begun. It cannot guarantee that an already-authorized
+external request emits no bytes. An adapter may use a broker held behind a
+local start barrier until authorization commits and the fence releases. It must
+not make network/model calls while holding the fence. A post-stop attempt needs
+new authorization after an explicit authorized resume.
+
+A crash after invocation intent, including before authorization, is unresolved
+unless the serialized journal and native broker prove it could not have
+submitted. A crash after authorization, including before a result/process
+receipt, means the request may have been submitted. Absence of a started receipt
+is not proof of no call. Recovery requires authoritative reconciliation or stays
+suspended; lease expiry cannot authorize a duplicate. Stop prevents verdict
+application and new calls and records unresolved remote execution explicitly.
 
 ## Stage and invoke
 
@@ -133,6 +145,29 @@ Only the matching admitted milestone can move to applied/completed.
 REVISE retains the chain and creates a repair continuation through the existing
 trusted packet/permission gate. A fresh worker receives original criteria,
 findings, exact subject and full history; its assertion cannot close a finding.
+
+Succession creates a NEW physical dispatch, actual worker native identity,
+admission, job and review chain. Never rewrite an old review opening to name
+the successor or reuse its acceptance for a different worker. The sealed
+successor envelope binds the root request/parent obligation, predecessor job
+and authenticated review head, complete unresolved finding references, unchanged
+criterion definitions and permitted source scope. Admission.prompt_sha256 is
+the actual queued instruction body for this attempt; a derived repair brief
+has a new hash, while the original owner request retains its separate binding.
+
+A qualified succession bridge authenticates predecessor findings and obtains
+explicit authenticated closure of each inherited reference by the successor's
+independent reviewer, binding predecessor head/finding/criterion to current
+subject and review head. A fresh chain's empty findings never close inherited
+debt. The new editor must differ from every contributing worker native identity
+in that obligation's lineage. Criterion-owned deferral rules remain unchanged.
+Append an evidence edge to the work ledger; retain the old REVISE subject and
+history as failed/superseded evidence rather than repainting it COMPLETE.
+SessionReview has no worker-rebinding or implicit finding-import authority.
+Until this explicit bridge and its controls are implemented, automatic successor
+dispatch/application HOLDs with the work and inherited findings retained. The
+initial dispatcher cannot claim a general repair loop from one source approval.
+
 Accepted work emits a bounded evidence/outcome record for the experience library.
 A variant or rubric is not credited as an improvement without its declared
 prospective/held-out outcome comparison. Missing automation stays visible.
@@ -145,6 +180,13 @@ at every boundary, changed dispatch under a reused ordinal, malformed storage,
 concurrent claims, partial durable writes, launch-before-receipt crashes,
 quota/storage suspensions, late results from old attempts and unavailable native
 sessions. Repeated drain must not duplicate model calls or task effects.
+Race stop against submission authorization with deterministic barriers: stop
+winning yields zero calls; authorization winning yields one tracked in-flight
+attempt with cancellation/ambiguity, never application after stop. Kill before
+and after intent, authorization and broker release, then restart drain. For
+succession, change worker/dispatch while retaining the request: old opening or
+receipt reuse and missing inherited debt HOLD. Verify inherited closures and
+actual independent native identities before a successor can apply.
 
 First qualify storage/leases, then staging/activated-policy resolution, the
 native invocation adapter, and finally the queue CAS hook. Enable one admitted
