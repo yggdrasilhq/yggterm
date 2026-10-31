@@ -218,6 +218,18 @@ class OwnerTests(unittest.TestCase):
                 self.gc()
                 self.assertTrue(path.exists())
 
+    def test_oversized_pid_never_reaches_kernel_conversion(self):
+        path, original = self.expired_dead()
+        for pid in (2**31, 10**400):
+            row.write_json(path, {**original, "pid": pid})
+            with patch.object(row.os, "pidfd_open", side_effect=AssertionError("invalid PID reached kernel")):
+                self.assertEqual(row.process_liveness(row.read_record(path))["state"], "UNKNOWN")
+                self.gc()
+            self.cli("list")
+            self.cli("list", "--json")
+            self.assertTrue(path.exists())
+            self.cli("heartbeat", "7.1", "--pid", str(pid), ok=False)
+
     def test_gc_only_expired_known_dead_explicitly_unpinned(self):
         path, original = self.expired_dead()
         for directory in (self.claims, self.store / "bridges"):

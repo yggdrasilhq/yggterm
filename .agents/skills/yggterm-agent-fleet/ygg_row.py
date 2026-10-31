@@ -122,7 +122,7 @@ def process_sample(pid):
 def bind_process(pid):
     if pid is None:
         return {"pid": None, "process_owner": None}
-    if type(pid) is not int or pid <= 0:
+    if type(pid) is not int or not 0 < pid <= 2**31 - 1:
         sys.exit("⛔ --pid must be a positive live same-UID Linux supervisor PID")
     try:
         identity = local_identity()
@@ -142,7 +142,7 @@ def process_liveness(record):
     pid, owner = record.get("pid"), record.get("process_owner")
     if pid is None and owner is None:
         return result("UNBOUND", "no_explicit_supervisor")
-    if type(pid) is not int or pid <= 0 or not isinstance(owner, dict):
+    if type(pid) is not int or not 0 < pid <= 2**31 - 1 or not isinstance(owner, dict):
         return result("UNKNOWN", "legacy_or_invalid_binding")
     if (not isinstance(owner.get("starttime"), str)
             or not owner["starttime"].isdigit()):
