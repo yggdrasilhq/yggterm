@@ -45,7 +45,7 @@ Usage:
                                          [--session u] [--model m] [--pid p]
 """
 
-import argparse, fcntl, json, math, os, re, socket, subprocess, sys, tempfile, time
+import argparse, errno, fcntl, json, math, os, re, socket, subprocess, sys, tempfile, time
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -101,8 +101,10 @@ def local_identity():
     boot = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
     if not boot:
         raise OSError("missing_boot_identity")
+    if os.readlink("/proc/self") != str(os.getpid()):
+        raise OSError("procfs_pid_namespace_mismatch")
     return {"platform": "linux", "host": socket.gethostname(), "boot_id": boot,
-            "uid": os.getuid()}
+            "uid": os.getuid(), "pid_namespace": os.readlink("/proc/self/ns/pid")}
 
 
 def process_sample(pid):
@@ -154,9 +156,19 @@ def process_liveness(record):
         try:
             sample = process_sample(pid)
         except FileNotFoundError:
-            # A functioning local procfs is required to interpret ENOENT.
-            process_sample(os.getpid())
-            return result("DEAD", "bound_pid_absent")
+            # Procfs absence is not death: a mount can hide only this target.
+            # A namespace-bound kernel PID lookup is an independent witness.
+            if not hasattr(os, "pidfd_open"):
+                return result("UNKNOWN", "no_positive_death_witness")
+            try:
+                fd = os.pidfd_open(pid)
+            except OSError as exc:
+                if exc.errno == errno.ESRCH:
+                    return result("DEAD", "kernel_pid_absent")
+                return result("UNKNOWN", "kernel_pid_visibility_unknown")
+            else:
+                os.close(fd)
+                return result("UNKNOWN", "kernel_pid_exists_procfs_hidden")
         if sample["uid"] != identity["uid"]:
             return result("UNKNOWN", "different_uid")
         if sample["starttime"] != owner["starttime"]:
@@ -172,7 +184,9 @@ def freshness(record):
     hb = record.get("heartbeat")
     ttl = record.get("ttl_hours", DEFAULT_TTL_HOURS)
     if (record.get("_record_error") or type(hb) not in (int, float)
-            or type(ttl) not in (int, float) or not math.isfinite(hb)
+            or type(ttl) not in (int, float)
+            or abs(hb) > 2**63 - 1 or abs(ttl) > 2**63 - 1
+            or not math.isfinite(hb)
             or not math.isfinite(ttl) or hb <= 0 or ttl <= 0):
         return "UNKNOWN"
     age = time.time() - hb

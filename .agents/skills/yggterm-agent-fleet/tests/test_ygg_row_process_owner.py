@@ -143,7 +143,7 @@ class OwnerTests(unittest.TestCase):
         with patch.object(row, "process_sample", return_value={"uid": os.getuid() + 1, "state": "S", "starttime": "1"}):
             with self.assertRaises(SystemExit):
                 row.bind_process(p.pid)
-        for key in ("host", "boot_id", "uid", "platform"):
+        for key in ("host", "boot_id", "uid", "platform", "pid_namespace"):
             other = json.loads(json.dumps(c))
             other["process_owner"][key] = "foreign"
             self.assertEqual(row.process_liveness(other)["state"], "UNKNOWN")
@@ -180,6 +180,43 @@ class OwnerTests(unittest.TestCase):
         self.assertIn("EXPIRED", output)
         self.assertIn("ALIVE", output)
         self.assertNotIn("REAPED", output)
+
+    def test_hidden_live_target_is_unknown_and_gc_retains_it(self):
+        p = self.process()
+        path = self.claim(p.pid)
+        record = row.read_record(path)
+        record["heartbeat"] = time.time() - 90000
+        row.write_json(path, record)
+        sample = row.process_sample
+        def hidden(pid):
+            if pid == p.pid:
+                raise FileNotFoundError()
+            return sample(pid)
+        with patch.object(row, "process_sample", side_effect=hidden):
+            self.assertEqual(row.process_liveness(record)["state"], "UNKNOWN")
+            self.gc()
+        self.assertTrue(path.exists())
+        self.assertIsNone(p.poll())
+
+    def test_procfs_namespace_mismatch_refuses_binding_and_liveness(self):
+        p = self.process()
+        record = row.read_record(self.claim(p.pid))
+        real = row.os.readlink
+        with patch.object(row.os, "readlink", side_effect=lambda path: "foreign" if str(path) == "/proc/self" else real(path)):
+            with self.assertRaises(SystemExit):
+                row.bind_process(p.pid)
+            self.assertEqual(row.process_liveness(record)["state"], "UNKNOWN")
+
+    def test_oversized_numbers_are_unknown_in_all_views_and_gc(self):
+        path, original = self.expired_dead()
+        for key in ("heartbeat", "ttl_hours"):
+            for value in (10**400, -(10**400), float("inf"), float("nan")):
+                row.write_json(path, {**original, key: value})
+                self.assertEqual(row.freshness(row.read_record(path)), "UNKNOWN")
+                self.cli("list")
+                self.cli("list", "--json")
+                self.gc()
+                self.assertTrue(path.exists())
 
     def test_gc_only_expired_known_dead_explicitly_unpinned(self):
         path, original = self.expired_dead()
