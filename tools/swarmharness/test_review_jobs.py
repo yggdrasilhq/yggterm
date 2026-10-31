@@ -107,6 +107,20 @@ class JobsTest(unittest.TestCase):
                          ['claimed', 'held'])
         self.assertEqual(self.store.get().state['revision'], 1)
 
+    def test_busy_fence_holds_without_waiting_or_mutating(self):
+        import fcntl
+        before = self.tree_bytes()
+        with (self.root / 'fence').open('r+') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            for operation in [self.store.get, lambda: self.store.admit(self.e),
+                              lambda: self.store.change('claim', operation_id=uid(),
+                                  expected_revision=0, generation=0,
+                                  data={'lease_seconds': 5})]:
+                with self.assertRaisesRegex(Hold, '^store_busy$'):
+                    operation()
+        self.assertEqual(self.tree_bytes(), before)
+        self.assertEqual(self.store.get().state['revision'], 0)
+
     def test_explicit_recovery_fences_old_worker(self):
         self.change('claim', {'lease_seconds': 1})
         old = self.s['attempt'].copy()

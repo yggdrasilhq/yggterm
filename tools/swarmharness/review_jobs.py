@@ -240,7 +240,10 @@ class Store:
             flags = os.O_RDWR | os.O_NOFOLLOW
             fd = os.open(lock, flags | (os.O_CREAT | os.O_EXCL if fresh else 0), 0o600)
             self._private(lock)
-            fcntl.flock(fd, fcntl.LOCK_EX)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise Hold('store_busy') from None
             for p in self.root.iterdir():
                 if p.name not in ('fence', 'store.sqlite', 'store.sqlite-journal'):
                     raise Hold('unknown_storage')
