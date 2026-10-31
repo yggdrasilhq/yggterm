@@ -1,4 +1,4 @@
-"""Standalone immutable evidence-version store (CSR09, schema 1).
+"""Standalone immutable evidence-version store (CSR09, schema 2).
 
 Durable facts for composer evidence: every consumed raw page window W
 (even when it yields no observation), every observation version V that
@@ -47,7 +47,7 @@ import time
 import urllib.request
 import uuid
 
-SCHEMA_VERSION = "1"
+SCHEMA_VERSION = "2"
 DB_NAME = "evidence-versions.db"
 LOCK_NAME = "evidence-versions.lock"
 
@@ -73,7 +73,7 @@ _SUMMARY_LIMIT_MAX = 200
 # Closed typed context domain: values admit NO free text. The only legal
 # strings are content digests (64 lowercase hex) or store identities
 # (W-/V-/C-/U-/L-/G- prefixed). Floats are excluded: canonical float
-# formatting is not part of the schema-1 typed projection.
+# formatting is not part of the schema-2 typed projection.
 _DIGEST_RE = re.compile(r"\A[0-9a-f]{64}\Z")
 _IDENTITY_RE = re.compile(r"\A[WVCLUG]-[0-9a-f]{64}\Z")
 _CONTEXT_MAX_INT = 2 ** 63 - 1
@@ -89,8 +89,9 @@ _WINDOW_COLS = ("window_id", "source_kind", "lineage_id", "generation",
 
 class EvidenceHeld(Exception):
     """An unknown, corrupt, contradictory or storage-faulted evidence
-    condition. The call made no durable change; the caller must hold
-    (never advance a cursor or claim success) on this."""
+    condition. No success receipt authorizes cursor advance. The fact
+    transaction is rolled back; a complete empty genesis or an uncertain
+    namespace publication may remain and must be retained for replay."""
 
 
 def _canonical(obj):
@@ -132,7 +133,7 @@ def _validate_context_value(value, path="context", depth=0):
         return 1
     if isinstance(value, float):
         raise EvidenceHeld(
-            f"{path}: floats are outside the schema-1 typed projection")
+            f"{path}: floats are outside the schema-2 typed projection")
     if isinstance(value, str):
         if _DIGEST_RE.match(value) or _IDENTITY_RE.match(value):
             return 1
@@ -230,6 +231,13 @@ _SCHEMA_STATEMENTS = [
 ]
 
 
+_SCHEMA_STATEMENTS += [
+    "CREATE INDEX IF NOT EXISTS ix_versions_window ON versions(window_id)",
+    "CREATE INDEX IF NOT EXISTS ix_versions_context ON versions(context_id)",
+    "CREATE INDEX IF NOT EXISTS ix_version_refs_window ON version_refs(window_id)",
+]
+
+
 def _db_path(state_dir):
     return os.path.join(state_dir, DB_NAME)
 
@@ -271,13 +279,14 @@ def _writable_connect(path):
 
 def _read_schema_version(conn):
     normalize = lambda text: " ".join(text.replace("IF NOT EXISTS ", "").split()).lower()
-    expected = {re.search(r"CREATE TABLE IF NOT EXISTS (\w+)", statement).group(1):
-                normalize(statement) for statement in _SCHEMA_STATEMENTS}
+    expected = {}
+    for statement in _SCHEMA_STATEMENTS:
+        kind, name = re.search(r"CREATE (TABLE|INDEX) IF NOT EXISTS (\w+)", statement).groups()
+        expected[(kind.lower(), name)] = normalize(statement)
     try:
         objects = conn.execute("SELECT type, name, sql FROM sqlite_master "
                                "WHERE name NOT LIKE 'sqlite_%'").fetchall()
-        if any(kind != "table" for kind, _name, _sql in objects) \
-                or {name: normalize(sql or "") for _kind, name, sql in objects} != expected:
+        if {(kind, name): normalize(sql or "") for kind, name, sql in objects} != expected:
             raise EvidenceHeld("version store table/column/dependency schema is unknown; held")
         row = conn.execute(
             "SELECT value FROM meta WHERE key='schema_version'").fetchone()
@@ -321,7 +330,11 @@ def _genesis(state_dir):
     leave only an unreferenced temp file — never a partial store."""
     path = _db_path(state_dir)
     tmp = f"{path}.genesis-{os.getpid()}-{uuid.uuid4().hex}"
+    created = False
     try:
+        fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        created = True
+        os.close(fd)
         conn = sqlite3.connect(tmp, isolation_level=None)
         try:
             conn.execute("PRAGMA journal_mode=DELETE")
@@ -348,7 +361,7 @@ def _genesis(state_dir):
     except (sqlite3.Error, OSError) as exc:
         raise EvidenceHeld(f"version store genesis fault: {exc}") from exc
     finally:
-        if os.path.exists(tmp):
+        if created and os.path.exists(tmp):
             os.unlink(tmp)
 
 
@@ -364,9 +377,16 @@ class _WriteSession:
         self.conn = None
 
     def __enter__(self):
-        os.makedirs(self.state_dir, exist_ok=True)
+        path = _db_path(self.state_dir)
+        # A pre-existing unknown DB must hold before even creating our lock.
+        # Recheck after locking too; the first read does not grant write scope.
+        if os.path.lexists(path):
+            if os.path.islink(path) or not os.path.isfile(path):
+                raise EvidenceHeld("version store is linked or nonregular; held")
+            _readonly_validate(path)
+        os.makedirs(self.state_dir, mode=0o700, exist_ok=True)
         lock_path = os.path.join(self.state_dir, LOCK_NAME)
-        self.lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        self.lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
         deadline = time.monotonic() + _LOCK_TIMEOUT_S
         while True:
             try:
@@ -390,6 +410,11 @@ class _WriteSession:
                         "absence cannot be proven; held, nothing initialized")
                 if not _genesis(self.state_dir):
                     _readonly_validate(path)  # lost publication race
+            try:
+                _dsync_dir(self.state_dir)
+            except OSError as exc:
+                raise EvidenceHeld("store namespace is visible but its "
+                                   "durability is unconfirmed; held for replay") from exc
             self.conn = _writable_connect(path)
             return self.conn
         except Exception:
@@ -650,6 +675,10 @@ def _validate_observation_span(conn, source, observation, refs):
 
 
 def _ensure_context_row(conn, context_id, context, created, now):
+    if conn.execute("SELECT 1 FROM contexts WHERE context_id=?", (context_id,)).fetchone() is None \
+            and conn.execute("SELECT 1 FROM versions WHERE context_id=? LIMIT 1", (context_id,)).fetchone():
+        raise EvidenceHeld("existing version references a missing context; "
+                           "replay cannot recreate lost provenance")
     """Insert the contexts row for one context identity once per call.
     The stored JSON must round-trip to the same identity on replay."""
     if _row_matches(conn, "contexts", "context_id", context_id,
@@ -673,7 +702,7 @@ def _validate_stored_version(conn, version_id, expect_refs):
             "SELECT ref_ord, ref_json, window_id, unbound_id "
             "FROM version_refs WHERE version_id = ? ORDER BY ref_ord",
             (version_id,))]
-    if stored_refs != expect_refs:
+    if sorted(stored_refs, key=lambda item: item[0]) != sorted(expect_refs, key=lambda item: item[0]):
         raise EvidenceHeld(
             f"stored version {version_id} dependency refs do not match "
             "the replay (missing, altered or extra child refs): "
@@ -781,6 +810,22 @@ def record_page(state_dir, *, source, start, raw, context, observations):
         try:
             conn.execute("BEGIN IMMEDIATE")
 
+            # Inspect every existing candidate V before adding dependencies.
+            # A replay must not silently recreate deleted W/C provenance.
+            for obs, eff_ctx in zip(parsed, effective_contexts):
+                logical = _logical_key(source_valid, obs)
+                cid = _identity("C-", eff_ctx)
+                refs = [({"kind": "window", "window_id": window_id}, window_id, None)] + obs["refs"]
+                expected_refs = sorted([(_canonical(enc), wid, uid) for enc, wid, uid in refs],
+                                       key=lambda item: item[0])
+                vid = _identity("V-", [logical, [item[0] for item in expected_refs], cid])
+                if conn.execute("SELECT 1 FROM versions WHERE version_id=?", (vid,)).fetchone():
+                    _validate_stored_version(conn, vid, expected_refs)
+            if conn.execute("SELECT 1 FROM windows WHERE window_id=?", (window_id,)).fetchone() is None:
+                if conn.execute("SELECT 1 FROM versions WHERE window_id=? LIMIT 1", (window_id,)).fetchone() \
+                        or conn.execute("SELECT 1 FROM version_refs WHERE window_id=? LIMIT 1", (window_id,)).fetchone():
+                    raise EvidenceHeld("existing evidence references a missing window; "
+                                       "capture cannot silently recreate its provenance")
             created = {"windows": 0, "contexts": 0, "versions": 0}
             now = _now()
             raw_sha = page_digest if raw is not None else None
@@ -833,6 +878,7 @@ def record_page(state_dir, *, source, start, raw, context, observations):
                                               own_window)
                 _validate_observation_span(conn, source_valid, obs, all_refs)
                 context_id = _identity("C-", eff_ctx)
+                expect_refs.sort(key=lambda item: item[0])
                 if context_id not in ensured_contexts:
                     _ensure_context_row(conn, context_id, eff_ctx,
                                         created, now)

@@ -2,7 +2,7 @@
 
 Status: source contract for CSR09 with the canonical typed encodings an
 implementation must follow; no empirical benefit is claimed. The store
-implementation is tools/swarmharness/evidence_versions.py (schema 1). This note refines the existing swarmharness2 law
+implementation is tools/swarmharness/evidence_versions.py (schema 2). This note refines the existing swarmharness2 law
 that independent evidence, rather than repeated correlated representations,
 controls repair eligibility. It must receive architecture review before an
 implementation is delegated.
@@ -65,7 +65,7 @@ valid. This does not prove evaluator improvement, repair execution or system
 convergence. Those require the separate externally observed outcomes in the
 research evaluation protocol.
 
-## Canonical typed encodings (implementation contract, schema 1)
+## Canonical typed encodings (implementation contract, schema 2)
 
 Canonical serialization is `json.dumps(obj, sort_keys=True, separators=(",", ":"))`
 encoded UTF-8; H(x) is the lowercase hex SHA-256 of those bytes. Timestamps are
@@ -95,7 +95,7 @@ provenance columns only and never enter any identity. Identities use the `L-`,
   before any I/O. Every accepted context is identity-bound: it determines
   the version's C digest, so a per-observation carried-state change
   produces a different V.
-- **Context schema (closed typed metadata projection, schema 1).** A
+- **Context schema (closed typed metadata projection, schema 2).** A
   context value is a nonempty JSON object (or `None`). Dict keys are
   closed metadata names (`depth`, `count`, `counts`, `schema_version`,
   `unknown`, `carried`, `carried_observations`, `carried_digest`,
@@ -209,3 +209,21 @@ fall inside that named window, and its declared byte digest must agree. A
 contradictory named fact is refused even if an unrelated current window or
 an unbound reference is also present. Unknown prior evidence can instead be
 explicitly labeled unbound without asserting contradictory known facts.
+
+
+The repaired standalone storage proposal uses schema marker **2**. Prototype
+schema-1 stores are held without automatic mutation; none was qualified for
+production. Indexed incoming dependency checks prevent a new capture from
+silently restoring a W/C row still referenced by an older version. Existing
+candidate V graphs are validated before dependency creation. Canonical E
+ordering is used for identity and new child-row persistence; replay compares
+canonical dependency facts, preserving valid equivalent caller permutations
+without rewriting their provenance.
+
+A held call never authorizes cursor advancement. Its fact transaction rolls
+back, but complete empty genesis files or a namespace publication with
+unconfirmed durability can remain. They are retained, never claimed absent.
+Existing-store admission retries parent-directory synchronization before
+writes; persistent failure stays held. A failed exclusive temporary-file
+creation never authorizes deleting an occupied temporary name. New genesis
+files are private0600 and referenced live SQLite/WAL/SHM files are not moved.

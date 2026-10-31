@@ -924,6 +924,59 @@ class ParentEvidenceBoundaryControls(EvidenceVersionsCase):
                                    observations=[self.obs(context={
                                        "prior_window_id":earlier["window_id"], **fields},
                                        refs=[{"kind":"window", "window_id":earlier["window_id"]}])])
+    def test_deleted_version_dependencies_are_not_recreated_on_replay(self):
+        for table in ["windows", "contexts"]:
+            with self.subTest(table=table):
+                root = os.path.join(self.dir, table)
+                args = dict(source=self.source(), start=0, raw=b"page\n",
+                            context=None, observations=[self.obs()])
+                ev.record_page(root, **args)
+                conn = sqlite3.connect(os.path.join(root, ev.DB_NAME))
+                conn.execute("DELETE FROM " + table)
+                conn.commit()
+                before = list(conn.iterdump())
+                conn.close()
+                with self.assertRaises(ev.EvidenceHeld):ev.record_page(root, **args)
+                conn = sqlite3.connect(os.path.join(root, ev.DB_NAME))
+                self.assertEqual(list(conn.iterdump()), before)
+                conn.close()
+    def test_reference_permutations_replay_same_version_without_rewrites(self):
+        a = ev.record_page(self.dir, source=self.source(), start=0,
+                           raw=b"A\n", context=None, observations=[])
+        b = ev.record_page(self.dir, source=self.source(), start=2,
+                           raw=b"B\n", context=None, observations=[])
+        refs = [{"kind":"window", "window_id":x["window_id"]} for x in [a,b]]
+        args = dict(source=self.source(), start=4, raw=b"C\n", context=None)
+        first = ev.record_page(self.dir, observations=[self.obs(span="bytes@4",refs=refs)], **args)
+        conn = self.open_db();before = list(conn.iterdump());conn.close()
+        second = ev.record_page(self.dir, observations=[self.obs(span="bytes@4",refs=list(reversed(refs)))], **args)
+        self.assertEqual(second["version_ids"], first["version_ids"])
+        self.assertEqual(second["created_counts"], {"windows":0,"contexts":0,"versions":0})
+        conn = self.open_db();self.assertEqual(list(conn.iterdump()),before);conn.close()
+    def test_occupied_genesis_temporary_file_is_never_deleted(self):
+        from unittest.mock import patch
+        fixed = type("FixedUUID", (), {"hex":"fixture"})()
+        target = ev._db_path(self.dir) + ".genesis-" + str(os.getpid()) + "-fixture"
+        with open(target,"wb") as stream:stream.write(b"occupied evidence")
+        with patch.object(ev.uuid,"uuid4",return_value=fixed):
+            with self.assertRaises(ev.EvidenceHeld):ev._genesis(self.dir)
+        with open(target,"rb") as stream:self.assertEqual(stream.read(),b"occupied evidence")
+    def test_unknown_existing_store_does_not_create_writer_lock(self):
+        with open(self.db_file(),"wb") as stream:stream.write(b"unknown store")
+        with self.assertRaises(ev.EvidenceHeld):
+            ev.record_page(self.dir,source=self.source(),start=0,raw=b"x\n",context=None,observations=[])
+        self.assertFalse(os.path.exists(os.path.join(self.dir,ev.LOCK_NAME)))
+    def test_replay_retries_directory_durability_before_writing_facts(self):
+        from unittest.mock import patch
+        ev.record_page(self.dir,source=self.source(),start=0,raw=b"x\n",context=None,observations=[])
+        before=self._db_bytes()
+        with patch.object(ev,"_dsync_dir",side_effect=OSError("injected fsync failure")):
+            with self.assertRaisesRegex(ev.EvidenceHeld,"durability"):
+                ev.record_page(self.dir,source=self.source(),start=2,raw=b"y\n",context=None,observations=[])
+        self.assertEqual(self._db_bytes(),before)
+        receipt=ev.record_page(self.dir,source=self.source(),start=2,raw=b"y\n",context=None,observations=[])
+        self.assertEqual(receipt["created_counts"]["windows"],1)
+        self.assertEqual(os.stat(self.db_file()).st_mode & 0o777,0o600)
     def test_raw_bodies_are_not_accepted_as_context_dictionary_keys(self):
         for key in ["SYNTHETIC-CANARY prompt body", "Bearer_fixture_token_body", "/home/user/private/path"]:
             with self.subTest(key=key):
