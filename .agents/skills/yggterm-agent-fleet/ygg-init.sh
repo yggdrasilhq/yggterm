@@ -2,7 +2,7 @@
 # ygg init / ygg doctor — the deterministic onboarding engine.
 #
 # The yggterm-onboarding SKILL explains; this script DOES. Tiers:
-#   0  node sanity            python3, bun, flock, ssh, git — fix hints, no changes
+#   0  node sanity            python3, bun, flock, ssh, rsync, git — fix hints, no changes
 #   1  verbs + memory hub     dispersal present, hub reachable, sync works
 #   2  observability          row registry present, agent shims healthy
 #   3  swarm services (OPT-IN) dream orchestrator config + units (spawner timer);
@@ -34,8 +34,8 @@ echo "ygg $MODE — tier $TIER $( [ "$FIX" = 1 ] && echo '(fix mode)')"
 
 # ---- tier 0: node sanity ----------------------------------------------------
 echo "tier 0 — node sanity"
-for bin in python3 git ssh flock; do
-  command -v "$bin" >/dev/null 2>&1 && ok "$bin" || bad "$bin missing — install it (apt/brew: coreutils provides flock)"
+for bin in python3 git ssh rsync flock; do
+  command -v "$bin" >/dev/null 2>&1 && ok "$bin" || bad "$bin missing — install the required executable using the system package manager"
 done
 if command -v bun >/dev/null 2>&1 || [ -x "$HOME/.bun/bin/bun" ]; then ok bun; else bad "bun missing — https://bun.sh (the worker CLI needs it)"; fi
 
