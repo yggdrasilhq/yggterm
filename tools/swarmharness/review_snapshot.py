@@ -3,7 +3,8 @@
 Trusted controller supplies the repository and attests local filesystem semantics.
 Same-UID writers are trusted and use the stable flock fence; permissions are NOT
 isolation from a malicious same-UID process. The enrolled root alias resolves
-once. No admission, privacy approval, SessionReview digest/signature, execution
+once. Trusted root lifecycle writers also honor that fence; concurrent hostile
+pathname replacement is outside this contract. No admission, privacy approval, SessionReview digest/signature, execution
 permission, relocation qualification, garbage collection or completion authority.
 
 API: Store(root, qualified_local=True).stage(repo, request), with exact request
@@ -189,7 +190,9 @@ def _owned(info, kind):
 
 
 def _directory(path):
-    _owned(os.lstat(path), stat.S_ISDIR)
+    info = os.lstat(path)
+    _owned(info, stat.S_ISDIR)
+    return info
 
 
 def _read(path, cap):
@@ -246,14 +249,22 @@ class Store:
             raise Hold('unsupported_storage')
         try:
             self.root = Path(root).resolve(strict=True)
-            _directory(self.root)
+            info = _directory(self.root)
+            self._root_identity = (info.st_dev, info.st_ino)
         except (OSError, ValueError, RuntimeError):
             raise Hold('storage_root') from None
 
     @contextmanager
     def _lock(self):
-        fd = os.open(self.root / '.lock', os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+        # Resolve the enrolled alias once, then bind each operation to that
+        # physical directory identity before creating even the lock file.
+        root_fd = os.open(self.root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        fd = None
         try:
+            self._check_root(os.fstat(root_fd))
+            self._check_root(_directory(self.root))
+            fd = os.open('.lock', os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK,
+                         0o600, dir_fd=root_fd)
             info = os.fstat(fd)
             _owned(info, stat.S_ISREG)
             if info.st_nlink != 1:
@@ -262,9 +273,18 @@ class Store:
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
                 raise Hold('lock_busy') from None
+            self._check_root(os.fstat(root_fd))
+            self._check_root(_directory(self.root))
             yield
         finally:
-            os.close(fd)
+            if fd is not None:
+                os.close(fd)
+            os.close(root_fd)
+
+    def _check_root(self, info):
+        _owned(info, stat.S_ISDIR)
+        if (info.st_dev, info.st_ino) != self._root_identity:
+            raise Hold('root_identity_changed')
 
     def _checkpoint(self, phase):
         """Fault-injection seam; production does nothing."""

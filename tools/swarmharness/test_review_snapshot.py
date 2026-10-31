@@ -115,6 +115,44 @@ class SnapshotTests(unittest.TestCase):
         for relative in ['', 'tools', 'tools/swarmharness', 'tools/swarmharness/deep']:
             self.assertEqual((source / relative).stat().st_mode & 0o777, 0o700)
 
+    def test_root_permission_drift_holds_before_creating_any_entry(self):
+        self.root.chmod(0o777)
+        try:
+            with self.assertRaisesRegex(rs.Hold, 'unsafe_storage'):
+                self.stage()
+            self.assertEqual(list(self.root.iterdir()), [])
+        finally:
+            self.root.chmod(0o700)
+
+    def test_existing_snapshot_retry_refuses_root_permission_drift(self):
+        self.stage()
+        before = {str(p.relative_to(self.root)): p.read_bytes()
+                  for p in self.root.rglob('*') if p.is_file()}
+        self.root.chmod(0o777)
+        try:
+            with self.assertRaisesRegex(rs.Hold, 'unsafe_storage'):
+                self.stage()
+            self.assertEqual(before, {str(p.relative_to(self.root)): p.read_bytes()
+                                      for p in self.root.rglob('*') if p.is_file()})
+        finally:
+            self.root.chmod(0o700)
+
+    def test_root_replacement_and_symlink_hold_without_redirected_writes(self):
+        original = self.base / 'enrolled-root'
+        self.root.rename(original)
+        self.root.mkdir(mode=0o700)
+        with self.assertRaisesRegex(rs.Hold, 'root_identity_changed'):
+            self.stage()
+        self.assertEqual(list(self.root.iterdir()), [])
+        self.assertEqual(list(original.iterdir()), [])
+        replacement = self.base / 'replacement-root'
+        self.root.rename(replacement)
+        self.root.symlink_to(replacement, target_is_directory=True)
+        with self.assertRaises(rs.Hold):
+            self.stage()
+        self.assertEqual(list(replacement.iterdir()), [])
+        self.assertEqual(list(original.iterdir()), [])
+
     def test_sha256_git_repository_content_identity(self):
         first = self.stage()
         repo = self.base / 'sha256-repo'
