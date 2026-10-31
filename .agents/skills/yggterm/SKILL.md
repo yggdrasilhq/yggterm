@@ -31,6 +31,17 @@ into success. Read NOW.md when present, then the required source doors.
 If the gate itself is the authorized repair, diagnose it without claiming
 freshness or expanding into unrelated source work.
 
+## Recover access before escalating
+
+Consult the operator's configured credential chain before asking for login or
+keys. When registered, the `infra` and `data-fabric` skills own that private
+route; see the [portable recovery contract](../../../steer/credential-recovery.example.md).
+Check native status, use the authorized local vault/recovery path and verify
+the requested read. Ask for human recovery only when both service access and
+its authorized recovery are blocked. A missing protocol is an explicit routing
+gap; do not guess credentials or claim that recovery ran. Quota, reserves and
+work eligibility remain separate from authentication.
+
 ## Load only the required door
 
 | Need | Entry |
