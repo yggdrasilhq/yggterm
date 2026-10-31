@@ -1,6 +1,67 @@
 # yggterm
 
-Install the latest build directly from GitHub Releases:
+yggterm is the operating layer for agent swarms across conventional operating
+systems. `ygg` is its primary command-line porcelain. The yggterm desktop is
+an optional client of that system, alongside other GUI, web and mobile clients.
+The architecture separates durable state, supervised execution and policy from
+the interface used to inspect them.
+
+The 4.0 transition is in progress. The Python operator components and bounded
+observation readers are published; the portable native CLI seed, complete
+correction loop and Windows GUI have remaining qualification gates. Source
+acceptance, installation and observed behavior are tracked separately. See
+[the system boundary](docs/ygg-system.md) and
+[current component status](docs/operating-python-status.md).
+
+## Start with a sentence
+
+```sh
+ygg                         # next words and examples
+ygg dream                   # dream inspection sentences
+ygg help examples --search "unused quota"
+ygg dream ls --all           # human-readable dream ledger
+ygg service ps --host all
+ygg swarm heartbeat --layers
+ygg swarm pressure --by plan --explain
+ygg schedule ls
+```
+
+Use `--json` for structured inspection output. Read source coverage alongside
+the rows: exit 3 can retain useful partial records while reporting unavailable,
+stale or unknown evidence. `--host all` selects hosts represented by the captured
+frame; it does not certify complete fleet enrollment. Exact session attachment,
+native quota calibration and conditional-plan execution have separate gates.
+Owned compatibility commands retain their component's validation and format.
+
+## Current source installation of the operator components
+
+For a POSIX host with Python 3 and Git, from a checkout:
+
+```sh
+git clone https://github.com/yggdrasilhq/yggterm.git
+cd yggterm
+python3 .agents/skills/yggterm-agent-fleet/ygg-disperse.py install --local
+export PATH="$HOME/.local/bin:$PATH"
+ygg help examples --search "unused quota"
+```
+
+This installs the compatibility command payload. Memory initialization,
+observation-kernel packaging and service onboarding have their own owners;
+this step does not arm autonomous work or establish node readiness. A source
+checkout can select its observation reader explicitly with
+`YGG_KERNEL_DIR="$PWD/tools" ygg dream ls --all`. Read the
+[onboarding skill](.agents/skills/yggterm-onboarding/SKILL.md) for the installed
+components and their configuration.
+
+The native 4.0 release will make the CLI seed the curl/PowerShell install unit,
+with the desktop installed separately through
+`ygg ynpm install https://github.com/yggdrasilhq/yggterm`. That release path is
+not yet qualified; it must not be inferred from the compatibility installer.
+
+## Existing desktop bootstrap
+
+The following existing bootstrap commands target desktop release artifacts.
+They are separate from qualification of the native 4.0 CLI seed.
 
 Linux and macOS:
 
@@ -18,9 +79,10 @@ Yggterm installs into a managed user-space location, wires up desktop
 integration, and ships `ynpm`/`ynpx` beside the GUI. `ynpm` owns release
 updates, package generations, and fleet distribution.
 
-Run `ynpm self-update` to force a direct-install update, or
-`ynpm sync-fleet --hosts machine-a,machine-b --integrated` to distribute the
-verified generations to named yggterm hosts.
+With the operator CLI installed, run `ygg ynpm self-update` for an explicit
+package update, or `ygg ynpm sync-fleet --hosts machine-a,machine-b --integrated`
+to distribute verified generations. Desktop-only installations retain the
+`ynpm` and `ynpx` plumbing entrypoints during the transition.
 
 Hot update is a session-preservation contract. When an updated client finds a running daemon that still owns live PTYs, the new daemon should come up without killing those runtimes; the old daemon remains a preserved terminal owner and the updated daemon routes terminal I/O through it until the session naturally ends or can be moved safely. If that fault-tolerant handoff cannot be proven, update completion is deferred. Losing the PTY session is a failed update, not a hot update.
 
@@ -67,11 +129,11 @@ Yggterm is also the first consumer of a broader `yggui` product pipeline for AI-
 
 The in-repo structure for that work lives here:
 
-- [docs/demos/ARCHITECTURE.md](/home/user/gh/yggterm/docs/demos/ARCHITECTURE.md)
-- [docs/demos/FORMAT.md](/home/user/gh/yggterm/docs/demos/FORMAT.md)
-- [docs/demos/STYLE.md](/home/user/gh/yggterm/docs/demos/STYLE.md)
-- [artifacts/demos/unreleased/README.md](/home/user/gh/yggterm/artifacts/demos/unreleased/README.md)
-- [.agents/skills/yggui-changelog-demo/SKILL.md](/home/user/gh/yggterm/.agents/skills/yggui-changelog-demo/SKILL.md)
+- [docs/demos/ARCHITECTURE.md](docs/demos/ARCHITECTURE.md)
+- [docs/demos/FORMAT.md](docs/demos/FORMAT.md)
+- [docs/demos/STYLE.md](docs/demos/STYLE.md)
+- [artifacts/demos/unreleased/README.md](artifacts/demos/unreleased/README.md)
+- [.agents/skills/yggui-changelog-demo/SKILL.md](.agents/skills/yggui-changelog-demo/SKILL.md)
 
 The intent is to keep release notes, QA evidence, and demo capture as one pipeline rather than three disconnected chores. `yggterm` is the first proving ground; later `yggui` apps should be able to reuse the same manifest format, macros, proof bundle structure, and release-page generation flow.
 
@@ -132,7 +194,7 @@ The left tree is not just a launcher. It is the workspace memory.
 
 The bigger bet is that terminal work deserves the same level of UX ambition browsers got when tabs became too important to manage casually. If Zen Browser and Arc helped people survive the chaos of 120 tabs, Yggterm should do the same for 120 terminal contexts.
 
-If that resonates, read the product thesis in [PRODUCT_THESIS.md](/home/user/gh/yggterm/PRODUCT_THESIS.md).
+If that resonates, read the product thesis in [PRODUCT_THESIS.md](PRODUCT_THESIS.md).
 
 ## Core nouns
 
