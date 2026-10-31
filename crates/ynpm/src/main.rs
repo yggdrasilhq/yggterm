@@ -9525,7 +9525,34 @@ mod f9_retention_tests {
         assert_eq!(fs::read(skills_registry_file(&paths)).unwrap(), before);
         assert!(skill_same_file(&lock_before, &fs::metadata(skills_root(&paths).join("registry.lock")).unwrap()));
         drop(guard);
-        assert!(lock_skill_registry(&paths, Duration::ZERO).is_ok());
+        // Parallel native tests spawn processes. A descriptor inherited during
+        // fork can briefly outlive this handle even with CLOEXEC. Qualification
+        // uses the same bounded acquisition contract as the production verb.
+        let reacquired = lock_skill_registry(&paths, Duration::from_secs(3));
+        assert!(reacquired.is_ok(), "lock was not released within the bounded acquisition contract");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn skill_registry_inherited_descriptor_outlives_the_original_handle() {
+        let sandbox = Sandbox::new("skill-inherited-lock");
+        let paths = sandbox.paths();
+        let guard = lock_skill_registry(&paths, Duration::ZERO).unwrap();
+        // An explicit inherited stdout descriptor models the otherwise brief
+        // fork-before-exec window of unrelated parallel subprocess tests.
+        let mut child = Command::new("sh").args(["-c", "printf 'ready\\n' >&2; read marker"])
+            .stdout(Stdio::from(guard.try_clone().unwrap()))
+            .stdin(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+        let mut ready = String::new();
+        std::io::BufRead::read_line(
+            &mut std::io::BufReader::new(child.stderr.take().unwrap()), &mut ready).unwrap();
+        assert_eq!(ready, "ready\n");
+        drop(guard);
+        let retained_by_child = lock_skill_registry(&paths, Duration::ZERO).is_err();
+        child.stdin.take().unwrap().write_all(b"release\n").unwrap();
+        assert!(child.wait().unwrap().success());
+        assert!(retained_by_child);
+        assert!(lock_skill_registry(&paths, Duration::from_secs(3)).is_ok());
     }
 
     #[test]
