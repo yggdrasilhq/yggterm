@@ -98,6 +98,23 @@ class SnapshotTests(unittest.TestCase):
         self.assertNotEqual(first.files, fourth.files)
         self.assertEqual(len(list(self.root.glob('provenance-*'))), 3)
 
+    def test_nested_source_directories_are_private_independent_of_umask(self):
+        nested = self.repo / 'tools/swarmharness/deep/example.py'
+        nested.parent.mkdir(parents=True)
+        nested.write_bytes(b'example source\n')
+        git(self.repo, 'add', '.')
+        git(self.repo, 'commit', '-qm', 'Nested source')
+        previous = os.umask(0)
+        try:
+            result = self.stage(commit=git(self.repo, 'rev-parse', 'HEAD'),
+                                paths=['tools/swarmharness/deep/example.py'])
+        finally:
+            os.umask(previous)
+        self.assertEqual(Path(result.files[0]).read_bytes(), b'example source\n')
+        source = Path(result.materialization)
+        for relative in ['', 'tools', 'tools/swarmharness', 'tools/swarmharness/deep']:
+            self.assertEqual((source / relative).stat().st_mode & 0o777, 0o700)
+
     def test_sha256_git_repository_content_identity(self):
         first = self.stage()
         repo = self.base / 'sha256-repo'

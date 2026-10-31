@@ -353,7 +353,16 @@ class Store:
                     source.mkdir(mode=0o700)
                     for f, data in zip(manifest['files'], blobs):
                         path = source / f['path']
-                        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                        # pathlib's parents=True applies mode only to the leaf;
+                        # make and validate every intermediate directory privately.
+                        directory = source
+                        for part in f['path'].split('/')[:-1]:
+                            directory = directory / part
+                            try:
+                                directory.mkdir(mode=0o700)
+                            except FileExistsError:
+                                pass
+                            _directory(directory)
                         _write(path, data, 0o500 if f['mode'] == '100755' else 0o400)
                     _write(staging / 'manifest.json', encoded)
                     self._verify(staging, manifest)
