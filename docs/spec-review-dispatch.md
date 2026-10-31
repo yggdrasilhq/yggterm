@@ -33,12 +33,18 @@ with the controller's operating-system identity or access to its signing key.
 
 ## Durable job and attempt state
 
-A job identity covers admission identity, immutable subject identity, selected
-review policy and protocol version. It is independent of a mutable workspace
-name, retry ordinal, host clock or CLI role label. The review ID is derived
+A job identity covers admission identity, a content artifact identified by
+logical scope/relative names/byte hashes, selected review policy and protocol
+version. It is independent of a mutable workspace name, retry ordinal, host
+clock or CLI role label. The review ID is derived
 from that job identity, preventing accidental reuse of an unrelated chain.
 Duplicate admission of identical bytes is idempotent; contradictory bytes for
-one identity HOLD and preserve both diagnostic inputs.
+one identity HOLD and preserve both diagnostic inputs. The kernel Job's digest
+and SessionReview subject digest are local execution bindings, not this global
+content identity: the current review kernel includes materialized file paths.
+Record that mapping explicitly. Physical-root migration and cross-host replay
+of those bindings remain held until their separate relocation adapter passes;
+copying a local digest does not qualify another materialization.
 
 The job manifest and append-only event journal use owned private storage,
 no-follow path checks, one stable mutation fence and durable publication.
@@ -55,6 +61,15 @@ lease after invocation-started is unresolved/suspended until the native adapter
 reconciles the invocation; it never silently launches a duplicate. Pre-launch
 claims are recoverable only under the declared serialized recovery contract.
 Owner stop fences claims, launch, verdict intake and task application.
+
+Before the first external submission, durably commit an invocation-intent event
+with its attempt/token and then recheck the launch fence. A crash after that
+intent, including before a result/process receipt is written, means the request
+may have been submitted. Absence of an invocation-started receipt is not proof
+of no call. Recovery requires authoritative reconciliation or remains suspended;
+lease expiry cannot turn that ambiguity into a duplicate launch. After submission,
+owner stop cancels through the native adapter where supported, records unresolved
+remote execution explicitly, and prevents verdict application and new calls.
 
 ## Stage and invoke
 
