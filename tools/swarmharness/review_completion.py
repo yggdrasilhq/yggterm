@@ -17,6 +17,9 @@ rehash and chain head. This pure kernel cannot close filesystem/queue TOCTOU.
 Supported review adapter: opened.worker is exactly {harness, native_uuid};
 opened.editor_binding is a JSON mapping with identity, hashed canonically;
 opened.config_digest binds the activated policy. Full/lightweight reviews only.
+The signed editor invocation_ref must be a canonical native UUID distinct from
+the worker UUID; a role label or opaque invocation string proves no separation.
+Other invocation-address formats require a qualified adapter and HOLD here.
 Payload-only reviews hold: current identity must come from actual staged files.
 Existing SessionReview private validation helpers are deliberately reused here;
 terminal resolve() alone caches acceptance and does not reverify provenance.
@@ -239,6 +242,11 @@ def _verify_review(review, admission, job):
         elif kind == 'editor_verdict':
             if row['editor']['identity'] != admission.editor_identity:
                 raise ValueError('wrong editor')
+            invocation = row['editor'].get('invocation_ref')
+            if (type(invocation) is not str
+                    or str(uuid.UUID(invocation)) != invocation
+                    or invocation == admission.worker_native_uuid):
+                raise ValueError('independent native editor invocation required')
             if row['verification_head'] != replay.history[-1]['record_hash']:
                 raise ValueError('receipt head mismatch')
             payload = row['signed_payload']

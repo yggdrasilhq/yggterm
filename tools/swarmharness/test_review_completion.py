@@ -47,13 +47,14 @@ class CompletionTests(unittest.TestCase):
             self.a.editor_identity, self.a.editor_binding_digest, self.a.config_digest)
 
     def verdict(self, *, overall='accept', findings=None, dispositions=None,
-                checks=True, key=None, scope=None):
+                checks=True, key=None, scope=None,
+                invocation_ref='00000000-0000-4000-8000-000000000003'):
         snap = self.r.snapshots()[-1]
         evidence = [{'status': 'pass', 'snapshot_digest': snap['subject_digest'],
                      'receipt_ref': 'fixture-check'}] if checks else None
         payload = verdict_payload(overall, findings or [], dispositions,
                                   list(self.a.criteria) if scope is None else scope, evidence)
-        editor = {'identity': self.a.editor_identity, 'invocation_ref': 'fixture-invocation'}
+        editor = {'identity': self.a.editor_identity, 'invocation_ref': invocation_ref}
         editor['invocation_receipt'] = editor_receipt(self.r.review_id,
             self.r.rows[0], snap, editor, payload, key=key or self.key,
             review_head=self.r.rows[-1]['record_hash'])
@@ -213,6 +214,25 @@ class CompletionTests(unittest.TestCase):
         self.complete()
         self.assertEqual(self.decision().fault, Fault.REVIEW)
 
+    def test_signed_native_self_review_does_not_become_independent_by_role_name(self):
+        self.assertTrue(self.verdict(invocation_ref=self.a.worker_native_uuid)['ok'])
+        self.assertEqual(self.r.resolve()['outcome'], 'COMPLETE')
+        # Signature authenticity and a different configured role do not prove
+        # that a separate native session supplied the review.
+        self.assertNotEqual(self.a.editor_identity, self.a.worker_native_uuid)
+        self.assertEqual(self.decision().fault, Fault.REVIEW)
+
+    def test_opaque_invocation_requires_qualified_identity_adapter(self):
+        self.assertTrue(self.verdict(invocation_ref='fixture-invocation')['ok'])
+        self.assertEqual(self.r.resolve()['outcome'], 'COMPLETE')
+        self.assertEqual(self.decision().fault, Fault.REVIEW)
+
+    def test_prefixed_invocation_requires_qualified_identity_adapter(self):
+        invocation = 'codex:' + self.a.worker_native_uuid
+        self.assertTrue(self.verdict(invocation_ref=invocation)['ok'])
+        self.assertEqual(self.r.resolve()['outcome'], 'COMPLETE')
+        self.assertEqual(self.decision().fault, Fault.REVIEW)
+
     def test_binding_mismatch_even_with_new_admission(self):
         self.complete()
         a = replace(self.a, editor_binding_digest='6' * 64)
@@ -278,7 +298,12 @@ class CompletionTests(unittest.TestCase):
 
     def test_corrupt_chain_or_storage_gap(self):
         self.complete()
-        self.r.path.write_text(self.r.path.read_text().replace('fixture-invocation', 'forged-invocation'))
+        original = self.r.path.read_text()
+        invocation = '00000000-0000-4000-8000-000000000003'
+        self.assertIn(invocation, original)
+        damaged = original.replace(invocation, '00000000-0000-4000-8000-000000000004', 1)
+        self.assertNotEqual(damaged, original)
+        self.r.path.write_text(damaged)
         self.hold()
         self.r.path.unlink()
         self.hold()
