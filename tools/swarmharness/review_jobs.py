@@ -275,7 +275,10 @@ class Store:
                     raise Hold('unknown_schema')
                 if db.execute('PRAGMA integrity_check').fetchall() != [('ok',)]:
                     raise Hold('corrupt_storage')
-                schema = db.execute("SELECT type,name,sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'").fetchall()
+                # This schema creates no auxiliary objects. Inspect ALL names:
+                # LIKE's underscore wildcard also hid ordinary sqliteFuture
+                # user tables and silently widened the accepted layout.
+                schema = db.execute("SELECT type,name,sql FROM sqlite_master ORDER BY type,name").fetchall()
                 if schema != [('table', 'records', _SQL)]:
                     raise Hold('unknown_schema')
                 db.execute('BEGIN IMMEDIATE')
@@ -369,7 +372,7 @@ class Store:
                            token=token, data={} if data is None else data)
             request = json.loads(_bytes(request))
             if operation_id in operations:
-                if request != operations[operation_id]:
+                if _bytes(request) != _bytes(operations[operation_id]):
                     raise Hold('contradictory_operation')
                 return Receipt(s, True)
             generated = (dict(attempt_id=str(uuid.uuid4()), token=str(uuid.uuid4()),

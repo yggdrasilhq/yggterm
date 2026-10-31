@@ -121,6 +121,33 @@ class JobsTest(unittest.TestCase):
         self.assertEqual(self.tree_bytes(), before)
         self.assertEqual(self.store.get().state['revision'], 0)
 
+    def test_unknown_sqlite_prefixed_user_table_is_not_an_internal_exception(self):
+        with sqlite3.connect(self.root / 'store.sqlite') as db:
+            db.execute('CREATE TABLE sqliteFuture (value TEXT)')
+        before = self.tree_bytes()
+        with self.assertRaisesRegex(Hold, '^unknown_schema$'):
+            self.store.get()
+        self.assertEqual(self.tree_bytes(), before)
+
+    def test_operation_reconciliation_requires_exact_canonical_numeric_types(self):
+        operation = uid()
+        original = dict(operation_id=operation, expected_revision=0,
+                        generation=0, data={'lease_seconds': 1})
+        self.store.change('claim', **original)
+        before = self.tree_bytes()
+        variants = [dict(original, expected_revision=False),
+                    dict(original, generation=False),
+                    dict(original, expected_revision=0.0),
+                    dict(original, data={'lease_seconds': True}),
+                    dict(original, data={'lease_seconds': 1.0})]
+        for altered in variants:
+            with self.subTest(altered=altered):
+                with self.assertRaisesRegex(Hold, '^contradictory_operation$'):
+                    self.store.change('claim', **altered)
+                self.assertEqual(self.tree_bytes(), before)
+        self.assertTrue(self.store.change('claim', **original).reconciled)
+        self.assertEqual(self.tree_bytes(), before)
+
     def test_explicit_recovery_fences_old_worker(self):
         self.change('claim', {'lease_seconds': 1})
         old = self.s['attempt'].copy()
