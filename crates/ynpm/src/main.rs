@@ -8671,6 +8671,8 @@ fn skills_registry_file(paths: &Paths) -> PathBuf {
     skills_root(paths).join("registry.json")
 }
 
+const SKILL_REGISTRY_MAX_BYTES: u64 = 16 * 1024 * 1024;
+
 fn today_stamp() -> String {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -8753,18 +8755,26 @@ fn load_skill_registry(paths: &Paths) -> anyhow::Result<SkillRegistry> {
     if !skill_same_file(&before, &file.metadata()?) {
         bail!("skill registry changed while opening; retained");
     }
-    const LIMIT: u64 = 16 * 1024 * 1024;
     let mut bytes = Vec::new();
-    file.take(LIMIT + 1).read_to_end(&mut bytes)
+    file.take(SKILL_REGISTRY_MAX_BYTES + 1).read_to_end(&mut bytes)
         .context("skill registry read failed; original retained")?;
     let after = skill_file_metadata(&path)?.context("skill registry disappeared; retained")?;
-    if bytes.len() as u64 > LIMIT || !skill_same_file(&before, &after)
+    if bytes.len() as u64 > SKILL_REGISTRY_MAX_BYTES || !skill_same_file(&before, &after)
         || before.len() != after.len() || before.modified().ok() != after.modified().ok()
     {
         bail!("skill registry oversized or changed while reading; retained");
     }
     // Do not echo parser diagnostics: even malformed field names may contain
     // private payload. Only absent storage can become an empty inventory.
+    let shape: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|_| anyhow::anyhow!("skill registry malformed; original retained"))?;
+    if !shape.is_object() || shape.get("skills").is_some_and(|skills|
+        skills.as_array().is_none_or(|records| records.iter().any(|record| !record.is_object())))
+    {
+        bail!("skill registry and records require JSON objects; original retained");
+    }
+    // Reparse the ORIGINAL bytes into the closed structs. Parsing through
+    // Value alone would silently discard duplicate object keys.
     let registry: SkillRegistry = serde_json::from_slice(&bytes)
         .map_err(|_| anyhow::anyhow!("skill registry malformed or has unknown fields; original retained"))?;
     validate_skill_registry(&registry)?;
@@ -8812,6 +8822,10 @@ fn publish_skill_registry(
     mut boundary: impl FnMut(&str) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     validate_skill_registry(registry)?;
+    let bytes = serde_json::to_vec_pretty(registry)?;
+    if bytes.len() as u64 > SKILL_REGISTRY_MAX_BYTES {
+        bail!("skill registry candidate exceeds the readable byte limit; original retained");
+    }
     let path = skills_registry_file(paths);
     skill_file_metadata(&path)?;
     let parent = path.parent().context("skill registry parent absent")?;
@@ -8828,7 +8842,7 @@ fn publish_skill_registry(
     let mut file = options.open(&temporary)?;
     let result = (|| -> anyhow::Result<()> {
         boundary("before-write")?;
-        file.write_all(&serde_json::to_vec_pretty(registry)?)?;
+        file.write_all(&bytes)?;
         file.sync_all()?;
         drop(file);
         boundary("before-rename")?;
@@ -9454,6 +9468,8 @@ mod f9_retention_tests {
         let file = skills_registry_file(&paths);
         for bytes in [
             "not-json PRIVATE-SENTINEL", "", "null", "[]", "false", "{}",
+            "[1,[]]",
+            r#"{"version":1,"skills":[["fixture","","","",[],false,[],""]]}"#,
             r#"{"version":99,"skills":[]}"#,
             r#"{"version":1,"version":1,"skills":[]}"#,
             r#"{"version":1,"skills":[],"PRIVATE-SENTINEL":true}"#,
@@ -9479,6 +9495,22 @@ mod f9_retention_tests {
         save_skill_registry(&paths, &registry).unwrap();
         let actual = load_skill_registry(&paths).unwrap();
         assert_eq!(serde_json::to_value(actual).unwrap(), serde_json::to_value(registry).unwrap());
+    }
+
+    #[test]
+    fn skill_registry_write_size_includes_growth_defaults_and_pretty_expansion() {
+        let sandbox = Sandbox::new("skill-size-boundary");
+        let paths = sandbox.paths();
+        fs::create_dir_all(skills_root(&paths)).unwrap();
+        let original = serde_json::to_vec(&serde_json::json!({"version":1,"skills":[{
+            "name":"fixture", "notes":"x".repeat(SKILL_REGISTRY_MAX_BYTES as usize - 100)
+        }]})).unwrap();
+        assert!((original.len() as u64) < SKILL_REGISTRY_MAX_BYTES);
+        fs::write(skills_registry_file(&paths), &original).unwrap();
+        assert!(load_skill_registry(&paths).is_ok());
+        assert!(verb_skills(&paths, &["note".into(), "fixture".into(), "small-append".into()]).is_err());
+        assert_eq!(fs::read(skills_registry_file(&paths)).unwrap(), original);
+        assert!(load_skill_registry(&paths).is_ok());
     }
 
     #[test]
