@@ -54,10 +54,12 @@ fi
 
 # --- [mem-dream] the canary: deterministic probes, failures logged with a stamp.
 if [ -x "$HOME/.local/bin/ygg-memory" ]; then
-  if ! "$HOME/.local/bin/ygg-memory" canary --json >/dev/null 2>&1; then
+  canary_rc=0
+  canary_output="$("$HOME/.local/bin/ygg-memory" canary --json 2>&1)" || canary_rc=$?
+  if [ "$canary_rc" -ne 0 ]; then
     {
-      printf '[%s] ' "$(date -Is)"
-      "$HOME/.local/bin/ygg-memory" canary 2>&1
+      printf '[%s] canary exit %s\n' "$(date -Is)" "$canary_rc"
+      printf '%s\n' "$canary_output"
     } >> "$HOME/.yggterm/memory/canary.log" 2>/dev/null || true
   fi
 fi

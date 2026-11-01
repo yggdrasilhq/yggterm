@@ -5411,33 +5411,33 @@ class _DreamJournalView:
             ts = float(rec.get("ts", 0))
             self.latest[ns] = max(self.latest.get(ns, ts), ts)
             self.activity.setdefault(ns, []).append(
-                (rec.get("seq", 0), float(rec.get("ts", float("-inf"))), "ts" not in rec)
+                (rec.get("seq", 0), float(rec.get("ts", float("inf"))), "ts" not in rec)
             )
         for ns, rows in self.activity.items():
             rows.sort(key=lambda row: row[0])
             seqs = [row[0] for row in rows]
-            suffix_latest = [row[1] for row in rows]
+            suffix_earliest = [row[1] for row in rows]
             suffix_missing = [row[2] for row in rows]
             for i in range(len(rows) - 2, -1, -1):
-                suffix_latest[i] = max(suffix_latest[i], suffix_latest[i + 1])
+                suffix_earliest[i] = min(suffix_earliest[i], suffix_earliest[i + 1])
                 suffix_missing[i] = suffix_missing[i] or suffix_missing[i + 1]
-            self.activity[ns] = (seqs, suffix_latest, suffix_missing)
+            self.activity[ns] = (seqs, suffix_earliest, suffix_missing)
 
     def _namespaces(self, ns):
         return (ns,) if ns == "_global" else (ns, "_global")
 
     def pending(self, ns, consumed):
-        count, latest = 0, None
+        count, earliest = 0, None
         now = time.time()
         for name in self._namespaces(ns):
             seqs, suffix, missing = self.activity.get(name, ((), (), ()))
             start = bisect.bisect_right(seqs, consumed)
             count += len(seqs) - start
             if start < len(seqs):
-                stamp = max(suffix[start], now) if missing[start] else suffix[start]
-                latest = stamp if latest is None else max(latest, stamp)
-        # Preserve the established min(age) progress/fairness semantics.
-        age = now - latest if latest is not None else 0.0
+                stamp = min(suffix[start], now) if missing[start] else suffix[start]
+                earliest = stamp if earliest is None else min(earliest, stamp)
+        # Any overdue pending delta must stay visible under new arrivals.
+        age = now - earliest if earliest is not None else 0.0
         return {"pending": count, "oldest_pending_s": int(age),
                 "overdue": bool(count) and age > DREAM_PROGRESS_DEADLINE_S}
 
@@ -5615,7 +5615,7 @@ def _dream_pending_summary(root: Path, ns: str, *, view=None) -> dict:
         return view.pending(ns, consumed)
     live = [r for r in dream_live_activity(root, ns) if r.get("seq", 0) > consumed]
     now = time.time()
-    oldest = min((now - float(r.get("ts", now)) for r in live), default=0.0)
+    oldest = max((now - float(r.get("ts", now)) for r in live), default=0.0)
     return {
         "pending": len(live),
         "oldest_pending_s": int(oldest),

@@ -166,6 +166,21 @@ class BatchTests(unittest.TestCase):
             self.watermark("-one", 1)
             self.assertEqual(view.pending("-one", 1), m._dream_pending_summary(self.root, "-one"))
 
+    def test_new_arrivals_do_not_mask_old_pending_work(self):
+        self.watermark("-one")
+        self.write([event(1, "-one", NOW - 28800),
+                    event(2, "_global", NOW - 60)])
+        view = self.equivalent(["-one", "_global"])
+        for result in [m._dream_pending_summary(self.root, "-one"),
+                       view.pending("-one", 0)]:
+            self.assertEqual(result["pending"], 2)
+            self.assertEqual(result["oldest_pending_s"], 28800)
+            self.assertTrue(result["overdue"])
+        self.assertIn("BLOWN", self.canary(True)[2])
+        self.watermark("-one", 1)
+        self.assertEqual(m._dream_pending_summary(self.root, "-one"),
+                         {"pending": 1, "oldest_pending_s": 60, "overdue": False})
+
     def test_candidate_selection_and_fresh_fences(self):
         self.watermark("-old")
         self.watermark("-new")
