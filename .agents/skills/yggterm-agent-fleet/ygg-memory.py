@@ -2327,24 +2327,119 @@ def unseen_journal_entries(root: Path, watermark: dict, namespace: str, harness:
     return result
 
 
-def mark_events_seen(root: Path, watermark: dict, namespace: str | None, harness: str) -> None:
-    vectors = watermark.setdefault("seen_origin_seq", {})
-    for record in read_journal_entries(root, after_seq=0, namespace=namespace, target_harness=harness):
+def _ack_from_records(records: list, watermark: dict, namespace, harness) -> dict:
+    """Source fallback: consume one snapshot, including its legacy ceiling."""
+    vectors = {ns: dict(vector) for ns, vector in watermark.get("seen_origin_seq", {}).items()}
+    for record in records:
+        if namespace is not None and record.get("ns") != namespace:
+            continue
+        if not matches_target_harness(record.get("target_harness", "all"), harness):
+            continue
         origin = record.get("origin")
         if record.get("event_id") and origin:
             vector = vectors.setdefault(record.get("ns", ""), {})
             vector[origin] = max(vector.get(origin, 0), record.get("seq", 0))
-    # Selective acknowledgements older than the full vector no longer need an
-    # unbounded UUID entry.
     covered = {
-        record_event_id(record)
-        for record in read_journal_entries(root)
-        if record.get("origin")
-        and record.get("seq", 0)
+        record_event_id(record) for record in records
+        if record.get("origin") and record.get("seq", 0)
         <= vectors.get(record.get("ns", ""), {}).get(record.get("origin"), 0)
     }
-    watermark["seen_event_ids"] = sorted(set(watermark.get("seen_event_ids", [])) - covered)
-    watermark["last_seq"] = get_latest_seq(root)
+    return {
+        "seen_origin_seq": vectors,
+        "seen_event_ids": sorted(set(watermark.get("seen_event_ids", [])) - covered),
+        "last_seq": max((record.get("seq", 0) for record in records), default=0),
+    }
+
+
+def _ji_ack_projection(root: Path, watermark: dict, namespace, harness) -> dict:
+    """Aggregate acknowledgment metadata without copying/decoding source bodies.
+
+    No persistent projection: refresh, metadata and legacy ceiling share the
+    same transaction. Unsupported JSON shapes use the source oracle instead.
+    """
+    if not get_journal_path(root).exists():
+        raise ValueError("journal absent; cached history is not authoritative")
+    conn = _ji_connect(root)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        _ji_refresh(root, conn)
+        if not get_journal_path(root).exists():
+            raise ValueError("journal disappeared during refresh")
+        gen = int(_ji_meta_get(conn).get("gen", "0") or 0)
+        # Keep Python truthiness, identity and normalization exact. Exotic
+        # legacy shapes are deliberately left to the existing source reader.
+        unsupported = conn.execute(
+            "SELECT 1 FROM entries WHERE gen = ? AND ("
+            "COALESCE(json_type(payload, '$.seq'), 'integer') != 'integer' OR "
+            "COALESCE(json_extract(payload, '$.seq'), 0) != seq OR "
+            + " OR ".join(
+                "COALESCE(json_type(payload, '$." + field + "'), 'null') NOT IN ('text', 'null')"
+                for field in ("event_id", "origin", "ns", "target_harness")
+            ) + " OR EXISTS (SELECT 1 FROM json_each(payload) WHERE key IN "
+            "('seq', 'event_id', 'origin', 'ns', 'target_harness') "
+            "GROUP BY key HAVING COUNT(*) > 1)) LIMIT 1", (gen,)
+        ).fetchone()
+        if unsupported:
+            raise ValueError("unsupported acknowledgment metadata")
+        projection = (
+            "SELECT seq, CASE WHEN json_type(payload, '$.ns') IS NULL THEN '' "
+            "ELSE json_extract(payload, '$.ns') END AS ns, "
+            "json_extract(payload, '$.origin') AS origin, "
+            "json_extract(payload, '$.event_id') AS event_id, "
+            "json_extract(payload, '$.target_harness') AS target FROM entries "
+            "WHERE gen = ? AND seq > 0"
+        )
+        seen = set(watermark.get("seen_event_ids", []))
+        if seen and conn.execute(
+            "SELECT 1 FROM (" + projection + ") WHERE origin IS NOT NULL "
+            "AND origin != '' AND (event_id IS NULL OR event_id = '') LIMIT 1", (gen,)
+        ).fetchone():
+            # Stable legacy identity hashes the full record. Rare selective
+            # legacy acknowledgments retain the honest source path.
+            raise ValueError("legacy selective acknowledgment requires source")
+        vectors = {ns: dict(vector) for ns, vector in watermark.get("seen_origin_seq", {}).items()}
+        sql = "SELECT ns, origin, target, MAX(seq) FROM (" + projection + ") "
+        sql += "WHERE event_id IS NOT NULL AND event_id != '' AND origin IS NOT NULL AND origin != ''"
+        args = [gen]
+        if namespace is not None:
+            # The source filter uses get('ns'), where missing and null both
+            # compare as None; a missing namespace must not match empty text.
+            sql = sql.replace("WHERE gen = ? AND seq > 0", "WHERE gen = ? AND seq > 0 AND ns = ?")
+            args.append(namespace)
+        sql += " GROUP BY ns, origin, target"
+        for ns, origin, target, seq in conn.execute(sql, args):
+            if matches_target_harness(target, harness):
+                vector = vectors.setdefault(ns, {})
+                vector[origin] = max(vector.get(origin, 0), seq)
+        covered = set()
+        if seen:
+            # Transfer only identities the caller actually holds. MIN keeps
+            # repeated IDs covered when any physical record is covered.
+            sql = ("SELECT ns, origin, event_id, MIN(seq) FROM (" + projection + ") "
+                   "WHERE event_id IN (SELECT value FROM json_each(?)) "
+                   "AND origin IS NOT NULL AND origin != '' GROUP BY ns, origin, event_id")
+            for ns, origin, event_id, seq in conn.execute(sql, (gen, json.dumps(list(seen)))):
+                if seq <= vectors.get(ns, {}).get(origin, 0):
+                    covered.add(event_id)
+        latest = conn.execute("SELECT MAX(seq) FROM entries WHERE gen = ?", (gen,)).fetchone()[0]
+        result = {"seen_origin_seq": vectors, "seen_event_ids": sorted(seen - covered),
+                  "last_seq": max(0, latest or 0)}
+        conn.commit()
+        return result
+    finally:
+        conn.close()
+
+
+def mark_events_seen(root: Path, watermark: dict, namespace: str | None, harness: str) -> None:
+    try:
+        result = _ji_ack_projection(root, watermark, namespace, harness)
+    except Exception:
+        # One source scan supplies both acknowledgment and its sequence ceiling;
+        # a later append can never advance last_seq past an unseen legacy event.
+        result = _ack_from_records(_read_journal_entries_naive(root), watermark, namespace, harness)
+    # Calculation (including sorting and fallback) must succeed before any
+    # caller-owned vector or selective identity is mutated.
+    watermark.update(result)
 
 
 _AUTOMATIC_BASE = object()
