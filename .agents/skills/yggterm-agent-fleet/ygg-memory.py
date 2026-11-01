@@ -22,6 +22,7 @@ import datetime
 import fcntl
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -5408,7 +5409,13 @@ class _DreamJournalView:
                     self.floors[ns] = max(self.floors.get(ns, 0), int(marker.group(1)))
             if rec.get("seq", 0) <= 0 or str(rec.get("summary", "")).startswith(DREAM_SUMMARY_PREFIXES):
                 continue
-            ts = float(rec.get("ts", 0))
+            value = rec.get("ts", 0)
+            try:
+                ts = float(value)
+            except (ValueError, TypeError, OverflowError):
+                raise ValueError("invalid dream activity timestamp metadata") from None
+            if type(value) not in (int, float) or not math.isfinite(ts):
+                raise ValueError("invalid dream activity timestamp metadata")
             self.latest[ns] = max(self.latest.get(ns, ts), ts)
             self.activity.setdefault(ns, []).append(
                 (rec.get("seq", 0), float(rec.get("ts", float("inf"))), "ts" not in rec)
@@ -5681,7 +5688,12 @@ def _dream_auto(root: Path, ns_filter: str, args, dreamer: dict | None = None) -
     candidates = []
     dream_root = root / "dream"
     if dream_root.is_dir():
-        view = _DreamJournalView(root)
+        try:
+            view = _DreamJournalView(root)
+        except (ValueError, TypeError, OverflowError):
+            _dream_auto_backoff(root, "invalid journal activity timestamp metadata")
+            _dream_receipt(root, "failed", "journal metadata invalid; candidates not admitted")
+            return "auto-dream: journal metadata invalid — decisions deferred"
         for ns_dir in sorted(dream_root.iterdir()):
             if not ns_dir.is_dir():
                 continue
@@ -7318,8 +7330,12 @@ def cmd_canary(args):
             pass
         # A live tick should leave receipts; absence over 2h with any pending
         # namespace means the controller is not running at all.
-        view = _DreamJournalView(root)
-        for ns_dir in sorted(dream_root.glob("*/")):
+        try:
+            view = _DreamJournalView(root)
+        except (ValueError, TypeError, OverflowError):
+            violations.append("dreamer: journal activity timestamp metadata invalid — progress UNKNOWN")
+            view = None
+        for ns_dir in sorted(dream_root.glob("*/")) if view is not None else ():
             summary = _dream_pending_summary(root, ns_dir.name, view=view)
             if summary["pending"] <= 0:
                 continue

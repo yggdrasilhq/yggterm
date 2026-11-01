@@ -197,6 +197,26 @@ class BatchTests(unittest.TestCase):
         self.assertIn("ACTIVE", m.dream_quiescence_violation(self.root, "-old"))
         self.assertIn("journal advanced", m.dream_fence_violation(self.root, "-old", 2))
 
+    def test_invalid_timestamps_never_become_healthy_or_candidate_permission(self):
+        self.watermark("-one")
+        for invalid in [float("nan"), float("inf"), float("-inf"), "NaN", True]:
+            for reverse in [False, True]:
+                with self.subTest(timestamp=repr(invalid), reverse=reverse):
+                    rows = [event(1, "-one", NOW - 2000), event(2, "-one", invalid)]
+                    self.write(list(reversed(rows)) if reverse else rows)
+                    with self.assertRaisesRegex(ValueError, "timestamp metadata"):
+                        m._DreamJournalView(self.root)
+                    rc, output, errors = self.canary(True)
+                    self.assertEqual(rc, 1)
+                    self.assertNotIn('"status": "ok"', output)
+                    self.assertIn("UNKNOWN", errors)
+                    backoff = self.root / "dream/auto-backoff.json"
+                    backoff.unlink(missing_ok=True)
+                    with patch.object(m, "subprocess") as child:
+                        result = m._dream_auto(self.root, "", SimpleNamespace())
+                        self.assertIn("decisions deferred", result)
+                        child.run.assert_not_called()
+
     def test_operation_count_history_plus_namespaces(self):
         self.write([event(i + 1, "_global") for i in range(200)])
         for i in range(60):
