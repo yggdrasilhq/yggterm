@@ -23,6 +23,14 @@ guard executes an opened source descriptor, retaining its identity across an
 ordinary atomic deployment replacement. Its interpreter uses isolated mode,
 excluding caller Python paths and user site hooks. It does not attest the interpreter,
 all imported dependencies or hostile in-place modification by the same UID.
+This helper exclusively waits for its gate child. It observes exit with
+`waitid(WNOWAIT)` and reserves the unreaped leader PID until bounded TERM/KILL
+cleanup of the owned gate process group finishes. Independently detached
+sessions and privilege-changing gate children are outside that group contract.
+The initial local procfs qualification observes same-UID group members until
+none is executing; unknown visibility or an unconfirmed cleanup remains held
+with the gate process retained in memory. It is not a cgroup confinement claim.
+[Linux wait semantics](https://man7.org/linux/man-pages/man2/waitpid.2.html).
 
 Every attempt retains private gate evidence. Failure produces a typed hold and
 never calls the harness constructor. A successful receipt is an observation,
@@ -30,6 +38,10 @@ not an execution permission, task completion, editorial approval or reusable
 authorization token. The admitted controller must still enforce policy, quota,
 budgets, privacy, durable intent, owner stop and replay rules at their proper
 boundaries. This primitive does not implement retry or queue completion.
+Command/environment inputs are copied before gate I/O. Diagnostic storage
+failure cannot mask the typed in-memory hold; a post-spawn hold retains the
+process handle and marks that the harness started, with its native effect
+unknown and no retry authorization.
 
 Passing an entry gate also does not authorize a worker to repair a subsequent
 conflict outside its task. Such a conflict retains work and returns to the

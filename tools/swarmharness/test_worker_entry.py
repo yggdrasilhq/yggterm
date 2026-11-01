@@ -2,6 +2,7 @@
 from dataclasses import asdict
 import hashlib
 import json
+import errno
 import os
 from pathlib import Path
 import sys
@@ -170,6 +171,121 @@ class EntryTests(unittest.TestCase):
             evidence_root=self.evidence, environment=environment)
         self.assertEqual(process.wait(timeout=3), 0)
         self.assertFalse(imported.exists())
+
+    def test_command_and_environment_are_frozen_during_gate(self):
+        started = self.root / 'gate-started'
+        changed = self.workspace / 'changed-command'
+        gate = self.specification(before='from pathlib import Path\nPath('
+            + repr(str(started)) + ').write_text("ready")\ntime.sleep(.2)')
+        command = [sys.executable, '-I', '-c', 'import os\nfrom pathlib import Path\nPath('
+            + repr(str(self.marker)) + ').write_text(os.environ["YGG_ENTRY_FIXTURE"])']
+        environment = dict(os.environ, YGG_ENTRY_FIXTURE='original')
+        def alter():
+            deadline = time.monotonic() + 2
+            while not started.exists() and time.monotonic() < deadline:
+                time.sleep(.005)
+            command[-1] = 'from pathlib import Path;Path(' + repr(str(changed)) + ').touch()'
+            environment['YGG_ENTRY_FIXTURE'] = 'changed'
+        thread = threading.Thread(target=alter)
+        thread.start()
+        try:
+            process, receipt = entry.guarded_spawn(gate, command, cwd=self.workspace,
+                evidence_root=self.evidence, environment=environment)
+            self.assertEqual(process.wait(timeout=3), 0)
+        finally:
+            thread.join(timeout=3)
+        self.assertEqual(self.marker.read_text(), 'original')
+        self.assertFalse(changed.exists())
+        directory = Path(receipt.evidence_directory)
+        requested = json.loads((directory / 'REQUEST.json').read_text())
+        spawned = json.loads((directory / 'SPAWNED.json').read_text())
+        self.assertEqual(requested['command_sha256'], spawned['command_sha256'])
+
+    def test_persistent_storage_failure_before_and_after_spawn_stays_typed(self):
+        gate = self.specification()
+        with patch.object(entry, '_write', side_effect=OSError(errno.ENOSPC, 'invented full disk')):
+            error = self.held(gate)
+        self.assertEqual(error.code, 'entry_launch_unresolved')
+        self.assertFalse(error.harness_started)
+        self.assertTrue(error.no_retry_authorized)
+        self.assertFalse(error.diagnostic_persisted)
+        real_write = entry._write
+        def full_after_spawn(path, data):
+            if path.name in ('SPAWNED.json', 'UNRESOLVED.json'):
+                raise OSError(errno.ENOSPC, 'invented full disk')
+            return real_write(path, data)
+        with patch.object(entry, '_write', side_effect=full_after_spawn), self.assertRaises(entry.Held) as held:
+            self.launch(gate)
+        error = held.exception
+        self.assertEqual(error.code, 'entry_launch_unresolved')
+        self.assertTrue(error.harness_started)
+        self.assertTrue(error.no_retry_authorized)
+        self.assertFalse(error.diagnostic_persisted)
+        self.assertEqual(error.process.wait(timeout=3), 0)
+        self.assertTrue(self.marker.exists())
+
+    def test_failed_gate_diagnostic_failure_never_masks_primary_hold(self):
+        gate = self.specification(rc=2)
+        original = entry._write
+        def unavailable(path, data):
+            if path.name == 'HELD.json':
+                raise OSError(errno.ENOSPC, 'invented full disk')
+            return original(path, data)
+        with patch.object(entry, '_write', side_effect=unavailable):
+            error = self.held(gate)
+        self.assertEqual(error.code, 'memory_gate_failed')
+        self.assertFalse(error.harness_started)
+        self.assertTrue(error.no_retry_authorized)
+        self.assertFalse(error.diagnostic_persisted)
+
+    def test_exited_gate_leader_and_term_resistant_descendants_are_cleaned(self):
+        for ignore_term in (False, True):
+            with self.subTest(ignore_term=ignore_term):
+                child_info = self.root / ('child-' + str(ignore_term) + '.json')
+                child = ('import os,json,time,signal\nfrom pathlib import Path\n'
+                    + ('signal.signal(signal.SIGTERM,signal.SIG_IGN)\n' if ignore_term else '')
+                    + 'raw=Path("/proc/self/stat").read_text()\n'
+                    + 'Path(' + repr(str(child_info)) + ').write_text(json.dumps({"pid":os.getpid(),'
+                      '"start":raw[raw.rfind(")")+2:].split()[19]}))\ntime.sleep(15)\n')
+                before = ('import subprocess\nfrom pathlib import Path\n'
+                    + 'subprocess.Popen([' + repr(sys.executable) + ',"-I","-c",' + repr(child) + '])\n'
+                    + 'deadline=time.monotonic()+2\n'
+                    + 'while not Path(' + repr(str(child_info)) + ').exists() and time.monotonic()<deadline:time.sleep(.005)\n')
+                gate = self.specification(before=before)
+                info = None
+                try:
+                    self.assertEqual(self.held(gate, gate_timeout=1.5).code, 'memory_gate_timeout')
+                    info = json.loads(child_info.read_text())
+                    status = Path('/proc') / str(info['pid']) / 'stat'
+                    if status.exists():
+                        raw = status.read_text()
+                        fields = raw[raw.rfind(')')+2:].split()
+                        self.assertTrue(fields[19] != info['start'] or fields[0] in ('Z', 'X', 'x'))
+                finally:
+                    if info is None and child_info.exists():
+                        info = json.loads(child_info.read_text())
+                    if info is not None:
+                        try:
+                            handle = os.pidfd_open(info['pid'])
+                            raw = (Path('/proc') / str(info['pid']) / 'stat').read_text()
+                            fields = raw[raw.rfind(')')+2:].split()
+                            if fields[19] == info['start'] and fields[0] not in ('Z', 'X', 'x'):
+                                import signal
+                                signal.pidfd_send_signal(handle, signal.SIGKILL)
+                            os.close(handle)
+                        except OSError:
+                            pass
+
+    def test_external_reaper_never_authorizes_numeric_group_signal(self):
+        class AlreadyReaped:
+            pid = 1234567
+            returncode = None
+        with patch.object(entry.os, 'waitid', side_effect=ChildProcessError), \
+                patch.object(entry.os, 'killpg') as signal_group:
+            with self.assertRaises(entry.Held) as caught:
+                entry._finish(AlreadyReaped())
+        self.assertEqual(caught.exception.code, 'gate_wait_ownership_lost')
+        signal_group.assert_not_called()
 
 
 if __name__ == '__main__':

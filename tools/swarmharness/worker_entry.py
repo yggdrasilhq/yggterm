@@ -23,9 +23,13 @@ import uuid
 
 
 class Held(Exception):
-    def __init__(self, code, receipt=None):
+    def __init__(self, code, receipt=None, process=None):
         self.code = code
         self.receipt = receipt
+        self.process = process
+        self.harness_started = process is not None
+        self.no_retry_authorized = True
+        self.diagnostic_persisted = False
         super().__init__(code)
 
 
@@ -61,13 +65,85 @@ def _write(path, data):
 
 
 def _finish(process):
-    if process.poll() is None:
+    # This helper is the gate's exclusive waiter. Leave even an exited
+    # leader unreaped until every numeric process-group signal is finished;
+    # its reserved PID prevents a later group's reuse during cleanup.
+    if process.returncode is not None:
+        raise Held('gate_wait_ownership_lost')
+    try:
+        os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+    except ChildProcessError:
+        raise Held('gate_wait_ownership_lost') from None
+    try:
         os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    deadline = time.monotonic() + .2
+    while time.monotonic() < deadline:
         try:
-            process.wait(timeout=1)
-        except subprocess.TimeoutExpired:
-            os.killpg(process.pid, signal.SIGKILL)
-            process.wait(timeout=2)
+            os.killpg(process.pid, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(.01)
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    deadline = time.monotonic() + 2
+    while _group_running(process.pid):
+        if time.monotonic() >= deadline:
+            error = Held('gate_cleanup_unresolved')
+            error.gate_process = process
+            raise error
+        time.sleep(.01)
+    try:
+        process.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        error = Held('gate_cleanup_unresolved')
+        error.gate_process = process
+        raise error from None
+
+
+def _group_running(group):
+    """Qualified local procfs, same-UID gate group; zombies perform no work."""
+    try:
+        text = Path('/proc/self/stat').read_text()
+        if int(text.split(' ', 1)[0]) != os.getpid():
+            raise Held('gate_process_visibility_unknown')
+        for path in Path('/proc').iterdir():
+            if not path.name.isdigit():
+                continue
+            try:
+                if path.stat().st_uid != os.getuid():
+                    continue
+                text = (path / 'stat').read_text()
+                fields = text[text.rfind(')') + 2:].split()
+                if int(fields[2]) == group and fields[0] not in ('Z', 'X', 'x'):
+                    return True
+            except FileNotFoundError:
+                continue  # Process exited while enumerating this observation.
+        return False
+    except (OSError, ValueError, IndexError):
+        raise Held('gate_process_visibility_unknown') from None
+
+
+def _exit_without_reaping(process, deadline):
+    while True:
+        result = os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+        if result is not None:
+            return result.si_status if result.si_code == os.CLD_EXITED else -result.si_status
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise Held('memory_gate_timeout')
+        time.sleep(min(.01, remaining))
+
+
+def _diagnostic(stage, name, payload):
+    try:
+        _write(stage / name, json.dumps(payload).encode())
+        return True
+    except (OSError, ValueError, TypeError):
+        return False
 
 
 def _collect(command, source_fd, environment, timeout, cap):
@@ -95,14 +171,19 @@ def _collect(command, source_fd, environment, timeout, cap):
                         streams[key.data].extend(data)
                         if sum(map(len, streams.values())) > cap:
                             raise Held('memory_gate_output_cap')
-            process.wait(timeout=max(.001, deadline - time.monotonic()))
-            return process.returncode, bytes(streams['stdout']), bytes(streams['stderr'])
+            code = _exit_without_reaping(process, deadline)
+            return code, bytes(streams['stdout']), bytes(streams['stderr'])
     except subprocess.TimeoutExpired:
         raise Held('memory_gate_timeout') from None
     finally:
-        _finish(process)
-        process.stdout.close()
-        process.stderr.close()
+        try:
+            _finish(process)
+        except Held as error:
+            error.gate_process = process
+            raise
+        finally:
+            process.stdout.close()
+            process.stderr.close()
 
 
 def _json_object(pairs):
@@ -170,7 +251,7 @@ def guarded_spawn(gate, command, *, cwd, evidence_root, environment=None,
     Commands and environment are trusted controller inputs, never worker JSON.
     No automatic retry; every call creates a separate explicit attempt.
     """
-    if (sys.platform != 'linux' or not hasattr(os, 'O_NOFOLLOW')
+    if (sys.platform != 'linux' or not all(hasattr(os, name) for name in ('O_NOFOLLOW', 'waitid', 'WNOWAIT'))
             or not Path('/proc/self/fd').is_dir()):
         raise Held('unsupported_gate_platform')
     if (type(command) not in (list, tuple) or not command
@@ -179,8 +260,13 @@ def guarded_spawn(gate, command, *, cwd, evidence_root, environment=None,
             or type(gate_timeout) not in (int, float) or not 0 < gate_timeout <= 120
             or type(gate_output_cap) is not int or not 0 < gate_output_cap <= 1024 * 1024):
         raise Held('invalid_launch_specification')
+    # A controller may retain these mutable containers. Freeze them before
+    # gate I/O so REQUEST and SPAWNED bind the same requested execution.
+    command = tuple(command)
     stage = None
+    process = None
     try:
+        child_environment = dict(os.environ if environment is None else environment)
         root = Path(evidence_root).resolve(strict=True)
         info = root.lstat()
         if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid()
@@ -198,7 +284,6 @@ def guarded_spawn(gate, command, *, cwd, evidence_root, environment=None,
             'qualified_source_sha256': gate.source_sha256,
             'command_sha256': _hash(json.dumps(list(command)).encode()),
             'source_or_task_acceptance': 'PENDING'}, sort_keys=True).encode())
-        child_environment = dict(os.environ if environment is None else environment)
         receipt = _gate(gate, stage, child_environment, gate_timeout, gate_output_cap)
         _write(stage / 'MEMORY-READY.json', json.dumps(asdict(receipt), sort_keys=True).encode())
         with (stage / 'worker.stdout').open('xb') as output, (stage / 'worker.stderr').open('xb') as errors:
@@ -212,13 +297,18 @@ def guarded_spawn(gate, command, *, cwd, evidence_root, environment=None,
             'source_or_task_acceptance': 'PENDING'}, sort_keys=True).encode())
         return process, receipt
     except Held as error:
+        error.process = process
+        error.harness_started = process is not None
         if stage is not None:
             error.receipt = str(stage)
-            _write(stage / 'HELD.json', json.dumps({'reason': error.code, 'harness_started': False}).encode())
+            error.diagnostic_persisted = _diagnostic(stage, 'HELD.json', {
+                'reason': error.code, 'harness_started': error.harness_started,
+                'no_retry_authorized': True})
         raise
     except (OSError, ValueError, TypeError, RuntimeError) as error:
+        held = Held('entry_launch_unresolved', str(stage) if stage else None, process)
         if stage is not None:
-            _write(stage / 'UNRESOLVED.json', json.dumps({
-                'reason': type(error).__name__, 'harness_started': 'UNKNOWN',
-                'no_retry_authorized': True}).encode())
-        raise Held('entry_launch_unresolved', str(stage) if stage else None) from None
+            held.diagnostic_persisted = _diagnostic(stage, 'UNRESOLVED.json', {
+                'reason': type(error).__name__, 'harness_started': held.harness_started,
+                'native_execution_effect': 'UNKNOWN', 'no_retry_authorized': True})
+        raise held from None
