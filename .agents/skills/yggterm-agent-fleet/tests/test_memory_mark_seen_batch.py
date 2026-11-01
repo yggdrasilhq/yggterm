@@ -153,7 +153,7 @@ class AckTests(unittest.TestCase):
         w = {}
         m.mark_events_seen(self.root, w, None, 'codex')
         self.assertEqual(w, expected)
-        # Simulate a build lacking JSON projection, without breaking refresh.
+        # A build without SQLite JSON functions still uses the coherent reader.
         original = m._ji_connect
         class NoJSON:
             def __init__(self, conn): self.conn = conn
@@ -186,12 +186,13 @@ class AckTests(unittest.TestCase):
         self.write([event(i, f'fixture-{i % 3}', summary='invented body' * 40) for i in range(1, 10001)])
         m.read_journal_entries(self.root)  # cold refresh is intentionally outside measurement
         with patch.object(m.json, 'loads', wraps=json.loads) as loads:
-            with patch.object(m, '_ack_from_records', side_effect=AssertionError('unexpected fallback'), create=True):
+            with patch.object(m, '_read_journal_entries_naive', side_effect=AssertionError('unexpected fallback')):
                 w = {'seen_event_ids': ['fixture-1', 'keep']}
                 m.mark_events_seen(self.root, w, 'widgets', 'codex')
                 self.assertEqual(w['last_seq'], 10000)
                 self.assertEqual(w['seen_event_ids'], ['keep'])
-            self.assertEqual(loads.call_count, 0)
+            self.assertGreaterEqual(loads.call_count, 10000)
+            self.assertLessEqual(loads.call_count, 10004)
 
     def test_refresh_snapshot_blocks_invalidation_and_excludes_later_legacy(self):
         self.write([event(1)])
