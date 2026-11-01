@@ -24,6 +24,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -37,6 +38,8 @@ DEFAULT_YAML = Path("~/.yggterm/swarm-config.yaml")
 LEGACY_YAML = Path("~/.yggterm/swarmconfig.yaml")
 DEFAULT_STATE = Path("~/.yggterm/swarm")
 MAX_BYTES = 256 * 1024
+MAX_STORAGE_BYTES = 8 * MAX_BYTES
+MAX_CONFIG_JOURNAL_BYTES = 16 * 1024 * 1024
 KNOWN_MAJOR = 3
 SUPPORTED_MAJORS = (2, 3)
 GENESIS_HASH = "0" * 64
@@ -177,6 +180,31 @@ def content_hash(cfg):
     if sync:
         body["sync"] = sync
     return hashlib.sha256(canonical_json(body)).hexdigest()
+
+
+def _read_storage_text(path, limit=MAX_STORAGE_BYTES):
+    """Read bounded regular policy storage; unsafe leaves never block as FIFOs.
+
+    Linux uses no-follow/nonblocking open and an opened-handle type/size check.
+    The precheck also protects ordinary readers on platforms lacking those
+    flags. This is not a filesystem race/hostile same-UID isolation contract.
+    """
+    info = os.lstat(path)
+    if not stat.S_ISREG(info.st_mode) or info.st_size > limit:
+        raise ValueError('unsafe or oversized policy storage')
+    flags = os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0)
+    descriptor = os.open(path, flags)
+    try:
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode) or opened.st_size > limit:
+            raise ValueError('unsafe or oversized policy storage')
+        with os.fdopen(descriptor, 'rb', closefd=False) as source:
+            data = source.read(limit + 1)
+        if len(data) > limit:
+            raise ValueError('oversized policy storage')
+        return data.decode('utf-8')
+    finally:
+        os.close(descriptor)
 
 
 def atomic_write(path: Path, data: bytes):
@@ -1606,7 +1634,7 @@ def deny_list(state_dir=DEFAULT_STATE):
     unreadable owner stops must contain, never reopen, stopped work."""
     p = _deny_path(state_dir)
     try:
-        data = json.loads(p.read_text())
+        data = json.loads(_read_storage_text(p))
     except FileNotFoundError:
         return {}
     except Exception as e:
@@ -1674,7 +1702,7 @@ def _paths(state_dir):
 def active_head(state_dir=DEFAULT_STATE):
     """-> {'content_hash','epoch','revision','change_id','activated_at'} or None."""
     try:
-        data = json.loads(_paths(state_dir)["active"].read_text())
+        data = json.loads(_read_storage_text(_paths(state_dir)["active"]))
     except Exception:
         return None
     if not isinstance(data, dict) or not HEX64.fullmatch(str(data.get("content_hash") or "")):
@@ -1685,7 +1713,7 @@ def active_head(state_dir=DEFAULT_STATE):
 def _read_release(P, h):
     rj = P["releases"] / h / "release.json"
     try:
-        obj = json.loads(rj.read_text())
+        obj = json.loads(_read_storage_text(rj))
     except Exception:
         return None
     if not isinstance(obj, dict):
@@ -1700,7 +1728,7 @@ def _committed_hashes(state_dir):
     when no journal exists yet (all sealed releases count as committed)."""
     j = Path(state_dir).expanduser() / "ledger" / "config" / "journal.jsonl"
     try:
-        rows = [json.loads(x) for x in j.read_text().splitlines() if x.strip()]
+        rows = [json.loads(x) for x in _read_storage_text(j, MAX_CONFIG_JOURNAL_BYTES).splitlines() if x.strip()]
     except FileNotFoundError:
         return set()  # no journal: nothing is committed (the append IS the commit point)
     except Exception:
@@ -1726,7 +1754,7 @@ def load(state_dir=DEFAULT_STATE, live_yaml=DEFAULT_YAML):
         if cfg is None:
             # fallback: checkpoint.json (independent copy, PyYAML-free)
             try:
-                cfg = json.loads(P["checkpoint"].read_text())
+                cfg = json.loads(_read_storage_text(P["checkpoint"]))
                 if content_hash(cfg) != head["content_hash"]:
                     cfg = None
             except Exception:
@@ -1906,7 +1934,7 @@ def accept(cfg_or_bytes, *, proposed_by, authority_class="owner",
     atomic_write_json(tmp, pointer)
     cur = None
     try:
-        cur = json.loads(P["active"].read_text())
+        cur = json.loads(_read_storage_text(P["active"]))
     except Exception:
         cur = None
     if cur is not None and cur.get("content_hash") != head_hash:
@@ -1946,7 +1974,7 @@ def acks(state_dir=DEFAULT_STATE):
     if d.is_dir():
         for p_ in sorted(d.glob("*.json")):
             try:
-                rec = json.loads(p_.read_text())
+                rec = json.loads(_read_storage_text(p_))
                 out[p_.stem] = rec.get("content_hash")
             except Exception:
                 out[p_.stem] = None
