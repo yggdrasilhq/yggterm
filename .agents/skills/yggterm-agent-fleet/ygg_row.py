@@ -509,6 +509,7 @@ def render(entries, ttl_default=DEFAULT_TTL_HOURS):
 def cmd_list(a):
     store = rows_dir()
     entries = collect(store)
+    incomplete = False
     if a.campaign:
         n, _ = resolve_campaign(store, a.campaign)
         entries = [e for e in entries if e.get("n") == n]
@@ -517,17 +518,29 @@ def cmd_list(a):
             try:
                 r = subprocess.run(["ssh", h, "python3", REMOTE_PATH, "list", "--json"],
                                    capture_output=True, text=True, timeout=25)
-                for e in json.loads(r.stdout or "[]"):
+                if r.returncode != 0 or r.stderr.strip():
+                    incomplete = True
+                    print(f"⚠ {h}: peer inventory unavailable or incomplete (exit {r.returncode})", file=sys.stderr)
+                peer_entries = json.loads(r.stdout)
+                if not isinstance(peer_entries, list):
+                    raise ValueError("unknown peer inventory shape")
+                for e in peer_entries:
+                    if not isinstance(e, dict):
+                        incomplete = True
+                        print(f"⚠ {h}: malformed peer inventory row", file=sys.stderr)
+                        continue
                     e.setdefault("host", h)
                     entries.append(e)
-            except Exception as ex:
-                print(f"⚠ {h}: {ex}", file=sys.stderr)
+            except Exception:
+                incomplete = True
+                print(f"⚠ {h}: peer inventory could not be read", file=sys.stderr)
     entries.sort(key=lambda c: (str(c.get("id") or c.get("sub"))))
     if a.json:
-        print(json.dumps(entries, indent=1, default=str)); return
+        print(json.dumps(entries, indent=1, default=str)); return 3 if incomplete else 0
     if not entries:
-        print("= nothing registered here"); return
+        print("= nothing registered here"); return 3 if incomplete else 0
     print(render(entries))
+    return 3 if incomplete else 0
 
 
 def cmd_gc(a):
@@ -599,7 +612,7 @@ def main():
     c = sp.add_parser("show"); c.add_argument("id"); c.set_defaults(fn=cmd_show)
 
     a = p.parse_args()
-    a.fn(a)
+    sys.exit(a.fn(a))
 
 
 if __name__ == "__main__":

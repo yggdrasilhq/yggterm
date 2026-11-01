@@ -45,7 +45,7 @@ def cmd_agents(as_json):
     """Render owner-host observations; local PID visibility says nothing remote."""
     rows, errors = [], []
     rc, out, err = run([str(YGGBIN / "ygg_row.py"), "list", "--all-hosts", "--json"], 30)
-    if rc == 0:
+    if out.strip():
         try:
             rows = json.loads(out)
             if not isinstance(rows, list):
@@ -53,9 +53,11 @@ def cmd_agents(as_json):
                 rows = []
         except Exception:
             errors.append("row registry returned non-json")
-    else:
-        errors.append(f"row registry unavailable ({(err or out).strip()[:80] or rc})")
-    if rc == 0 and err.strip():
+    elif rc == 0:
+        errors.append("row registry returned an empty response")
+    if rc != 0:
+        errors.append(f"row registry unavailable or incomplete (exit {rc})")
+    if err.strip():
         errors.append("row registry reported incomplete coverage")
     live = []
     for record in rows:
@@ -65,7 +67,7 @@ def cmd_agents(as_json):
         row = dict(record)
         observation = row.get("process_liveness")
         if (not isinstance(observation, dict)
-                or observation.get("state") not in ("ALIVE", "DEAD", "UNKNOWN", "UNBOUND")
+                or observation.get("state") not in ("ALIVE", "DEAD", "REUSED", "UNKNOWN", "UNBOUND")
                 or not isinstance(observation.get("reason"), str)
                 or not observation["reason"].strip()):
             observation = {"state": "UNKNOWN", "reason": "owner_observation_unavailable"}
@@ -76,7 +78,7 @@ def cmd_agents(as_json):
         if observation["state"] in ("ALIVE", "DEAD"):
             row["dead"] = observation["state"] == "DEAD"
         live.append(row)
-    status = 3 if errors or any(row["process_liveness"]["state"] == "UNKNOWN" for row in live) else 0
+    status = 3 if errors or any(row["process_liveness"]["state"] in ("UNKNOWN", "REUSED") for row in live) else 0
     if as_json:
         print(json.dumps({"sessions": live, "errors": errors}, indent=1))
         return status
