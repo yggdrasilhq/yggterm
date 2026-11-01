@@ -27,6 +27,7 @@ def fixture():
     cat['accounts']['a1']['permitted_hosts'] = ['example-host']
     cat['plans']['pl1']['account'] = 'a1'
     cat['bindings']['b1']['reasoning'] = 'high'
+    cat['bindings']['b1']['capabilities'] = ['editorial', 'review']
     cfg['roles']['editor'].update(scenario_policy_ref='swap', authority_ref='example-owner',
                                 required_capabilities=['editorial'])
     cfg['editor_scenarios']['swap']['activation']['authority_ref'] = 'example-owner'
@@ -97,7 +98,7 @@ class PolicyTest(unittest.TestCase):
         p['role']['required_capabilities'].clear()
         r = s.revision
         r.clear()
-        self.assertEqual(s.editor_binding['capabilities'], ['editorial'])
+        self.assertEqual(s.editor_binding['capabilities'], ['editorial', 'review'])
         self.assertEqual(s.policy['role']['required_capabilities'], ['editorial'])
         self.assertEqual(s.revision['revision'], 1)
         with self.assertRaises(FrozenInstanceError):
@@ -142,6 +143,8 @@ class PolicyTest(unittest.TestCase):
             (('catalog', 'accounts', 'a1', 'permitted_hosts'), ['other-host']),
             (('catalog', 'accounts', 'a1', 'permitted_hosts'), None),
             (('catalog', 'bindings', 'b1', 'capabilities'), []),
+            (('catalog', 'bindings', 'b1', 'capabilities'), ['editorial']),
+            (('catalog', 'bindings', 'b1', 'capabilities'), ['review']),
             (('catalog', 'bindings', 'b1', 'task_restrictions'), ['unknown-task']),
             (('catalog', 'bindings', 'b1', 'task_restrictions'), False),
             (('catalog', 'bindings', 'b1', 'reasoning'), 'unsupported'),
@@ -153,7 +156,6 @@ class PolicyTest(unittest.TestCase):
             (('roles', 'editor', 'scenario_policy_ref'), 'missing'),
             (('roles', 'editor', 'default_binding_ref'), 'missing'),
             (('roles', 'editor', 'required_capabilities'), ['missing']),
-            (('editor_scenarios', 'swap', 'activation', 'authority_ref'), 'other'),
             (('schema_version',), 999),
             (('catalog', 'unexpected'), {}),
         ]
@@ -183,6 +185,31 @@ class PolicyTest(unittest.TestCase):
         self.held(self.loaded(cfg))
         with self.assertRaises(rp.Hold):
             rp.observe_default_editor(self.state, self.live, 'guessed-host')
+
+    def test_collection_pointer_selects_default_without_triggering_fallback(self):
+        cfg = deepcopy(self.cfg)
+        cfg['roles']['editor']['scenario_policy_ref'] = 'editor_scenarios'
+        # A fallback may require a different authority and need not list the
+        # already admitted default as its target. Observing it executes none.
+        cfg['catalog']['bindings']['fallback'] = deepcopy(cfg['catalog']['bindings']['b1'])
+        cfg['editor_scenarios']['swap']['activation']['authority_ref'] = 'another-authority'
+        cfg['editor_scenarios']['swap']['binding_order'] = ['fallback']
+        with patch.object(sc, 'load', return_value=self.loaded(cfg)):
+            selected = self.observe()
+        self.assertEqual(selected.editor_identity, 'b1')
+        self.assertEqual(selected.authority_ref, 'example-owner')
+        self.assertEqual(selected.scenario_policy_ref, 'editor_scenarios')
+        self.assertEqual(selected.policy['scenarios'], cfg['editor_scenarios'])
+        self.assertFalse((self.state / 'editorial/current-editor.json').exists())
+
+    def test_named_scenario_is_preserved_as_metadata_without_activation(self):
+        cfg = deepcopy(self.cfg)
+        cfg['editor_scenarios']['swap']['activation']['authority_ref'] = 'another-authority'
+        with patch.object(sc, 'load', return_value=self.loaded(cfg)):
+            selected = self.observe()
+        self.assertEqual(selected.policy['scenarios']['swap']['activation']['authority_ref'],
+                         'another-authority')
+        self.assertEqual(selected.authority_ref, 'example-owner')
 
     def test_verified_checkpoint_and_revision_disagreement(self):
         release = self.state / 'config/releases' / sc.content_hash(self.cfg) / 'release.json'

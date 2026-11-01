@@ -10,6 +10,10 @@ An observation records policy/control identity at read time. It is NOT a launch
 token and closes no policy-read-to-launch race. The native controller must
 still validate fresh common-fence owner stop, capability, budget, quota,
 privacy and actual native account execution before submitting anything.
+
+scenario_policy_ref may name the editor_scenarios collection or a scenario
+within it. Those are preserved fallback-policy references, not a trigger or
+authorization to execute a scenario while observing the admitted default.
 """
 from dataclasses import dataclass
 import json
@@ -156,12 +160,13 @@ def observe_default_editor(state_dir, live_yaml, host_ref):
         if role.get('binding_refs') is not None and ref not in role['binding_refs']:
             raise Hold('default_outside_role_bindings')
         scenario_ref = _string(role['scenario_policy_ref'])
-        scenario = _record(cfg['editor_scenarios'], scenario_ref)
+        if scenario_ref == 'editor_scenarios':
+            scenarios = cfg['editor_scenarios']
+            if type(scenarios) is not dict:
+                raise Hold('unsupported_scenario_policy')
+        else:
+            scenarios = {scenario_ref: _record(cfg['editor_scenarios'], scenario_ref)}
         authority = _string(role['authority_ref'])
-        if (scenario['activation'].get('authority_ref') != authority
-                or scenario['activation'].get('requires_admitted_target') is not True
-                or ref not in scenario['binding_order']):
-            raise Hold('unsupported_scenario_policy')
         harness = _record(cat['harnesses'], binding['harness'])
         provider = _record(cat['providers'], binding['provider'])
         account_ref = _string(binding['account'])
@@ -180,7 +185,8 @@ def observe_default_editor(state_dir, live_yaml, host_ref):
         caps = binding['capabilities']
         required = role.get('required_capabilities', [])
         if (type(required) is not list or any(type(c) is not str for c in required)
-                or 'editorial' not in caps or not set(required).issubset(caps)):
+                or not {'editorial', 'review'}.issubset(caps)
+                or not set(required).issubset(caps)):
             raise Hold('editor_capability_missing')
         restrictions = binding.get('task_restrictions', [])
         if type(restrictions) not in (list, dict) or restrictions:
@@ -191,7 +197,7 @@ def observe_default_editor(state_dir, live_yaml, host_ref):
             raise Hold('unqualified_native_shape')
         _string(binding['model'])
         editor_binding = dict(identity=ref, **binding)
-        projection = dict(role=role, scenario=scenario, harness=harness,
+        projection = dict(role=role, scenarios=scenarios, harness=harness,
             provider=provider, account=dict(provider=account['provider'], permitted_hosts=hosts),
             plan=plan, host_ref=host, authority_ref=authority)
         return Selection(ref, binding_digest(editor_binding), expected['content_hash'],
