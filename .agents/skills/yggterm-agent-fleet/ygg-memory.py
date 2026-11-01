@@ -2327,24 +2327,56 @@ def unseen_journal_entries(root: Path, watermark: dict, namespace: str, harness:
     return result
 
 
-def mark_events_seen(root: Path, watermark: dict, namespace: str | None, harness: str) -> None:
-    vectors = watermark.setdefault("seen_origin_seq", {})
-    for record in read_journal_entries(root, after_seq=0, namespace=namespace, target_harness=harness):
+def _ack_from_records(records: list, watermark: dict, namespace, harness) -> dict:
+    """Pure derivation from one detached snapshot and its legacy ceiling."""
+    vectors = {ns: dict(vector) for ns, vector in watermark.get("seen_origin_seq", {}).items()}
+    for record in records:
+        if namespace is not None and record.get("ns") != namespace:
+            continue
+        if not matches_target_harness(record.get("target_harness", "all"), harness):
+            continue
         origin = record.get("origin")
         if record.get("event_id") and origin:
             vector = vectors.setdefault(record.get("ns", ""), {})
             vector[origin] = max(vector.get(origin, 0), record.get("seq", 0))
-    # Selective acknowledgements older than the full vector no longer need an
-    # unbounded UUID entry.
     covered = {
-        record_event_id(record)
-        for record in read_journal_entries(root)
-        if record.get("origin")
-        and record.get("seq", 0)
+        record_event_id(record) for record in records
+        if record.get("origin") and record.get("seq", 0)
         <= vectors.get(record.get("ns", ""), {}).get(record.get("origin"), 0)
     }
-    watermark["seen_event_ids"] = sorted(set(watermark.get("seen_event_ids", [])) - covered)
-    watermark["last_seq"] = get_latest_seq(root)
+    return {
+        "seen_origin_seq": vectors,
+        "seen_event_ids": sorted(set(watermark.get("seen_event_ids", [])) - covered),
+        "last_seq": max((record.get("seq", 0) for record in records), default=0),
+    }
+
+
+def _ji_ack_projection(root: Path, watermark: dict, namespace, harness) -> dict:
+    """Derive acknowledgment once from the index reader's coherent snapshot.
+
+    The existing reader keeps refresh and consuming rows in one transaction.
+    Calculation afterwards uses detached records, so later invalidation or
+    appends cannot move the consumed sequence ceiling or mutate this view.
+    A missing journal must never reuse a stale index as authoritative history.
+    """
+    if not get_journal_path(root).exists():
+        raise ValueError("journal absent; cached history is not authoritative")
+    records = _ji_read(root, 0, None, None)
+    if not get_journal_path(root).exists():
+        raise ValueError("journal disappeared during snapshot")
+    return _ack_from_records(records, watermark, namespace, harness)
+
+
+def mark_events_seen(root: Path, watermark: dict, namespace: str | None, harness: str) -> None:
+    try:
+        result = _ji_ack_projection(root, watermark, namespace, harness)
+    except Exception:
+        # One source scan supplies both acknowledgment and its sequence ceiling;
+        # a later append can never advance last_seq past an unseen legacy event.
+        result = _ack_from_records(_read_journal_entries_naive(root), watermark, namespace, harness)
+    # Calculation (including sorting and fallback) must succeed before any
+    # caller-owned vector or selective identity is mutated.
+    watermark.update(result)
 
 
 _AUTOMATIC_BASE = object()
