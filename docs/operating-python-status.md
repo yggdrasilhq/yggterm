@@ -57,3 +57,11 @@ The memory component keeps its native owner-managed entrypoint authoritative.
 Installing this payload does not arm dreaming, alter active authentication,
 restart desktop sessions or establish fleet health. See the filesystem,
 steering, verb-dispersal and session/role-ledger specs for the remaining gates.
+
+The source review-dispatch components now include a Linux pre-model memory
+gate, bounded default-editor policy observation and a local durable
+intent/authorization/start barrier. These are controller primitives. They
+do not automatically intercept every queue/harness launch, enforce a worker's
+filesystem scope, supervise native model execution or apply accepted queue
+results. See [review dispatch](spec-review-dispatch.md) and
+[worker entry](spec-worker-entry.md) for the exact boundaries and falsifiers.
