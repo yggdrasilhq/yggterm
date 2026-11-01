@@ -1,7 +1,9 @@
 # Trusted worker review dispatch
 
-Status: proposed bridge design. The accepted `session_review` and
-`review_completion` kernels are prerequisites, not a deployed dispatcher.
+Status: the review/completion kernels, durable job store, immutable Git
+snapshot, staging bridge and read-only default-editor observation are
+implemented. The Linux local invocation barrier below supplies another
+bounded mechanism; it is not a deployed automatic dispatcher.
 Current queue results remain review-pending until this bridge is qualified.
 Our Composer proposes/edits/composes improvements; the configured independent
 acceptance reviewer remains the separate `roles.editor` execution.
@@ -118,6 +120,35 @@ distinct; different role labels do not establish independence. Credentials
 remain in the local authorized native/vault channel. Recover access through
 the configured credential chain before escalating to the owner; distinguish
 blocked recovery from quota, reserves, policy holds and missing work.
+
+`tools/swarmharness/review_invocation.py` provides the local start mechanism
+for an already admitted and staged job. A trusted, bounded local verifier
+binds the exact invocation plan and job state before broker creation and
+immediately before submission authorization. It must incorporate the actual
+policy, account, quota, budget, privacy and memory preconditions; the mechanism
+does not implement those adapters or accept worker-supplied permission.
+The broker remains behind a pipe barrier until durable authorization commits
+through the job store's owner-stop fence. Release occurs outside both local
+mutation fences. Parent death before release produces EOF and no command
+execution. Retained intent prevents a blind duplicate after every tested
+crash boundary, including an authorized attempt without a start receipt.
+Reconciled intent or authorization receipts are observations, never a fresh
+grant to launch a second broker through another storage root. The helper
+starts in a fixed safe environment. The requested command environment is
+passed through a sealed anonymous Linux descriptor and applied only at
+post-grant exec; loader variables cannot run command-supplied hooks before
+authorization. Environment values are not persisted in invocation metadata.
+
+The receipt identifies the actual local broker PID/start token, with native
+model session identity explicitly unverified and task acceptance pending.
+The command/environment are copied and recorded by digest; native stdin is
+an opened immutable private input artifact. This is qualified local Linux,
+cooperative same-UID storage and exclusive child waiting, without filesystem
+confinement, automated recovery, deadline/output supervision after release,
+native identity or verdict intake. The controller still owns supervision and
+qualified cancellation. Do not deploy an unattended real model through this
+primitive without those remaining adapters. Its hermetic marker controls do
+not certify an actual model session or a working automatic correction loop.
 
 A trusted invocation record plus exact payload/chain-head verification admits
 the verdict into SessionReview. The worker cannot supply its own verifier or
