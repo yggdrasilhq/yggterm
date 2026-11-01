@@ -68,6 +68,10 @@ class EntryTests(unittest.TestCase):
         self.assertEqual(error.code, 'memory_gate_failed')
         self.assertEqual(popen.call_count, 1)  # Only the gate process, never the harness.
         self.assertIn('"status": "ok"', (Path(error.receipt) / 'gate.stdout').read_text())
+        requested = json.loads((Path(error.receipt) / 'REQUEST.json').read_text())
+        self.assertEqual(requested['harness'], 'example')
+        self.assertEqual(requested['namespace'], '-example')
+        self.assertEqual(requested['qualified_source_sha256'], gate.source_sha256)
 
     def test_unknown_and_mismatched_results_never_start_worker(self):
         variants = [dict(self.good, status='unknown'), dict(self.good, harness='other'),

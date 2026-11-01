@@ -191,6 +191,13 @@ def guarded_spawn(gate, command, *, cwd, evidence_root, environment=None,
             raise Held('gate_evidence_inside_worker_workspace')
         stage = root / str(uuid.uuid4())
         stage.mkdir(mode=0o700)
+        if type(gate) is not Gate:
+            raise Held('invalid_gate_specification')
+        _write(stage / 'REQUEST.json', json.dumps({
+            'attempt_id': stage.name, 'harness': gate.harness, 'namespace': gate.namespace,
+            'qualified_source_sha256': gate.source_sha256,
+            'command_sha256': _hash(json.dumps(list(command)).encode()),
+            'source_or_task_acceptance': 'PENDING'}, sort_keys=True).encode())
         child_environment = dict(os.environ if environment is None else environment)
         receipt = _gate(gate, stage, child_environment, gate_timeout, gate_output_cap)
         _write(stage / 'MEMORY-READY.json', json.dumps(asdict(receipt), sort_keys=True).encode())
