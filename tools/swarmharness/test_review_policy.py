@@ -2,8 +2,11 @@
 from copy import deepcopy
 from dataclasses import asdict, FrozenInstanceError, replace
 import json
+import os
 from pathlib import Path
 import tempfile
+import subprocess
+import sys
 import unittest
 from unittest.mock import patch
 import uuid
@@ -277,9 +280,60 @@ class PolicyTest(unittest.TestCase):
         with self.assertRaises(rp.Hold):
             self.observe()
         override.unlink()
-        with patch.object(Path, 'read_bytes', side_effect=PermissionError('invented')):
+        with patch.object(sc, '_read_storage_text', side_effect=PermissionError('invented')):
             with self.assertRaises(rp.Hold):
                 self.observe()
+
+    def test_actual_fifo_policy_leaves_hold_promptly(self):
+        for relative in ['control/deny.json', 'config/active.json',
+                         'config/checkpoint.json', 'ledger/config/journal.jsonl']:
+            with self.subTest(relative=relative):
+                target = self.state / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                original = target.read_bytes() if target.is_file() else None
+                if target.exists():
+                    target.unlink()
+                os.mkfifo(target)
+                # Force the canonical recovery paths as well as primary reads.
+                head = self.state / 'config/active.json'
+                head_original = head.read_bytes() if relative != 'config/active.json' else None
+                release = self.state / 'config/releases' / sc.content_hash(self.cfg) / 'release.json'
+                release_original = release.read_bytes()
+                if relative == 'config/checkpoint.json':
+                    release.write_text('corrupt')
+                if relative == 'ledger/config/journal.jsonl':
+                    head.write_text('corrupt')
+                command = [sys.executable, '-c',
+                    'from swarmharness import review_policy as p\n'
+                    'try:p.observe_default_editor(' + repr(str(self.state)) + ','
+                    + repr(str(self.live)) + ',"example-host")\n'
+                    'except p.Hold:print("HOLD")\n'
+                    'else:raise SystemExit("unexpected selection")\n']
+                try:
+                    environment = dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parents[1]))
+                    result = subprocess.run(command, env=environment, capture_output=True,
+                                            text=True, timeout=3)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stdout.strip(), 'HOLD')
+                finally:
+                    target.unlink()
+                    if original is not None:
+                        target.write_bytes(original)
+                    if head_original is not None:
+                        head.write_bytes(head_original)
+                    release.write_bytes(release_original)
+
+    def test_fifo_release_and_oversized_reader_are_bounded(self):
+        release = self.state / 'config/releases' / sc.content_hash(self.cfg) / 'release.json'
+        release.unlink()
+        os.mkfifo(release)
+        # A verified regular checkpoint can still supply the active config.
+        selected = self.observe()
+        self.assertEqual(selected.config_digest, sc.content_hash(self.cfg))
+        large = self.root / 'oversized'
+        large.write_bytes(b'x' * 33)
+        with self.assertRaises(ValueError):
+            sc._read_storage_text(large, 32)
 
 
 if __name__ == '__main__':

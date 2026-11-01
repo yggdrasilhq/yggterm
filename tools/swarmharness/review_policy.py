@@ -82,7 +82,7 @@ def _optional_file(path):
         return None
     if not stat.S_ISREG(info.st_mode) or info.st_size > sc.MAX_BYTES:
         raise Hold('unsafe_control_storage')
-    return path.read_bytes()
+    return sc._read_storage_text(path).encode('utf-8')
 
 
 def _unique_object(pairs):
