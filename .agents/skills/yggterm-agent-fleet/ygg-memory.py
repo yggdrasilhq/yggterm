@@ -16,11 +16,13 @@ etc.) to:
 """
 
 import argparse
+import bisect
 import contextlib
 import datetime
 import fcntl
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -3968,7 +3970,7 @@ def get_dream_dir(root: Path, ns: str, create: bool = True) -> Path:
     return d
 
 
-def load_dream_watermark(root: Path, ns: str) -> dict:
+def load_dream_watermark(root: Path, ns: str, *, view=None) -> dict:
     """Scratch cache FIRST, journal floor SECOND (round-4: amnesiac
     watermarks). The scratch file is per-host; the journal is the fleet
     truth. When any host dreamed this ns, its NOW.md publish (origin
@@ -3986,32 +3988,33 @@ def load_dream_watermark(root: Path, ns: str) -> dict:
             watermark.update(loaded)
     except Exception:
         pass
-    floor = 0
-    jpath = get_journal_path(root)
-    if jpath.exists():
-        with open(jpath, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    rec = json.loads(line)
-                except Exception:
-                    continue
-                if (
-                    rec.get("ns") == ns
-                    and rec.get("file") == "NOW.md"
-                    and rec.get("origin") == DREAM_ORIGIN
-                ):
-                    # The publish event fires a few records AFTER the dream
-                    # consumed its deltas; the EXACT consumed floor rides the
-                    # summary marker so nothing is skipped and nothing is
-                    # re-collected beyond the dream's own watermark.
-                    marker = re.search(
-                        r"\[consumed seq (\d+)\]", str(rec.get("summary", ""))
-                    )
-                    if marker:
-                        floor = max(floor, int(marker.group(1)))
+    floor = view.floors.get(ns, 0) if view is not None else 0
+    if view is None:
+        jpath = get_journal_path(root)
+        if jpath.exists():
+            with open(jpath, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except Exception:
+                        continue
+                    if (
+                        rec.get("ns") == ns
+                        and rec.get("file") == "NOW.md"
+                        and rec.get("origin") == DREAM_ORIGIN
+                    ):
+                        # The publish event fires a few records AFTER the dream
+                        # consumed its deltas; the EXACT consumed floor rides the
+                        # summary marker so nothing is skipped and nothing is
+                        # re-collected beyond the dream's own watermark.
+                        marker = re.search(
+                            r"\[consumed seq (\d+)\]", str(rec.get("summary", ""))
+                        )
+                        if marker:
+                            floor = max(floor, int(marker.group(1)))
     if floor > watermark.get("last_seq", 0):
         watermark["last_seq"] = floor
     return watermark
@@ -5383,6 +5386,73 @@ DREAM_SUMMARY_PREFIXES = ("dream ", "owner-now update")
 DREAM_QUIESCENCE_SECONDS = 15 * 60
 
 
+class _DreamJournalView:
+    """Command-local observation, NEVER an apply/composition permission.
+
+    The journal reader owns refresh+generation coherence and safe raw fallback.
+    Decode once, partition once, and query sequence suffix statistics without
+    copying or sorting _global for each namespace. Physical duplicate seqs stay
+    distinct. Discard this view after candidate selection or one canary pass.
+    """
+
+    def __init__(self, root: Path):
+        self.floors = {}
+        self.activity = {}
+        self.latest = {}
+        # Floors historically inspect every publish, including seq zero;
+        # activity retains the public reader's default seq > 0 contract.
+        for rec in read_journal_entries(root, after_seq=float("-inf")):
+            ns = rec.get("ns")
+            if rec.get("file") == "NOW.md" and rec.get("origin") == DREAM_ORIGIN:
+                marker = re.search(r"\[consumed seq (\d+)\]", str(rec.get("summary", "")))
+                if marker:
+                    self.floors[ns] = max(self.floors.get(ns, 0), int(marker.group(1)))
+            if rec.get("seq", 0) <= 0 or str(rec.get("summary", "")).startswith(DREAM_SUMMARY_PREFIXES):
+                continue
+            value = rec.get("ts", 0)
+            try:
+                ts = float(value)
+            except (ValueError, TypeError, OverflowError):
+                raise ValueError("invalid dream activity timestamp metadata") from None
+            if type(value) not in (int, float) or not math.isfinite(ts):
+                raise ValueError("invalid dream activity timestamp metadata")
+            self.latest[ns] = max(self.latest.get(ns, ts), ts)
+            self.activity.setdefault(ns, []).append(
+                (rec.get("seq", 0), float(rec.get("ts", float("inf"))), "ts" not in rec)
+            )
+        for ns, rows in self.activity.items():
+            rows.sort(key=lambda row: row[0])
+            seqs = [row[0] for row in rows]
+            suffix_earliest = [row[1] for row in rows]
+            suffix_missing = [row[2] for row in rows]
+            for i in range(len(rows) - 2, -1, -1):
+                suffix_earliest[i] = min(suffix_earliest[i], suffix_earliest[i + 1])
+                suffix_missing[i] = suffix_missing[i] or suffix_missing[i + 1]
+            self.activity[ns] = (seqs, suffix_earliest, suffix_missing)
+
+    def _namespaces(self, ns):
+        return (ns,) if ns == "_global" else (ns, "_global")
+
+    def pending(self, ns, consumed):
+        count, earliest = 0, None
+        now = time.time()
+        for name in self._namespaces(ns):
+            seqs, suffix, missing = self.activity.get(name, ((), (), ()))
+            start = bisect.bisect_right(seqs, consumed)
+            count += len(seqs) - start
+            if start < len(seqs):
+                stamp = min(suffix[start], now) if missing[start] else suffix[start]
+                earliest = stamp if earliest is None else min(earliest, stamp)
+        # Any overdue pending delta must stay visible under new arrivals.
+        age = now - earliest if earliest is not None else 0.0
+        return {"pending": count, "oldest_pending_s": int(age),
+                "overdue": bool(count) and age > DREAM_PROGRESS_DEADLINE_S}
+
+    def latest_activity(self, ns):
+        stamps = [self.latest[n] for n in self._namespaces(ns) if n in self.latest]
+        return max(stamps) if stamps else None
+
+
 def dream_live_activity(root: Path, ns: str) -> list:
     """Non-dream journal records for THIS ns (plus _global, which the
     dreamer also writes) — the quiescence and fencing input. The dream's
@@ -5417,14 +5487,18 @@ def dream_autoclaw_activity_age(home: Path | None = None) -> float | None:
         return None
 
 
-def dream_quiescence_violation(root: Path, ns: str) -> str:
+def dream_quiescence_violation(root: Path, ns: str, *, view=None) -> str:
     """Gate 3 (round-3 consult): the dreamer never competes with an active
     writer — a journal write inside the cooldown window defers the dream.
     AutoClaw activity (heartbeat) counts as live writer activity too."""
-    live = dream_live_activity(root, ns)
-    if not live:
+    if view is None:
+        live = dream_live_activity(root, ns)
+        latest = float(live[-1].get("ts", 0)) if live else None
+    else:
+        latest = view.latest_activity(ns)
+    if latest is None:
         return ""
-    age = time.time() - float(live[-1].get("ts", 0))
+    age = time.time() - latest
     if age < DREAM_QUIESCENCE_SECONDS:
         return (
             f"ns {ns} is ACTIVE (last non-dream write {int(age)}s ago, "
@@ -5536,17 +5610,19 @@ def _dream_backoff_remaining(root: Path) -> float:
         return 0.0
 
 
-def _dream_pending_summary(root: Path, ns: str) -> dict:
+def _dream_pending_summary(root: Path, ns: str, *, view=None) -> dict:
     """Per-namespace coverage state (slice 1): deltas pending, oldest pending
     age, and whether the progress deadline is blown."""
     try:
-        watermark = load_dream_watermark(root, ns)
+        watermark = load_dream_watermark(root, ns, view=view)
     except Exception:
         watermark = {"last_seq": 0}
     consumed = watermark.get("last_seq", 0)
+    if view is not None:
+        return view.pending(ns, consumed)
     live = [r for r in dream_live_activity(root, ns) if r.get("seq", 0) > consumed]
     now = time.time()
-    oldest = min((now - float(r.get("ts", now)) for r in live), default=0.0)
+    oldest = max((now - float(r.get("ts", now)) for r in live), default=0.0)
     return {
         "pending": len(live),
         "oldest_pending_s": int(oldest),
@@ -5612,6 +5688,12 @@ def _dream_auto(root: Path, ns_filter: str, args, dreamer: dict | None = None) -
     candidates = []
     dream_root = root / "dream"
     if dream_root.is_dir():
+        try:
+            view = _DreamJournalView(root)
+        except (ValueError, TypeError, OverflowError):
+            _dream_auto_backoff(root, "invalid journal activity timestamp metadata")
+            _dream_receipt(root, "failed", "journal metadata invalid; candidates not admitted")
+            return "auto-dream: journal metadata invalid — decisions deferred"
         for ns_dir in sorted(dream_root.iterdir()):
             if not ns_dir.is_dir():
                 continue
@@ -5628,7 +5710,7 @@ def _dream_auto(root: Path, ns_filter: str, args, dreamer: dict | None = None) -
                     continue
             elif ns_filter and ns_filter != "_global" and ns != ns_filter:
                 continue
-            watermark = load_dream_watermark(root, ns)
+            watermark = load_dream_watermark(root, ns, view=view)
             last_ts = watermark.get("last_dream_ts")
             if last_ts:
                 try:
@@ -5640,14 +5722,13 @@ def _dream_auto(root: Path, ns_filter: str, args, dreamer: dict | None = None) -
                         continue
                 except Exception:
                     pass
-            if dream_quiescence_violation(root, ns):
+            if dream_quiescence_violation(root, ns, view=view):
                 continue
             if (ns_dir / "pending" / "MANIFEST.json").is_file():
                 continue
             consumed = watermark.get("last_seq", 0)
-            delta = sum(
-                1 for rec in dream_live_activity(root, ns) if rec.get("seq", 0) > consumed
-            )
+            summary = view.pending(ns, consumed)
+            delta = summary["pending"]
             # [slice 2 trigger] work_due = new_source_delta OR temporal_deadline_due:
             # an expired/due claim with ZERO new deltas still deserves a dream.
             if delta <= 0 and not temporal_work_due(root, ns):
@@ -5657,7 +5738,6 @@ def _dream_auto(root: Path, ns_filter: str, args, dreamer: dict | None = None) -
             # [slice 1 fairness] score = delta * age pressure so a starving
             # small namespace (old pending, few deltas) can outrank a churny
             # big one; the pure-delta sort starved smaller namespaces.
-            summary = _dream_pending_summary(root, ns)
             age_hours = summary["oldest_pending_s"] / 3600.0
             candidates.append((delta * (1.0 + min(age_hours, 24.0) / 6.0), delta, ns, summary))
     if not candidates:
@@ -7250,8 +7330,13 @@ def cmd_canary(args):
             pass
         # A live tick should leave receipts; absence over 2h with any pending
         # namespace means the controller is not running at all.
-        for ns_dir in sorted(dream_root.glob("*/")):
-            summary = _dream_pending_summary(root, ns_dir.name)
+        try:
+            view = _DreamJournalView(root)
+        except (ValueError, TypeError, OverflowError):
+            violations.append("dreamer: journal activity timestamp metadata invalid — progress UNKNOWN")
+            view = None
+        for ns_dir in sorted(dream_root.glob("*/")) if view is not None else ():
+            summary = _dream_pending_summary(root, ns_dir.name, view=view)
             if summary["pending"] <= 0:
                 continue
             if summary["overdue"]:
