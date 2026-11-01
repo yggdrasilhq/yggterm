@@ -10,6 +10,7 @@ Every subcommand degrades honestly per host: a dead peer is a line in the
 output, never a crash — supervision must work from a partially alive fleet.
 """
 import json, os, subprocess, sys
+import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -41,32 +42,60 @@ def ssh(host, cmd, timeout=30):
 
 
 def cmd_agents(as_json):
-    """Row registry first (daemon hosts), /proc liveness second (everything)."""
+    """Render owner-host observations; local PID visibility says nothing remote."""
     rows, errors = [], []
     rc, out, err = run([str(YGGBIN / "ygg_row.py"), "list", "--all-hosts", "--json"], 30)
     if rc == 0:
         try:
             rows = json.loads(out)
+            if not isinstance(rows, list):
+                errors.append("row registry returned an unknown inventory shape")
+                rows = []
         except Exception:
             errors.append("row registry returned non-json")
     else:
         errors.append(f"row registry unavailable ({(err or out).strip()[:80] or rc})")
-    # prune dead pids
+    if rc == 0 and err.strip():
+        errors.append("row registry reported incomplete coverage")
     live = []
-    for r in rows if isinstance(rows, list) else []:
-        pid = r.get("pid")
-        if pid and not Path(f"/proc/{pid}").exists():
-            r["dead"] = True
-        live.append(r)
+    for record in rows:
+        if not isinstance(record, dict):
+            errors.append("row registry contained a malformed row")
+            continue
+        row = dict(record)
+        observation = row.get("process_liveness")
+        if (not isinstance(observation, dict)
+                or observation.get("state") not in ("ALIVE", "DEAD", "UNKNOWN", "UNBOUND")
+                or not isinstance(observation.get("reason"), str)
+                or not observation["reason"].strip()):
+            observation = {"state": "UNKNOWN", "reason": "owner_observation_unavailable"}
+        row["process_liveness"] = dict(observation)
+        # A legacy flag may be stale. Only the typed owner observation can
+        # derive it; missing or unknown is never converted into either verdict.
+        row.pop("dead", None)
+        if observation["state"] in ("ALIVE", "DEAD"):
+            row["dead"] = observation["state"] == "DEAD"
+        live.append(row)
+    status = 3 if errors or any(row["process_liveness"]["state"] == "UNKNOWN" for row in live) else 0
     if as_json:
         print(json.dumps({"sessions": live, "errors": errors}, indent=1))
-        return
-    print(f"agents ps — {len(live)} registered rows" + (f" ({len(errors)} registry errors)" if errors else ""))
+        return status
+    def cell(value, width):
+        text = str(value) if isinstance(value, (str, int)) else "?"
+        text = "".join(" " if unicodedata.category(char).startswith("C") else char
+                       for char in text)
+        return text[:width]
+    print(f"agents ps — {len(live)} registered rows; owner observation snapshot"
+          + (f" ({len(errors)} registry errors)" if errors else ""))
+    print(f"  {'ID':<10} {'HOST':<12} {'PID':<8} {'PROCESS':<8} {'HARNESS':<10} PURPOSE")
     for r in live:
-        flag = " DEAD" if r.get("dead") else ""
-        print(f"  {str(r.get('row') or r.get('id') or '?'):8} {str(r.get('host') or '?'):6} pid={r.get('pid')} {str(r.get('claim') or r.get('title') or '')[:60]}{flag}")
+        print(f"  {cell(r.get('row') or r.get('id'), 10):<10} "
+              f"{cell(r.get('host'), 12):<12} {cell(r.get('pid'), 8):<8} "
+              f"{r['process_liveness']['state']:<8} {cell(r.get('harness'), 10):<10} "
+              f"{cell(r.get('purpose') or r.get('title') or r.get('claim'), 60)}")
     for e in errors:
-        print(f"  ! {e}")
+        print(f"  ! {cell(e, 160)}")
+    return status
 
 
 def zai_plans_local():
@@ -169,7 +198,7 @@ def main():
     as_json = "--json" in sys.argv
     verb = args[0] if args else ""
     if verb == "agents":
-        cmd_agents(as_json)
+        sys.exit(cmd_agents(as_json))
     elif verb in ("fleet", "pressure"):
         cmd_pressure(as_json)
     elif verb == "board":
