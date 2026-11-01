@@ -18,6 +18,7 @@ is no automated replay/recovery/succession. Process handles on post-release
 holds are retained; absence of a receipt NEVER authorizes another launch.
 """
 from dataclasses import dataclass
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -52,7 +53,7 @@ class Receipt:
 
 # No caller-controlled program executes before exact one-byte grant + EOF.
 # Parent death closes its writer; EOF alone exits without executing anything.
-_BARRIER = '''import os,sys
+_BARRIER = '''import os,sys,json
 fd=int(sys.argv[1])
 grant=b''
 while True:
@@ -62,13 +63,18 @@ while True:
  if len(grant)>1:os._exit(125)
 os.close(fd)
 if grant!=b'G':os._exit(125)
-os.execvpe(sys.argv[2],sys.argv[2:],os.environ)
+environment_fd=int(sys.argv[2])
+environment=json.loads(os.read(environment_fd,262145))
+os.close(environment_fd)
+os.execvpe(sys.argv[3],sys.argv[3:],environment)
 '''
 
 
 class Broker:
     def __init__(self, root, *, worker_workspace, qualified_local=False):
         if (sys.platform != 'linux' or not hasattr(os, 'pidfd_open')
+                or not hasattr(os, 'memfd_create') or not hasattr(os, 'MFD_ALLOW_SEALING')
+                or not all(hasattr(fcntl,n) for n in ('F_ADD_SEALS','F_SEAL_SEAL','F_SEAL_GROW','F_SEAL_SHRINK','F_SEAL_WRITE'))
                 or not hasattr(signal, 'pidfd_send_signal')):
             raise Hold('unsupported_process_identity')
         self.storage = storage.Store(root, qualified_local=qualified_local)
@@ -92,7 +98,7 @@ class Broker:
         """
         process = None
         released = False
-        read_fd = write_fd = pidfd = input_fd = None
+        read_fd = write_fd = pidfd = input_fd = environment_fd = None
         try:
             if (not callable(authorize) or type(command) not in (list, tuple)
                     or not command or any(type(x) is not str or '\0' in x for x in command)
@@ -103,6 +109,9 @@ class Broker:
                     or type(expected_revision) is not int or type(generation) is not int):
                 raise Hold('invalid_launch_input')
             command, environment = tuple(command), dict(environment)
+            environment_bytes=jobs._bytes(environment)
+            if len(environment_bytes)>256*1024:
+                raise Hold('environment_bound')
             ids = json.loads(jobs._bytes(operation_ids))
             jobs._keys(ids, 'intent authorize start')
             for value in ids.values():
@@ -153,16 +162,26 @@ class Broker:
                 storage._write(root/'intent.json', jobs._bytes(plan))
                 storage._syncdir(root)
                 self._checkpoint('before_intent')
-                current = store.change('intent', operation_id=ids['intent'], expected_revision=expected_revision,
-                    token=token, generation=generation, data=dict(intent_sha256=digest)).state
+                intent = store.change('intent', operation_id=ids['intent'], expected_revision=expected_revision,
+                    token=token, generation=generation, data=dict(intent_sha256=digest))
+                if intent.reconciled:
+                    raise Hold('invocation_intent_requires_reconciliation')
+                current = intent.state
                 self._checkpoint('after_intent')
+                environment_fd=os.memfd_create('ygg-review-command-env',os.MFD_CLOEXEC|os.MFD_ALLOW_SEALING)
+                if os.write(environment_fd,environment_bytes)!=len(environment_bytes):
+                    raise Hold('environment_transfer_unresolved')
+                os.lseek(environment_fd,0,os.SEEK_SET)
+                fcntl.fcntl(environment_fd,fcntl.F_ADD_SEALS,
+                    fcntl.F_SEAL_SEAL|fcntl.F_SEAL_GROW|fcntl.F_SEAL_SHRINK|fcntl.F_SEAL_WRITE)
                 read_fd, write_fd = os.pipe2(os.O_CLOEXEC)
                 with (root/'stdout').open('xb') as out, (root/'stderr').open('xb') as err:
                     os.chmod(root/'stdout', 0o600)
                     os.chmod(root/'stderr', 0o600)
                     process = subprocess.Popen([sys.executable, '-I', '-c', _BARRIER,
-                        str(read_fd), *command], env=environment, cwd=directory,
-                        stdin=input_fd, stdout=out, stderr=err, pass_fds=(read_fd,), start_new_session=True)
+                        str(read_fd), str(environment_fd), *command],
+                        env=dict(PATH='/usr/bin:/bin',LC_ALL='C'), cwd=directory,
+                        stdin=input_fd, stdout=out, stderr=err, pass_fds=(read_fd,environment_fd), start_new_session=True)
                 os.close(read_fd)
                 read_fd = None
                 pidfd = os.pidfd_open(process.pid)
@@ -175,8 +194,11 @@ class Broker:
                 self._checkpoint('before_authorize')
                 if authorize(json.loads(jobs._bytes(plan)), json.loads(jobs._bytes(current))) is not True:
                     raise Hold('authorization_unverified')
-                current = store.change('authorize', operation_id=ids['authorize'],
-                    expected_revision=expected_revision+1, token=token, generation=generation).state
+                authorization = store.change('authorize', operation_id=ids['authorize'],
+                    expected_revision=expected_revision+1, token=token, generation=generation)
+                if authorization.reconciled:
+                    raise Hold('submission_authorization_requires_reconciliation')
+                current = authorization.state
                 self._checkpoint('after_authorize')
             # No model/network emission while either local mutation fence is held.
             self._checkpoint('before_release')
@@ -186,9 +208,12 @@ class Broker:
             os.close(write_fd)
             write_fd = None
             self._checkpoint('after_release')
-            current = store.change('record_start', operation_id=ids['start'],
+            started_receipt = store.change('record_start', operation_id=ids['start'],
                 expected_revision=expected_revision+2, token=token, generation=generation,
-                data=dict(receipt_sha256=jobs.digest(started))).state
+                data=dict(receipt_sha256=jobs.digest(started)))
+            if started_receipt.reconciled:
+                raise Hold('start_receipt_requires_reconciliation')
+            current=started_receipt.state
             self._checkpoint('after_start')
             return Receipt(process, digest, current, str(root))
         except Exception as error:
@@ -196,7 +221,7 @@ class Broker:
             raise Hold(code, process, released) from None
         finally:
             active_error = sys.exc_info()[1]
-            for fd in (read_fd, write_fd, input_fd):
+            for fd in (read_fd, write_fd, input_fd, environment_fd):
                 if fd is not None:
                     try:
                         os.close(fd)

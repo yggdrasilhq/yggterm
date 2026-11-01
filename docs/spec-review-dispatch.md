@@ -132,6 +132,12 @@ through the job store's owner-stop fence. Release occurs outside both local
 mutation fences. Parent death before release produces EOF and no command
 execution. Retained intent prevents a blind duplicate after every tested
 crash boundary, including an authorized attempt without a start receipt.
+Reconciled intent or authorization receipts are observations, never a fresh
+grant to launch a second broker through another storage root. The helper
+starts in a fixed safe environment. The requested command environment is
+passed through a sealed anonymous Linux descriptor and applied only at
+post-grant exec; loader variables cannot run command-supplied hooks before
+authorization. Environment values are not persisted in invocation metadata.
 
 The receipt identifies the actual local broker PID/start token, with native
 model session identity explicitly unverified and task acceptance pending.

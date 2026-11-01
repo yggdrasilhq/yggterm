@@ -7,6 +7,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from unittest.mock import patch
@@ -163,6 +164,91 @@ class InvocationTests(unittest.TestCase):
             self.assertEqual(worker.exitcode,0)
         self.assertEqual(sorted(output.get(timeout=2) for _ in workers),['held','launched'])
         self.assertEqual(self.marker.read_bytes(),b'one\n')
+
+    def test_same_job_and_operations_in_two_roots_require_reconciliation(self):
+        second_root=self.base/'second-invocation';second_root.mkdir(mode=0o700)
+        second=invocation.Broker(second_root,worker_workspace=self.workspace,qualified_local=True)
+        both=threading.Barrier(2,timeout=3)
+        first_ready,first_intent,second_done=threading.Event(),threading.Event(),threading.Event()
+        outcomes={}
+        def verifier(name):
+            def verify(plan,state):
+                if state['state']=='staged':
+                    if name=='first':first_ready.set()
+                    both.wait()
+                return True
+            return verify
+        def first_checkpoint(phase):
+            if phase=='after_intent':
+                first_intent.set()
+                self.assertTrue(second_done.wait(3))
+        def second_checkpoint(phase):
+            if phase=='before_intent':self.assertTrue(first_intent.wait(3))
+        self.broker._checkpoint=first_checkpoint
+        second._checkpoint=second_checkpoint
+        def run(name,broker):
+            try:
+                result=broker.launch(self.store,**self.options,authorize=verifier(name))
+                outcomes[name]=('receipt',result.process.wait(timeout=3))
+            except invocation.Hold as held:
+                outcomes[name]=('held',held.code,held.process is None)
+            finally:
+                if name=='second':second_done.set()
+        workers=[threading.Thread(target=run,args=('first',self.broker)),
+                 threading.Thread(target=run,args=('second',second))]
+        workers[0].start()
+        self.assertTrue(first_ready.wait(3))
+        workers[1].start()
+        for worker in workers:worker.join(6)
+        self.assertFalse(any(worker.is_alive() for worker in workers))
+        self.assertEqual(outcomes['first'],('receipt',0))
+        self.assertEqual(outcomes['second'],('held','invocation_intent_requires_reconciliation',True))
+        self.assertEqual(self.marker.read_bytes(),b'one\n')
+
+    def test_reconciled_authorization_never_releases_broker(self):
+        original=self.store.change
+        def reconcile(action,**kwargs):
+            result=original(action,**kwargs)
+            return jobs.Receipt(result.state,True) if action=='authorize' else result
+        with patch.object(self.store,'change',side_effect=reconcile):
+            with self.assertRaises(invocation.Hold) as held:self.launch()
+        self.assertEqual(held.exception.code,'submission_authorization_requires_reconciliation')
+        self.assertEqual(held.exception.process.returncode,125)
+        self.assertFalse(self.marker.exists())
+
+    def test_loader_environment_has_no_effect_before_authorization(self):
+        loader_marker=self.base/'loader-marker'
+        source=self.base/'loader.c';library=self.base/'loader.so'
+        source.write_text('#include <fcntl.h>\n#include <unistd.h>\n'
+            '__attribute__((constructor)) static void mark(void) {'
+            'int f=open('+json.dumps(str(loader_marker))+',O_WRONLY|O_CREAT|O_APPEND,0600);'
+            'if(f>=0){write(f,"effect\\n",7);close(f);}}\n')
+        subprocess.run(['/usr/bin/cc','-shared','-fPIC','-o',str(library),str(source)],
+            check=True,timeout=10,env=dict(PATH='/usr/bin:/bin',TMPDIR=str(self.base)))
+        def verify(plan,state):
+            if state['state']=='staged':return True
+            time.sleep(.15)  # Let the real blocked helper finish its safe startup.
+            self.assertFalse(loader_marker.exists())
+            return False
+        with self.assertRaises(invocation.Hold) as held:
+            self.launch(environment=dict(PATH='/usr/bin:/bin',LD_PRELOAD=str(library)),authorize=verify)
+        self.assertEqual(held.exception.native_effect,'NOT_RELEASED')
+        self.assertFalse(loader_marker.exists())
+        self.assertFalse(self.marker.exists())
+        # A fresh independent admitted fixture proves the requested environment
+        # is actually applied after grant, rather than silently discarded.
+        case=InvocationTests('test_exact_retry_never_duplicates');case.setUp()
+        try:
+            result=case.launch(environment=dict(PATH='/usr/bin:/bin',LD_PRELOAD=str(library)))
+            self.assertEqual(result.process.wait(timeout=3),0)
+            self.assertEqual(loader_marker.read_bytes(),b'effect\n')
+        finally:case.tearDown()
+
+    def test_requested_environment_values_are_not_persisted_in_metadata(self):
+        result=self.launch(environment=dict(PATH='/usr/bin:/bin',EXAMPLE_VALUE='invented-ephemeral-value'))
+        result.process.wait(timeout=3)
+        for name in ['intent.json','broker.json']:
+            self.assertNotIn(b'invented-ephemeral-value',(self.root/name).read_bytes())
 
     def test_unknown_storage_is_retained_and_never_used(self):
         unexpected=self.root/'future.json'
