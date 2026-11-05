@@ -2136,6 +2136,508 @@
       ],
       "strict": false,
       "component": "steer"
+    },
+    {
+      "path": [
+        "ledger"
+      ],
+      "summary": "Keep flexible local working context, notes and evidence references.",
+      "handler": "group",
+      "options": [],
+      "examples": [
+        {
+          "title": "Start a working context",
+          "command": "ygg ledger create --title \"Service upgrade\"",
+          "tags": "ledger notebook continuity"
+        },
+        {
+          "title": "Read a bounded resume packet",
+          "command": "ygg ledger resume",
+          "tags": "ledger resume composer context"
+        }
+      ]
+    },
+    {
+      "path": [
+        "ledger",
+        "create"
+      ],
+      "summary": "Start a working context and return its stable entry ID.",
+      "effect": "write",
+      "handler": "legacy",
+      "component": "working_ledger",
+      "legacy": [
+        "ygg-ledger.py",
+        "create"
+      ],
+      "strict": false,
+      "options": [
+        {
+          "flags": [
+            "--db"
+          ],
+          "help": "Optional store path under the configured local ledger root."
+        },
+        {
+          "flags": [
+            "--json"
+          ],
+          "action": "store_true",
+          "help": "Emit a versioned machine-readable result."
+        },
+        {
+          "flags": [
+            "--title"
+          ],
+          "help": "Human title for this working context."
+        },
+        {
+          "flags": [
+            "--payload"
+          ],
+          "help": "Extensible JSON object, recorded as reported context."
+        },
+        {
+          "flags": [
+            "--payload-file"
+          ],
+          "help": "Read an extensible JSON object from a file."
+        },
+        {
+          "flags": [
+            "--op"
+          ],
+          "help": "Caller-known UUID for replay or lost-acknowledgement lookup."
+        },
+        {
+          "flags": [
+            "--session-label"
+          ],
+          "help": "Reported session label; not an identity attestation."
+        },
+        {
+          "flags": [
+            "--dry-run"
+          ],
+          "action": "store_true",
+          "help": "Validate a plan without creating or changing a store."
+        }
+      ],
+      "examples": [
+        {
+          "title": "Start an upgrade notebook",
+          "command": "ygg ledger create --title \"Service upgrade\"",
+          "tags": "ledger working context"
+        },
+        {
+          "title": "Retain a task and its evidence references",
+          "command": "ygg ledger create --title \"Check release\" --payload '{\"task\":\"task-7\",\"evidence\":[]}'",
+          "tags": "ledger working context"
+        }
+      ]
+    },
+    {
+      "path": [
+        "ledger",
+        "list"
+      ],
+      "summary": "List local working contexts with reported status.",
+      "effect": "read",
+      "handler": "legacy",
+      "component": "working_ledger",
+      "legacy": [
+        "ygg-ledger.py",
+        "list"
+      ],
+      "strict": false,
+      "options": [
+        {
+          "flags": [
+            "--db"
+          ],
+          "help": "Optional store path under the configured local ledger root."
+        },
+        {
+          "flags": [
+            "--json"
+          ],
+          "action": "store_true",
+          "help": "Emit a versioned machine-readable result."
+        },
+        {
+          "flags": [
+            "--limit"
+          ],
+          "help": "Bound result rows."
+        }
+      ],
+      "examples": [
+        {
+          "title": "Scan current working contexts",
+          "command": "ygg ledger list",
+          "tags": "ledger working context"
+        }
+      ]
+    },
+    {
+      "path": [
+        "ledger",
+        "show"
+      ],
+      "summary": "Inspect one working context and its bounded notes.",
+      "effect": "read",
+      "handler": "legacy",
+      "component": "working_ledger",
+      "legacy": [
+        "ygg-ledger.py",
+        "show"
+      ],
+      "strict": false,
+      "options": [
+        {
+          "flags": [
+            "--db"
+          ],
+          "help": "Optional store path under the configured local ledger root."
+        },
+        {
+          "flags": [
+            "--json"
+          ],
+          "action": "store_true",
+          "help": "Emit a versioned machine-readable result."
+        },
+        {
+          "flags": [
+            "--entry"
+          ],
+          "help": "Ledger entry slug or UUID returned by create."
+        }
+      ],
+      "examples": [
+        {
+          "title": "Read a context by the ID returned by create",
+          "command": "ygg ledger show --entry amber-otter-ab12",
+          "tags": "ledger working context"
+        }
+      ]
+    },
+    {
+      "path": [
+        "ledger",
+        "note"
+      ],
+      "summary": "Append an observation, question or delegation note.",
+      "effect": "write",
+      "handler": "legacy",
+      "component": "working_ledger",
+      "legacy": [
+        "ygg-ledger.py",
+        "note"
+      ],
+      "strict": false,
+      "options": [
+        {
+          "flags": [
+            "--db"
+          ],
+          "help": "Optional store path under the configured local ledger root."
+        },
+        {
+          "flags": [
+            "--json"
+          ],
+          "action": "store_true",
+          "help": "Emit a versioned machine-readable result."
+        },
+        {
+          "flags": [
+            "--entry"
+          ],
+          "help": "Ledger entry slug or UUID returned by create."
+        },
+        {
+          "flags": [
+            "--text"
+          ],
+          "help": "Literal note text, never executed."
+        },
+        {
+          "flags": [
+            "--file"
+          ],
+          "help": "Read note text from a file; - reads stdin."
+        },
+        {
+          "flags": [
+            "--op"
+          ],
+          "help": "Caller-known UUID for replay or lost-acknowledgement lookup."
+        },
+        {
+          "flags": [
+            "--session-label"
+          ],
+          "help": "Reported session label; not an identity attestation."
+        },
+        {
+          "flags": [
+            "--dry-run"
+          ],
+          "action": "store_true",
+          "help": "Validate a plan without creating or changing a store."
+        }
+      ],
+      "examples": [
+        {
+          "title": "Append a note without executing its text",
+          "command": "ygg ledger note --entry amber-otter-ab12 --text \"Native verification remains open\"",
+          "tags": "ledger working context"
+        },
+        {
+          "title": "Append a prepared observation",
+          "command": "ygg ledger note --entry amber-otter-ab12 --file observation.md",
+          "tags": "ledger working context"
+        }
+      ]
+    },
+    {
+      "path": [
+        "ledger",
+        "edit"
+      ],
+      "summary": "Replace a payload using its expected revision.",
+      "effect": "write",
+      "handler": "legacy",
+      "component": "working_ledger",
+      "legacy": [
+        "ygg-ledger.py",
+        "edit"
+      ],
+      "strict": false,
+      "options": [
+        {
+          "flags": [
+            "--db"
+          ],
+          "help": "Optional store path under the configured local ledger root."
+        },
+        {
+          "flags": [
+            "--json"
+          ],
+          "action": "store_true",
+          "help": "Emit a versioned machine-readable result."
+        },
+        {
+          "flags": [
+            "--entry"
+          ],
+          "help": "Ledger entry slug or UUID returned by create."
+        },
+        {
+          "flags": [
+            "--payload"
+          ],
+          "help": "Extensible JSON object, recorded as reported context."
+        },
+        {
+          "flags": [
+            "--payload-file"
+          ],
+          "help": "Read an extensible JSON object from a file."
+        },
+        {
+          "flags": [
+            "--expected-revision"
+          ],
+          "help": "Required current revision for a payload replacement."
+        },
+        {
+          "flags": [
+            "--op"
+          ],
+          "help": "Caller-known UUID for replay or lost-acknowledgement lookup."
+        },
+        {
+          "flags": [
+            "--session-label"
+          ],
+          "help": "Reported session label; not an identity attestation."
+        },
+        {
+          "flags": [
+            "--dry-run"
+          ],
+          "action": "store_true",
+          "help": "Validate a plan without creating or changing a store."
+        }
+      ],
+      "examples": [
+        {
+          "title": "Preserve a conflicting proposal rather than overwrite a newer revision",
+          "command": "ygg ledger edit --entry amber-otter-ab12 --expected-revision 1 --payload '{\"state\":\"investigating\"}'",
+          "tags": "ledger working context"
+        }
+      ]
+    },
+    {
+      "path": [
+        "ledger",
+        "history"
+      ],
+      "summary": "Read attributable changes and retained conflicts.",
+      "effect": "read",
+      "handler": "legacy",
+      "component": "working_ledger",
+      "legacy": [
+        "ygg-ledger.py",
+        "history"
+      ],
+      "strict": false,
+      "options": [
+        {
+          "flags": [
+            "--db"
+          ],
+          "help": "Optional store path under the configured local ledger root."
+        },
+        {
+          "flags": [
+            "--json"
+          ],
+          "action": "store_true",
+          "help": "Emit a versioned machine-readable result."
+        },
+        {
+          "flags": [
+            "--entry"
+          ],
+          "help": "Ledger entry slug or UUID returned by create."
+        },
+        {
+          "flags": [
+            "--limit"
+          ],
+          "help": "Bound result rows."
+        }
+      ],
+      "examples": [
+        {
+          "title": "Inspect changes as machine data",
+          "command": "ygg ledger history --entry amber-otter-ab12 --json",
+          "tags": "ledger working context"
+        }
+      ]
+    },
+    {
+      "path": [
+        "ledger",
+        "resume"
+      ],
+      "summary": "Read a bounded packet of open work and references.",
+      "effect": "read",
+      "handler": "legacy",
+      "component": "working_ledger",
+      "legacy": [
+        "ygg-ledger.py",
+        "resume"
+      ],
+      "strict": false,
+      "options": [
+        {
+          "flags": [
+            "--db"
+          ],
+          "help": "Optional store path under the configured local ledger root."
+        },
+        {
+          "flags": [
+            "--json"
+          ],
+          "action": "store_true",
+          "help": "Emit a versioned machine-readable result."
+        }
+      ],
+      "examples": [
+        {
+          "title": "Resume without a model call or state mutation",
+          "command": "ygg ledger resume",
+          "tags": "ledger working context"
+        },
+        {
+          "title": "Pass the packet to an agent",
+          "command": "ygg ledger resume --json",
+          "tags": "ledger working context"
+        }
+      ]
+    },
+    {
+      "path": [
+        "ledger",
+        "ops"
+      ],
+      "summary": "Look up an operation after a lost acknowledgement.",
+      "effect": "read",
+      "handler": "legacy",
+      "component": "working_ledger",
+      "legacy": [
+        "ygg-ledger.py",
+        "ops"
+      ],
+      "strict": false,
+      "options": [
+        {
+          "flags": [
+            "--db"
+          ],
+          "help": "Optional store path under the configured local ledger root."
+        },
+        {
+          "flags": [
+            "--json"
+          ],
+          "action": "store_true",
+          "help": "Emit a versioned machine-readable result."
+        },
+        {
+          "flags": [
+            "--op"
+          ],
+          "help": "Caller-known UUID for replay or lost-acknowledgement lookup."
+        },
+        {
+          "flags": [
+            "--pending"
+          ],
+          "action": "store_true",
+          "help": "List retained pending operation intents."
+        },
+        {
+          "flags": [
+            "--limit"
+          ],
+          "help": "Bound result rows."
+        }
+      ],
+      "examples": [
+        {
+          "title": "Inspect unresolved operation intents before retrying",
+          "command": "ygg ledger ops --pending",
+          "tags": "ledger working context"
+        }
+      ]
+    },
+    {
+      "path": [
+        "ledger",
+        "ls"
+      ],
+      "alias_of": [
+        "ledger",
+        "list"
+      ],
+      "summary": "List local working contexts."
     }
   ],
   "contract": "ygg4-cli",
@@ -2394,6 +2896,20 @@
       "owns": [
         "portable generic steering seeds",
         "private deployment policy and exact local target plans"
+      ]
+    },
+    "working_ledger": {
+      "runner": "ygg-ledger.py",
+      "aliases": [
+        "ygg-ledger.py"
+      ],
+      "resolution": [
+        "env_dir:YGG_BIN_DIR",
+        "payload:ygg-ledger.py"
+      ],
+      "interpreter": "python3",
+      "owns": [
+        "local attributable working notes, immutable events, revision conflicts and replay intents"
       ]
     }
   }

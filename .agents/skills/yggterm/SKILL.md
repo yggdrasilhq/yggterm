@@ -34,8 +34,8 @@ freshness or expanding into unrelated source work.
 ## Recover access before escalating
 
 Consult the operator's configured credential chain before asking for login or
-keys. When registered, the `infra` and `data-fabric` skills own that private
-route; see the [portable recovery contract](../../../steer/credential-recovery.example.md).
+keys. When registered, infrastructure and credential-recovery skills own that
+private route; see the [portable recovery contract](../../../steer/credential-recovery.example.md).
 Check native status, use the authorized local vault/recovery path and verify
 the requested read. Ask for human recovery only when both service access and
 its authorized recovery are blocked. A missing protocol is an explicit routing
@@ -53,6 +53,7 @@ work eligibility remain separate from authentication.
 | Auth capabilities and accounts | `ygg auth harnesses`, `ygg auth status --harness all`; load the registered `ygg-auth` skill for account work |
 | Private steering and locations | `ygg steer`, `ygg fs`; [steering](../../../docs/spec-ygg-steer.md), [filesystem](../../../docs/spec-ygg-fs.md) |
 | Dreams, services, schedules, pressure | `ygg dream`, `ygg service`, `ygg schedule`, `ygg swarm`; [inspection](../../../docs/swarm-introspection.md) |
+| Working context, observations and delegation references | `ygg ledger`; [working-ledger contract](../../../docs/working-ledgers.md) |
 | Integration builds and publication | `ygg ci`; [build contract](../../../docs/spec-ygg-ci.md), [completion](../../../docs/repository-completion.md) |
 | Rows, spawn, relay or GUI mechanisms | Relevant section of the [fleet manual](../yggterm-agent-fleet/SKILL.md) |
 | System taxonomy and rollout boundaries | [System](../../../docs/ygg-system.md), [current status](../../../docs/operating-python-status.md) |
@@ -63,6 +64,14 @@ prove fleet convergence or authorize garbage collection. Private policy and
 credentials stay outside the public seed. Account rotation needs an eligible
 local binding; it never authorizes a banked reset or replay of a failed
 native request. Installing components does not consent to arm autonomous work.
+
+Use a working ledger for an evolving objective, short notes, open obligations
+and links to delegated jobs or evidence. Read `ygg ledger resume` at a handoff;
+inspect operation lookup before retrying after a lost acknowledgement. Notes
+are reported context: they do not dispatch workers, grant authority or certify
+completion. Canonical task, review and memory stores retain those decisions.
+This local notebook is distinct from fleet-wide job/role history. Consult the
+installed command help and the contract's availability status before using it.
 
 A live process, transport exit, delivered artifact and accepted work are
 different observations. Inspect source age, coverage, exact attempts and the

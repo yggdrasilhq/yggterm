@@ -28,7 +28,8 @@
     "ygg-fs.py",
     "ygg-fs-locations.json",
     "ygg-steer.py",
-    "ygg-steer-seed.json"
+    "ygg-steer-seed.json",
+    "ygg-ledger.py"
   ],
   "owner_managed": [
     "ygg-memory",
@@ -96,11 +97,13 @@
     "ygg-init.sh",
     "ygg-inspect.py",
     "ygg-fs.py",
-    "ygg-steer.py"
+    "ygg-steer.py",
+    "ygg-ledger.py"
   ],
   "tier_data": [
     "ygg_command_tree.py",
     "commands.json",
-    "ygg-steer-compiler.py"
+    "ygg-steer-compiler.py",
+    "working_ledger.py"
   ]
 }
