@@ -995,117 +995,668 @@ def _checks(datasets, q, hb, services, dstate, now):
     return out
 
 
+# ------------------------------------------------------------- human view
+# Everything below is the pure human projection of a query result: it only
+# reads the result dict and prints. The machine contract is the --json path
+# in serve() (json.dumps of the same result) and is never routed through
+# this code. Formatting rules:
+#   - every cell AND every dynamic key (execution count keys, flattened
+#     dict keys, summary area keys) is single-line sanitized text: C0/C1/
+#     ANSI bytes, tabs and embedded newlines never reach the output, and
+#     credential-like strings are redacted;
+#   - truncation is always marked with an explicit "..." suffix and bounded
+#     row lists (grants, windows, fields) declare their omitted remainder
+#     with a total, instead of silently pretending a shortened value or a
+#     clipped list is the whole one;
+#   - missing values render as "-" or an explicit word (not-collected,
+#     unreported) and are never folded into 0 or "healthy";
+#   - effective freshness is derived from ALL contributing assessed
+#     coverage rows of a kind (worst source wins; unattributed areas stay
+#     UNKNOWN), so a stale source's healthy-looking recorded state is
+#     labeled "last reported" with its capture-time anchor on the same
+#     row, never presented as current health;
+#   - one logical row per line so piped grep/awk/sed stay stable.
+
+
+def _cell(value, limit=160):
+    """One display cell: bounded, single-line, credential-redacted text.
+    None is "-" (missing), booleans are yes/no, numbers keep their value.
+    C0 tabs are flattened to spaces here (the shared text bound keeps them,
+    but a tab must never shift human output columns)."""
+    if value is None:
+        return "-"
+    if isinstance(value, bool):
+        return "yes" if value else "no"
+    if isinstance(value, float):
+        value = "%g" % value
+    return model.text(str(value), limit).replace("\t", " ")
+
+
+def _clip(value, width):
+    """Bounded-width cell that MARKS truncation with "..." instead of
+    pretending the full value was shown; --json carries the whole field."""
+    text = _cell(value, max(width * 3, 160))
+    return text if len(text) <= width else text[:max(1, width - 3)] + "..."
+
+
+def _pad(value, width):
+    return _clip(value, width).ljust(width)
+
+
+def _age_text(seconds):
+    """Compact human duration; an untimeable or future-skewed age stays "?"
+    rather than being rounded into a confident-looking number."""
+    if seconds is None:
+        return "?"
+    seconds = int(seconds)
+    if seconds < 0:
+        return "?"
+    if seconds < 60:
+        return "%ds" % seconds
+    if seconds < 3600:
+        return "%dm%02ds" % (seconds // 60, seconds % 60)
+    if seconds < 86400:
+        return "%dh%02dm" % (seconds // 3600, (seconds % 3600) // 60)
+    return "%dd%02dh" % (seconds // 86400, (seconds % 86400) // 3600)
+
+
+def _row_age(row, anchor):
+    """Age of the row's own observation clock against the snapshot anchor —
+    never the reader's wall clock. "?" when the row carries no usable time."""
+    if anchor is None:
+        return "?"
+    for key in ("age_seconds", "observed_at", "source_observed_at", "last_at"):
+        v = row.get(key)
+        if v is None:
+            continue
+        if key == "age_seconds":
+            return _age_text(v)
+        t = model.epoch(v)
+        if t is not None:
+            return _age_text(anchor - t)
+    return "?"
+
+
+def _loud(freshness):
+    """Freshness word for an observation row: only "current" stays as is;
+    everything else is rendered as the loud word it is (STALE/UNKNOWN). A
+    row without a usable freshness word is UNKNOWN, not a quiet hyphen."""
+    text = _clip(freshness, 12)
+    if text in ("-", ""):
+        return "UNKNOWN"
+    return text if text == "current" else text.upper()
+
+
+_QUALITY_RANK = {"verified": 0, "stale": 1, "conflicting": 2, "unavailable": 3}
+_WORD_RANK = {"current": 0, "STALE": 1, "CONFLICTING": 2, "UNAVAILABLE": 3}
+
+
+def _kind_rows(coverage, kind):
+    """ALL assessed coverage rows contributing to one kind. A kind is only
+    as fresh as its worst enrolled source, so every row participates — a
+    fresh first row never certifies a later stale or unavailable one."""
+    return [c for c in (coverage or []) if c.get("kind") == kind]
+
+
+def _worst_row(rows):
+    """The most demoted row of a kind (None when the kind has no coverage
+    row at all). Unknown quality and unrankable rows rank as the worst
+    state there is, never as a healthy one."""
+    if not rows:
+        return None
+    return max(rows, key=lambda c: _QUALITY_RANK.get(str(c.get("quality")), 4))
+
+
+def _effective_word(cov_row):
+    """Query-time assessed freshness word for one row's source coverage:
+    "current" only when a verified in-TTL coverage row exists; every other
+    assessed quality renders as the loud word it is; no coverage row at all
+    is UNKNOWN, never silently strong-fresh."""
+    if cov_row is None:
+        return "UNKNOWN"
+    q = str(cov_row.get("quality") or "unknown")
+    return "current" if q == "verified" else q.upper()
+
+
+def _worse_word(a, b):
+    """The more demoted of two freshness words: a query-time assessment may
+    demote a recorded capture-time word but never freshens it."""
+    return max((a, b), key=lambda w: _WORD_RANK.get(w, 4))
+
+
+def _coverage_by_kind(coverage):
+    """The WORST assessed coverage row per kind: an aggregate that cannot
+    attribute its inputs beyond kind level inherits the worst contributing
+    source rather than the first-seen one, and a kind with no coverage row
+    stays absent (rendered UNKNOWN downstream) — never verified."""
+    kinds = {c.get("kind") for c in (coverage or []) if c.get("kind")}
+    return {k: _worst_row(_kind_rows(coverage, k)) for k in kinds}
+
+
+def _freshness(cov_row):
+    """Effective freshness words for an assessed coverage row. Only a
+    verified in-TTL source reads "verified"; stale/unavailable/conflicting/
+    unknown (or a missing coverage row) render as the honest loud words and
+    are never folded into a healthy one."""
+    if cov_row is None:
+        return "UNKNOWN"
+    q = cov_row.get("quality")
+    if q == "verified":
+        return "verified age=%s" % _age_text(cov_row.get("age_seconds"))
+    if q == "stale":
+        return "STALE age=%s" % _age_text(cov_row.get("age_seconds"))
+    if q == "conflicting":
+        return "CONFLICTING"
+    if q == "unavailable":
+        return "UNAVAILABLE"
+    return "UNKNOWN"
+
+
+def _last_reported_note(state, cov_row, label):
+    """The stale-ok honesty clause. A healthy-looking recorded state (state=ok)
+    read from a source that is not verified-fresh is that source's LAST
+    REPORTED value; the note says so on its own line instead of letting the
+    reader take stale ok as current health."""
+    if state is None:
+        return None
+    if cov_row is None:
+        if str(state).lower() in ("ok", "verified", "active", "healthy"):
+            return ("note: %s=%s is recorded without a coverage row; its "
+                    "freshness is UNKNOWN" % (label, _clip(state, 20)))
+        return None
+    if cov_row.get("quality") == "verified":
+        return None
+    if str(state).lower() not in ("ok", "verified", "active", "healthy"):
+        return None
+    return ("note: %s=%s is the last reported value from a %s source (age %s); "
+            "it does not assert current health"
+            % (label, _clip(state, 20), str(cov_row.get("quality", "unknown")).upper(),
+               _age_text(cov_row.get("age_seconds"))))
+
+
+def _flatten(value, max_fields=12):
+    """Bounded deterministic key=value flattening for JSON-shaped rows that
+    have no dedicated human layout (unknown composer rows, nested provider
+    windows, extra summary keys). Dicts widen to dotted keys, lists to [i]
+    indexes; every leaf is sanitized; overflow is declared as a "+fields"
+    pair — never silently dropped, never rendered as raw JSON."""
+    pairs = []
+
+    def walk(v, key, depth):
+        if len(pairs) >= 200 or depth > 4:
+            pairs.append((key or "value", "(bound reached; see --json)"))
+            return
+        if isinstance(v, dict):
+            if not v:
+                pairs.append((key or "value", "empty-object"))
+                return
+            for k in sorted(v, key=str):
+                walk(v[k], (key + "." if key else "") +
+                     _clip(k, 40).replace(" ", "_"), depth + 1)
+        elif isinstance(v, list):
+            if not v:
+                pairs.append((key or "value", "empty-list"))
+                return
+            for i, item in enumerate(v[:4]):
+                walk(item, "%s[%d]" % (key, i), depth + 1)
+            if len(v) > 4:
+                pairs.append((key + "[4..]", "(%d more; see --json)" % (len(v) - 4)))
+        else:
+            pairs.append((key or "value", _cell(v)))
+
+    walk(value, "", 0)
+    if len(pairs) > max_fields:
+        return pairs[:max_fields] + [("+fields", "%d more; see --json"
+                                     % (len(pairs) - max_fields))]
+    return pairs
+
+
+def _kv(pairs, width=60, preferred=()):
+    """key=value line; keys named in ``preferred`` come first (in that
+    order) so the common fields read naturally, the rest stay sorted."""
+    def rank(item):
+        k = item[0].split(".")[-1].split("[")[0]
+        return (preferred.index(k) if k in preferred else len(preferred), item[0])
+    ordered = sorted(pairs, key=rank) if preferred else pairs
+    return " ".join("%s=%s" % (k, _clip(v, width)) for k, v in ordered)
+
+
 def _emit(result, as_json):
     if as_json:
         print(json.dumps(result, indent=1))
         return
-    print("snapshot %s  as_of %s  code-coverage below" % (result["snapshot_id"][:16], result["as_of"]))
+    print("snapshot %s (short id; --json carries the full id and verbatim data)"
+          "  as_of %s  query_as_of %s"
+          % (str(result.get("snapshot_id", ""))[:16], result.get("as_of"),
+             result.get("query_as_of")))
+    print("coverage (effective freshness; a newer reader clock never freshens "
+          "an old observation):")
     for c in result["coverage"]:
-        line = "  %-34s %-10s ttl=%ss" % (c["source"], c["quality"], c.get("ttl_seconds"))
+        age = ("never-observed" if not c.get("observed_at")
+               else _age_text(c.get("age_seconds")))
+        quality = str(c.get("quality") or "unknown")
+        line = "  %s %s age=%s ttl=%ss" % (
+            _pad(c.get("source"), 30),
+            _pad(quality if quality == "verified" else quality.upper(), 12),
+            _pad(age, 15), _cell(c.get("ttl_seconds"), 12))
         if c.get("reason"):
-            line += "  " + str(c["reason"])[:100]
+            line += "  " + _clip(c["reason"], 110)
         print(line)
     for f in result["findings"]:
-        print("  ! finding %s %s" % (f.get("code"), str(f.get("id", f.get("command", "")))[:60]))
+        ident = f.get("id") or " ".join(str(x) for x in (f.get("command") or []))
+        print("  ! finding code=%s severity=%s %s" % (
+            _pad(f.get("code"), 22), _pad(f.get("severity"), 8),
+            _clip(ident, 60)))
     print("total %d%s" % (result["total"], "" if result.get("next_cursor") is None
                           else " (next cursor available)"))
 
 
-def _row_briefs(items, family):
+def _area_line(label, pairs, cov_row, contributing=()):
+    """One scan-friendly key=value row with its effective freshness; the
+    freshness always comes from the assessed coverage row — the WORST of
+    all contributing sources of the kind (see _coverage_by_kind) — never
+    from the recorded state value itself. Keys and values are single-line
+    sanitized cells, and a kind fed by more than one source declares that
+    count instead of letting one row speak for the whole kind."""
+    parts = [_pad(label, 13)] + ["%s=%s" % (_cell(k, 40), _clip(v, 60))
+                                 for k, v in pairs]
+    parts.append("freshness=" + _freshness(cov_row))
+    if len(contributing) > 1:
+        parts.append("(worst of %d sources)" % len(contributing))
+    print("  " + " ".join(parts))
+
+
+def _render_status(result):
+    """swarm status: the summary row as labeled sections, cross-referenced
+    with the frame's assessed coverage. The recorded state values are shown
+    verbatim; the freshness verdict is computed from coverage only, so a
+    stale source's state=ok reads as "last reported", never current health.
+    Missing datasets render as not-collected, never as 0."""
+    cov = _coverage_by_kind(result.get("coverage"))
+    raw_cov = result.get("coverage") or []
+    items = result.get("items") or []
+
+    def area(label, pairs, kind):
+        """One status area: the kind's worst coverage row drives freshness;
+        every contributing source of the kind is counted on the row."""
+        _area_line(label, pairs, cov.get(kind),
+                   [c for c in raw_cov if c.get("kind") == kind])
+
+    if not items:
+        print("  no summary row in this snapshot (see coverage above; a missing "
+              "summary is not a healthy fleet)")
+        return
+    s = items[0]
+    mode = _clip(s.get("collection_mode"), 20)
+    if mode in ("disabled", "invalid"):
+        print("  collection mode=%s — fail-closed: no sources were read; "
+              "nothing below is an observation" % mode)
+    elif mode == "standing":
+        print("  collection mode=standing — standing local collection; NOT a "
+              "complete fleet view")
+    else:
+        print("  collection mode=%s" % mode)
+    if s.get("note"):
+        print("  note: " + _clip(s["note"], 160))
+
+    known = {"id", "collection_mode", "note"}
+
+    def used(*keys):
+        known.update(keys)
+
+    if "dreams" in s:
+        used("dreams", "running", "failed", "queue_is_not_whole_compute")
+        if s.get("dreams") is None:
+            area("work", [("rows", "not-collected")], "queue")
+            print("    (no work dataset in this capture; not the same as zero work)")
+        else:
+            area("work", [("rows", s.get("dreams")), ("running", s.get("running")),
+                       ("failed", s.get("failed"))], "queue")
+            print("    (running counts queue-scope work rows only; running=0 is "
+                  "not zero agents)")
+    if "workers" in s or "workers_state" in s:
+        used("workers", "workers_state")
+        rows = "not-collected" if s.get("workers") is None else s.get("workers")
+        area("workers", [("registry_rows", rows),
+                          ("source_state", s.get("workers_state"))], "workers")
+        note = _last_reported_note(s.get("workers_state"), cov.get("workers"),
+                                   "workers_state")
+        if note:
+            print("    " + note)
+    if "composer_observations" in s or "composer_state" in s:
+        used("composer_observations", "composer_state")
+        obs = ("not-collected" if s.get("composer_observations") is None
+               else s.get("composer_observations"))
+        area("composer", [("observations", obs),
+                           ("state", s.get("composer_state"))], "composer")
+        note = _last_reported_note(s.get("composer_state"), cov.get("composer"),
+                                   "composer_state")
+        if note:
+            print("    " + note)
+    if "reviews" in s or "reviews_state" in s:
+        used("reviews", "reviews_state")
+        chains = "not-collected" if s.get("reviews") is None else s.get("reviews")
+        area("reviews", [("chains", chains),
+                          ("state", s.get("reviews_state"))], "reviews")
+        note = _last_reported_note(s.get("reviews_state"), cov.get("reviews"),
+                                   "reviews_state")
+        if note:
+            print("    " + note)
+    if "memory_lock_modules" in s or "memory_lock_state" in s:
+        used("memory_lock_modules", "memory_lock_state")
+        mods = ("not-collected" if s.get("memory_lock_modules") is None
+                else s.get("memory_lock_modules"))
+        area("memory-lock", [("modules", mods),
+                              ("state", s.get("memory_lock_state"))], "memory_lock")
+        note = _last_reported_note(s.get("memory_lock_state"),
+                                   cov.get("memory_lock"), "memory_lock_state")
+        if note:
+            print("    " + note)
+    if "heartbeat_planes" in s or "active_findings" in s:
+        used("heartbeat_planes", "active_findings")
+        area("heartbeat", [("planes", s.get("heartbeat_planes")),
+                            ("active_findings", s.get("active_findings"))], "heartbeat")
+    if "services" in s:
+        used("services", "services_dynamic_instances")
+        area("services", [("units", s.get("services")),
+                           ("dynamic_instances",
+                            s.get("services_dynamic_instances"))], "services")
+    if "schedules" in s:
+        used("schedules")
+        area("schedules", [("rows", s.get("schedules"))], "schedule")
+    if "events" in s:
+        used("events")
+        area("events", [("rows", s.get("events"))], "events")
+    if "sources_enrolled" in s:
+        used("sources_enrolled")
+        area("enrollment", [("sources_enrolled", s.get("sources_enrolled"))], None)
+    leftovers = {k: v for k, v in s.items() if k not in known}
+    if leftovers:
+        print("  other " + _kv(_flatten(leftovers, max_fields=10)))
+
+
+def _grant_line(g, with_ends=True):
+    if not isinstance(g, dict):
+        print("    grant " + _clip(g, 90))
+        return
+    ends = model.epoch(g.get("ends_at")) if with_ends else None
+    tail = (" ends=%s" % (model.iso(ends) if ends is not None
+                          else _cell(g.get("ends_at"), 24))) if with_ends else ""
+    print("    grant id=%s grant_units=%s remaining=%s status=%s%s" % (
+        _pad(_clip(g.get("id"), 26), 26),
+        _pad(_cell(g.get("grant_units"), 18), 12),
+        _pad(_cell(g.get("remaining"), 16), 12),
+        _pad(g.get("status"), 10), tail))
+
+
+def _time_cell(value, limit=26):
+    """A time-ish cell: epoch numbers render as UTC ISO (times are facts,
+    not exponents); anything else falls back to the plain cell."""
+    t = model.epoch(value) if not isinstance(value, str) else None
+    return _clip(model.iso(t) if t is not None else value, limit)
+
+
+def _window_lines(row, limit=4):
+    """Nested provider windows flattened field by field. Values keep the
+    provider's own fields and unit meaning; nothing is converted or invented,
+    and windows beyond the shown bound are declared, never dropped."""
+    windows = row.get("windows") or []
+    for i, w in enumerate(windows[:limit]):
+        if isinstance(w, dict):
+            print("    window[%d] %s" % (i, _kv(_flatten(w, max_fields=8), width=40,
+                                                preferred=("remaining", "usage", "number",
+                                                           "nextResetTime"))))
+        else:
+            print("    window[%d] %s" % (i, _clip(w, 80)))
+    if len(windows) > limit:
+        print("    windows[%d..] (%d more; see --json)" % (limit, len(windows) - limit))
+
+
+def _render_pressure(result):
+    """swarm pressure: funding planes in their native units (a missing unit
+    stays "-", never invented), execution counts labeled as the queue's own
+    tallies. Every row carries the EFFECTIVE freshness of its source kind —
+    the worst contributing assessed coverage row at query time — so a stale
+    assessment demotes the row: its recorded capture-time words (freshness,
+    observed age) stay on the row but labeled as capture facts, and the
+    recorded numbers read as LAST REPORTED, explicitly not current
+    capacity."""
+    anchor = model.epoch(result.get("as_of"))
+    eff = _worst_row(_kind_rows(result.get("coverage"), "pressure"))
+    eff_age = _age_text(eff.get("age_seconds")) if eff else "?"
+    funding = False
+    for r in result.get("items") or []:
+        kind = r.get("kind")
+        if kind == "funding":
+            funding = True
+            recorded = _loud(r.get("plane_freshness"))
+            word = _worse_word(recorded, _effective_word(eff))
+            print("  funding plane=%s reader=%s freshness=%s age=%s observed_age=%s" % (
+                _pad(r.get("plane"), 18), _pad(r.get("reader_quality"), 10),
+                _pad(word, 8), _pad(eff_age, 7), _pad(_row_age(r, anchor), 6)))
+            if word != "current":
+                print("    reported(%s, age %s, at capture %s); the plane state "
+                      "below is the LAST REPORTED observation — it does not "
+                      "assert current health or capacity"
+                      % (recorded, _row_age(r, anchor), result.get("as_of")))
+            if r.get("unknown_reader"):
+                print("    unknown reader: the numbers below are the LAST "
+                      "REPORTED observation, not current capacity")
+            if r.get("error"):
+                print("    reader error: " + _clip(r["error"], 130))
+            grants = r.get("grants") or []
+            for g in grants[:6]:
+                _grant_line(g)
+            if len(grants) > 6:
+                print("    grants[6..] (%d more; see --json; %d total)"
+                      % (len(grants) - 6, len(grants)))
+            _window_lines(r)
+            if r.get("available") is not None:
+                print("    available=%s (as reported by the provider)"
+                      % _clip(r["available"], 80))
+        elif kind == "execution":
+            word = _effective_word(eff)
+            print("  execution plane=%s reader=%s freshness=%s age=%s" % (
+                _pad(r.get("plane"), 18),
+                _pad(r.get("reader_quality") or r.get("quality"), 10),
+                _pad(word, 8), _pad(eff_age, 7)))
+            if word != "current":
+                print("    note: these counts are the LAST REPORTED tallies "
+                      "(recorded at capture %s); freshness %s — not current "
+                      "queue state" % (result.get("as_of"), word))
+            counts = r.get("counts")
+            if isinstance(counts, dict) and counts:
+                print("    counts " + " ".join(
+                    "%s=%s" % (_clip(k, 40), _clip(v, 12))
+                    for k, v in sorted(counts.items(), key=lambda kv: str(kv[0]))))
+            elif counts is not None:
+                print("    counts none-reported")
+            print("    note: counts are the queue's own tallies; running=0 is "
+                  "not zero agents")
+            serve = r.get("serve")
+            if isinstance(serve, dict):
+                print("    serve alive=%s" % _clip(serve.get("alive"), 10))
+            else:
+                print("    serve unobserved (queue liveness is not part of "
+                      "this reading)")
+        else:
+            print("  %s %s" % (_pad(kind, 10), _kv(_flatten(
+                {k: v for k, v in r.items() if k not in ("id", "kind")},
+                max_fields=10))))
+    if funding:
+        print("  units: funding values keep the provider's native unit names; "
+              "'-' means the provider did not report one — none is invented; "
+              "remaining balances unavailable at the CLI stay unknown")
+
+
+def _render_heartbeat(result):
+    """swarm heartbeat: one line per plane/finding, then each grant and
+    nested provider window on its own line in native units. The plane row's
+    freshness word is the WORSE of its recorded capture-time freshness and
+    the effective query-time assessment of the heartbeat source; a demoted
+    row keeps its recorded words only as labeled capture facts and reads as
+    LAST REPORTED, never as current plane health."""
+    anchor = model.epoch(result.get("as_of"))
+    eff = _worst_row(_kind_rows(result.get("coverage"), "heartbeat"))
+    eff_age = _age_text(eff.get("age_seconds")) if eff else "?"
+    for r in result.get("items") or []:
+        if r.get("row_type") == "finding":
+            print("  finding %s kind=%s active=%-5s count=%-5s %s" % (
+                _pad(r.get("id"), 34), _pad(r.get("kind"), 16),
+                _pad(_cell(r.get("active"), 6), 5), _pad(_cell(r.get("count"), 8), 5),
+                _clip(r.get("detail"), 70)))
+            continue
+        recorded = _loud(r.get("freshness"))
+        word = _worse_word(recorded, _effective_word(eff))
+        print("  plane %s quality=%s freshness=%s age=%s observed_age=%s grants=%d" % (
+            _pad(r.get("plane"), 16), _pad(r.get("quality"), 9),
+            _pad(word, 8), _pad(eff_age, 7), _pad(_row_age(r, anchor), 6),
+            len(r.get("grants") or [])))
+        if word != "current":
+            print("    reported(%s, age %s, at capture %s); the plane state "
+                  "below is the LAST REPORTED observation — it does not "
+                  "assert current plane health"
+                  % (recorded, _row_age(r, anchor), result.get("as_of")))
+        if r.get("error"):
+            print("    reader error: " + _clip(r["error"], 120))
+        grants = r.get("grants") or []
+        for g in grants[:8]:
+            _grant_line(g, with_ends=False)
+        if len(grants) > 8:
+            print("    grants[8..] (%d more; see --json; %d total)"
+                  % (len(grants) - 8, len(grants)))
+        _window_lines(r)
+        if r.get("note"):
+            print("    note: " + _clip(r["note"], 120))
+
+
+def _render_events(items):
+    for r in items:
+        t = model.epoch(r.get("at"))
+        print("  %-12s %-8s %-20s %s" % (
+            _pad(r.get("subsystem"), 12), _pad(r.get("severity"), 8),
+            _pad(model.iso(t) if t is not None else r.get("at"), 20),
+            _clip(r.get("summary"), 80)))
+
+
+def _dream_rows(items):
+    for r in items:
+        att = r.get("reported_attempt_count")
+        print("  %s state=%s route=%s attempts=%s %s" % (
+            _pad(r.get("queue_id") or r.get("id"), 28), _pad(r.get("state"), 13),
+            _pad(r.get("route"), 16),
+            _pad(att if att is not None else "unreported", 10),
+            _clip(r.get("title"), 64)))
+        for a in r.get("attempts") or []:
+            print("    attempt %s state=%s ord=%-3s started=%s finished=%s evidence=%s" % (
+                _pad(str(a.get("id", "")).replace("attempt:queue:", ""), 38),
+                _pad(a.get("state"), 11), _pad(a.get("ordinal"), 3),
+                _pad(_time_cell(a.get("started_at")), 26),
+                _pad(_time_cell(a.get("finished_at")), 26),
+                _clip(a.get("evidence_state"), 24)))
+            if a.get("reason"):
+                print("      reason: %s" % _clip(a["reason"], 120))
+        for rp in r.get("repairs") or []:
+            print("    repair %s verdict=%s verification=%s" % (
+                _pad(rp.get("ref"), 40), _pad(rp.get("verdict"), 12),
+                _clip(rp.get("verification"), 40)))
+
+
+def _service_rows(items):
+    for r in items:
+        rss = ""
+        if r.get("rss_bytes"):
+            rss = " rss=%dMiB" % (r["rss_bytes"] // (1024 * 1024))
+        print("  %s %-9s %-9s pid=%-7s src=%-11s%s" % (
+            _pad(r.get("unit"), 46), _pad(r.get("active"), 9),
+            _pad(r.get("sub"), 9), _pad(r.get("pid"), 7),
+            _pad(r.get("provenance") or "systemd", 11), rss))
+
+
+def _schedule_rows(items):
+    for r in items:
+        kind = r.get("kind", "timer")
+        when = r.get("next_text") or r.get("expires_at") or ""
+        extra = ""
+        if kind == "plan":
+            extra = " staged=%s target=%s remaining=%s" % (
+                _clip(r.get("staged"), 10), _clip(r.get("target"), 10),
+                _clip(r.get("remaining"), 10))
+        elif kind == "commitment":
+            extra = " rev=%s authority=%s" % (_clip(r.get("revision"), 16),
+                                              _clip(r.get("authority"), 16))
+        print("  %s %-11s %s%s" % (_pad(r.get("id"), 46), _pad(kind, 11),
+                                   _clip(_time_cell(when) if when else "", 26), extra))
+
+
+def _worker_rows(items):
+    for r in items:
+        print("  %s %-10s %-10s %-12s %s" % (
+            _pad(r.get("id"), 30), _pad(r.get("row_type") or "worker", 10),
+            _pad(r.get("status") or r.get("state") or "?", 10),
+            _pad(r.get("origin"), 12), _clip(r.get("note"), 50)))
+
+
+def _composer_rows(items, anchor):
+    for r in items:
+        if r.get("row_type") == "observation":
+            print("  obs %s status=%s severity=%-8s detector=%s/%s repeats=%-4s last_age=%s" % (
+                _pad(r.get("id"), 44), _pad(r.get("status"), 12),
+                _pad(r.get("severity"), 8), _clip(r.get("detector_id"), 14),
+                _clip(r.get("detector_version"), 8), _pad(r.get("repeat_count"), 4),
+                _row_age(r, anchor)))
+        else:
+            # Rows without a closed human layout (cursors, state rows, and
+            # any future row_type) get the bounded deterministic flattening
+            # instead of a raw JSON dump.
+            pairs = _flatten({k: v for k, v in r.items()
+                              if k not in ("id", "row_type")}, max_fields=12)
+            print("  %s %s %s" % (_pad(r.get("row_type"), 8),
+                                  _pad(_clip(r.get("id"), 40), 40),
+                                  _kv(pairs, width=44)))
+
+
+def _review_rows(items):
+    for r in items:
+        print("  %s resolution=%s state=%s editor=%s chain=%s" % (
+            _pad(r.get("review_id"), 40), _pad(r.get("resolution") or "open", 12),
+            _pad(r.get("review_state"), 9), _pad(r.get("editor_bound") or "-", 24),
+            _clip(r.get("chain_state"), 24)))
+
+
+def _row_briefs(result, family):
+    items = result.get("items") or []
+    anchor = model.epoch(result.get("as_of"))
     if family == "dream":
-        for r in items:
-            att = r.get("reported_attempt_count")
-            print("  %-28.28s %-13.13s %-16.16s att=%-4s %s" % (
-                r.get("queue_id") or r.get("id"), r.get("state"), r.get("route"),
-                att if att is not None else "?", r.get("title", "")[:64]))
-            for a in r.get("attempts") or []:
-                print("    attempt %-38.38s %-11.11s ord=%-3s started=%s finished=%s evidence=%s" % (
-                    str(a.get("id")).replace("attempt:queue:", ""),
-                    a.get("state"), a.get("ordinal"), a.get("started_at"),
-                    a.get("finished_at"), a.get("evidence_state")))
-                if a.get("reason"):
-                    print("      reason: %s" % a["reason"][:120])
-            for rp in r.get("repairs") or []:
-                print("    repair   %-40.40s verdict=%-12.12s %s" % (
-                    rp.get("ref"), rp.get("verdict"), rp.get("verification")))
+        _dream_rows(items)
     elif family == "service":
-        for r in items:
-            res = ""
-            if r.get("rss_bytes"):
-                res = " rss=%dMiB" % (r["rss_bytes"] // (1024 * 1024))
-            print("  %-46.46s %-10.10s %-9.9s pid=%-7s%s" % (
-                r.get("unit"), r.get("active"), r.get("sub"), r.get("pid"), res))
+        _service_rows(items)
     elif family == "schedule":
-        for r in items:
-            kind = r.get("kind", "timer")
-            when = r.get("next_text") or r.get("expires_at") or ""
-            extra = ""
-            if kind == "plan":
-                extra = " staged=%s target=%s remaining=%s" % (
-                    r.get("staged"), r.get("target"), r.get("remaining"))
-            elif kind == "commitment":
-                extra = " rev=%s authority=%s" % (r.get("revision"), r.get("authority"))
-            print("  %-46.46s %-11.11s %s%s" % (r.get("id"), kind, when, extra))
+        _schedule_rows(items)
     elif family == "heartbeat":
-        for r in items:
-            if r.get("row_type") == "finding":
-                print("  %-34.34s %-16.16s active=%-5s count=%-5s %s" % (
-                    r.get("id"), r.get("kind"), r.get("active"), r.get("count"),
-                    str(r.get("detail", ""))[:70]))
-            else:
-                print("  %-20.20s %-10.10s grants=%-3s %s" % (
-                    r.get("plane"), r.get("quality"), len(r.get("grants") or []),
-                    str(r.get("error") or "")[:60]))
+        _render_heartbeat(result)
     elif family == "plans":
-        for r in items:
-            if r.get("kind") == "funding":
-                grants = ", ".join(
-                    "grant_units=%s%s" % (g.get("grant_units"),
-                                          "" if g.get("remaining") is None
-                                          else " remaining=%s" % g.get("remaining"))
-                    for g in (r.get("grants") or [])[:3])
-                if r.get("windows"):
-                    grants += " windows=" + json.dumps(r["windows"][:2], sort_keys=True)
-                print("  %-16.16s %-10.10s %s%s" % (
-                    r.get("plane"), r.get("quality"), grants,
-                    " [unknown reader: %s]" % r.get("error") if r.get("unknown_reader") else ""))
-            else:
-                print("  queue %-10.10s %s" % (r.get("quality"), json.dumps(r.get("counts") or {}, sort_keys=True)))
+        _render_pressure(result)
     elif family == "events":
-        for r in items:
-            print("  %-12.12s %-8.8s %-10.10s %s" % (
-                r.get("subsystem"), r.get("severity"), r.get("at"),
-                str(r.get("summary", ""))[:80]))
+        _render_events(items)
     elif family == "findings":
         for r in items:
-            print("  %-18.18s %-10.10s %s" % (r.get("scope"), r.get("verdict"),
-                                              str(r.get("detail", ""))[:90]))
+            print("  %-18s %-10s %s" % (_pad(r.get("scope"), 18),
+                                        _pad(r.get("verdict"), 10),
+                                        _clip(r.get("detail"), 90)))
     elif family in ("worker", "workers"):
-        for r in items:
-            print("  %-30.30s %-9.9s %-10.10s %-12.12s %s" % (
-                r.get("id"), r.get("row_type") or "worker",
-                r.get("status") or r.get("state") or "?",
-                r.get("origin", ""), str(r.get("note", ""))[:50]))
+        _worker_rows(items)
     elif family == "composer":
-        for r in items:
-            if r.get("row_type") == "observation":
-                print("  %-52.52s %-9.9s %-18.18s det=%s/%s rep=%s last=%s" % (
-                    r.get("id"), r.get("severity"), r.get("status"),
-                    r.get("detector_id"), r.get("detector_version"),
-                    r.get("repeat_count"), r.get("last_at")))
-            else:
-                print("  %s %s" % (r.get("id"), json.dumps(
-                    {k: v for k, v in r.items()
-                     if k not in ("id", "row_type")}, sort_keys=True)[:150]))
+        _composer_rows(items, anchor)
     elif family == "reviews":
-        for r in items:
-            print("  %-40.40s %-12.12s %-9.9s editor=%-24.24s chain=%s" % (
-                r.get("review_id"), r.get("resolution") or "open",
-                r.get("review_state"), r.get("editor_bound") or "-",
-                r.get("chain_state")))
+        _review_rows(items)
     elif family == "summary":
-        for r in items:
-            print("  " + json.dumps({k: v for k, v in r.items() if k != "id"}, sort_keys=True))
+        _render_status(result)
+
+
+def _empty_scope():
+    print("  no rows in this query scope (see coverage above: an empty verified "
+          "scope is not proof the fleet is idle)")
 
 
 def _render(result, path):
@@ -1114,27 +1665,28 @@ def _render(result, path):
     _emit(result, False)
     if family == "swarm" and verb == "check":
         for r in result["items"]:
-            print("  check %-10.10s %-10.10s %s" % (r.get("scope"), r.get("verdict"),
-                                                    str(r.get("detail", ""))[:100]))
+            print("  check %s %s %s" % (_pad(r.get("scope"), 12),
+                                        _pad(r.get("verdict"), 10),
+                                        _clip(r.get("detail"), 110)))
+        print("  verdicts: held=assertion held  falsified=assertion falsified  "
+              "unknown=evidence insufficient (unknown is not a pass)")
         return
-    if family == "swarm" and verb == "pressure" and result["items"]:
-        _row_briefs(result["items"], "plans")
-        print("  (native funding units above; remaining balances unavailable at the CLI stay unknown)")
+    if family == "swarm" and verb == "pressure":
+        _render_pressure(result) if result["items"] else _empty_scope()
         return
     if family == "swarm" and verb == "status":
-        _row_briefs(result["items"], "summary")
+        _render_status(result)
         return
     if family == "swarm" and verb == "heartbeat":
-        _row_briefs(result["items"], "heartbeat")
+        _render_heartbeat(result) if result["items"] else _empty_scope()
         return
     if family == "swarm" and verb == "events":
-        _row_briefs(result["items"], "events")
+        _render_events(result["items"]) if result["items"] else _empty_scope()
         return
     if result["items"]:
-        _row_briefs(result["items"], family)
+        _row_briefs(result, family)
     elif result["total"] == 0:
-        print("  no rows in this query scope (see coverage above: an empty verified "
-              "scope is not proof the fleet is idle)")
+        _empty_scope()
 
 
 def _attempt_for(frame, work_id, attempt_id=None):

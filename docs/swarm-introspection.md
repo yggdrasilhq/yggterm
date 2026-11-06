@@ -54,6 +54,50 @@ reference edges; malformed/skipped source records report unknown coverage.
 flag form such as `ygg board --json` remains a compatibility alias. Board
 mutation verbs retain their ordinary authority/privacy obligations.
 
+## Output contract: human default, `--json` machine
+
+`--json` prints `json.dumps` of the query result verbatim — the machine
+contract. It is byte-stable across formatting changes; the human projection
+below never feeds it.
+
+The default human output is a scan-friendly projection of the same result:
+one logical row per line (piped `grep`/`awk`/`sed` stay stable), fixed-width
+key=value cells, no color or status noise. Rules:
+
+- **Coverage table** shows each source with its effective freshness
+  (`verified` stays quiet; `STALE`/`UNAVAILABLE`/`CONFLICTING`/`UNKNOWN` are
+  loud), observed age (`age=` from the source's own clock, `never-observed`
+  when the source carried no time), ttl, and the exact demotion reason.
+- **Freshness is computed from coverage only.** A recorded state value is
+  shown verbatim, but when its source is not verified-fresh the view says so:
+  `composer state=ok freshness=STALE age=9d00h` plus "last reported value …
+  does not assert current health". Stale ok is never rendered as healthy.
+- **Missing ≠ zero.** Values the capture never observed render as `-` or an
+  explicit word (`not-collected`, `unreported`, `serve unobserved`), never as
+  0. A fail-closed capture says so; its rows are not observations.
+- **Scope honesty.** Standing mode is labeled "standing local collection;
+  NOT a complete fleet view". Queue tallies carry "running=0 is not zero
+  agents". An empty verified scope is "not proof the fleet is idle"; `swarm
+  check` prints a legend where `unknown` is not a pass.
+- **Units are kept, never invented.** Funding grants/windows render the
+  provider's native fields and unit values (`grant_units=125000`); a missing
+  unit stays `-`. Windows flatten field by field (`window[0] remaining=…
+  usage=…`), overflow is declared (`windows[4..] (N more; see --json)`).
+- **Cells are safe.** C0/C1/ANSI bytes and embedded newlines are stripped;
+  credential-like text is redacted; truncation is marked with an explicit
+  `...` suffix (the full value stays in `--json`); the snapshot header shows
+  a short id and says so.
+- **Unknown row shapes** (composer cursor/state rows, future summary keys,
+  unrecognized pressure rows) get a bounded deterministic key=value
+  flattening — never a raw JSON dump, which remains available via `--json`.
+
+Residual cases (known, deliberate): values longer than a column are marked
+truncated rather than wrapped; flattened unknown rows show at most ~12
+fields with a declared remainder; the flattened ordering of provider windows
+prefers remaining/usage/number/nextResetTime and sorts any other provider
+fields alphabetically; ages beyond a day render as `NdHHh`; `age=?` marks an
+untimeable or clock-skewed observation instead of guessing.
+
 ## Falsification and packaging
 
 `tests/test_introspection_cli.py` in the fleet skill runs the shipped router
@@ -64,6 +108,11 @@ The help falsifier fails against the previous router because help invokes
 backends or cannot discover the command groups. The existing dispersal suite
 checks manifests, drift, PATH links and preservation of owner-managed files.
 
-Python tests use disk-backed scratch through `TMPDIR`. Runtime source
+Python tests use disk-backed scratch through `TMPDIR`. The human projection
+is falsified by `tools/swarmharness/introspection/test_human_output.py`: it
+drives the real formatter with typed fixtures (stale-ok contradiction,
+missing quota units, nested windows, unknown rows, unicode/control bytes,
+zero/empty/partial coverage), captures stdout, pins parser/help to no I/O,
+and compares `--json` bytes against the pristine module copy. Runtime source
 coverage and owner-visible session attachment require separate adapter tests;
 local command conformance does not establish a complete inspection release.
