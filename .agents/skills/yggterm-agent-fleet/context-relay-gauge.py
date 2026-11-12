@@ -30,11 +30,12 @@ looking at a screen.
     agent whose discipline resets every session. It fires on the booter's kick too,
     which is precisely the caller that has no judgement of its own.
 
-★ WHY A THRESHOLD AND NOT COMPACTION. Compaction is lossy at exactly the moment the
-  session is most loaded; a relay hands over a WRITTEN brief plus a repo state. The
-  owner's design is relays, and `autoCompactEnabled:false` is deliberate. So this
-  gauge exists to make the relay land with runway — ~300k tokens on a 1M window —
-  never to squeeze the last 3% out of a context.
+★ WHY A THRESHOLD. A relay hands over a WRITTEN brief plus a repo state, and it lands
+  best with runway (~300k tokens on a 1M window). That is the protection wherever the
+  CLI's native compaction is OFF (settings `autoCompactEnabled:false`, or DISABLE_AUTO_COMPACT
+  / DISABLE_COMPACT in the environment): the handover messages apply there. Where native
+  compaction is configured ON, the gauge is advisory only — it reports and does not command
+  a relay (see `claude_compaction_policy`). An actual overflow is always shown as a HOLD.
 
 Hook mode never fails a session. Explicit CLI --report failures must remain
 visible: the native Codex reader reports unknown/exit 3 rather than guessing
@@ -48,6 +49,10 @@ Usage:
     context-relay-gauge.py --session <uuid> [--report]
 
 Env overrides (percent of window): CTX_NOTICE=55 CTX_LAND=70 CTX_CRITICAL=85
+
+Contract, evidence rules and the compaction/error policy for Claude sessions:
+docs/spec-claude-context-calibration.md (repository root). This script is the reference
+implementation of that spec; where the two disagree, fix the one that drifted.
 """
 import json
 import os
@@ -117,9 +122,18 @@ TAIL_BYTES = 3_000_000
 #   `claude-opus-5`, there is no `[1m]` suffix in env, settings or the transcript, so every
 #   selector heuristic below misses it. Match the GENERATION, never the family, and let
 #   anything unrecognised fall through to assumed=True rather than asserting 200k.
+# ⛔⛔ THE 2026-11-12 INSTANCE — THE SAME RULE, BROKEN BY TWO BARE FAMILY TOKENS: "haiku" and
+#   "sonnet" sat in the 200k table, so a claude-haiku-5-5 session (native CLI
+#   modelUsage.contextWindow 1000000) was read as a 200k window with assumed=False, which
+#   asserted a wall at ~95% of a session that had used ~190k. Family tokens are removed. The
+#   only 200k authority a model may carry is an exact id whose window was measured.
 KNOWN_1M_MODEL_TOKENS = ("fable", "opus-5", "opus5")
+# Whole-id matches measured from the native CLI's modelUsage.contextWindow. A substring is NOT
+# used here: a future id that merely shares a prefix must earn its own entry.
+KNOWN_1M_EXACT_MODEL_IDS = ("claude-haiku-5-5",)
 # ⛔ "opus" alone is NOT in this table on purpose — opus-4 is 200k and opus-5 is 1M.
-KNOWN_200K_MODEL_TOKENS = ("opus-4", "sonnet", "haiku")
+# No Sonnet or Haiku id has a measured 200k window in this gauge, so none is listed.
+KNOWN_200K_MODEL_TOKENS = ("opus-4",)
 # zcode/GLM (taught 2026-09-04, owner instrument): GLM-5.3-Flash variant
 # `max` has a 2M window — the harness's own context indicator read 20.8%
 # where this gauge's formula (input+cacheRead+cacheWrite = 423,902 tokens)
@@ -131,36 +145,167 @@ KNOWN_200K_MODEL_TOKENS = ("opus-4", "sonnet", "haiku")
 KNOWN_2M_MODEL_TOKENS = ("glm-5.3-flash",)
 
 
-def window_for(observed_max, model=""):
-    """(window_tokens, assumed) — `assumed` True when the model was not recognized
-    and the number is a guess the message must direct the agent to VERIFY with the
-    CLI's own instrument (/context) rather than act on.
+def _exact_model_id(model):
+    """The model id as the transcript states it, lower-cased, minus a client-side selector."""
+    return (model or "").strip().lower().split("[", 1)[0]
 
-    ⛔ For the `[1m]` variant do NOT trust `message.model` — it reads
-      `claude-opus-5` even for the 1M variant, because the suffix is a client-side
-      selector stripped before the request. Settings and env carry it. But for
-      models whose window is natively 1M (Fable), the transcript model id is
-      exactly right and nothing else knows. Observation stays as the backstop that
-      cannot be wrong in the dangerous direction."""
+
+def _selector_1m_present():
+    """True when a `[1m]` selector is set in the environment (ANTHROPIC_MODEL, CLAUDE_MODEL), in
+    settings `model`, or in the settings `env` block. This is configuration, not evidence about the
+    session that is running: it can be unrelated to the session's model, or stale because a command
+    line `--model` override replaced it. So it is only ever a reason to mark a window UNVERIFIED."""
+    sources = [os.environ.get("ANTHROPIC_MODEL", ""), os.environ.get("CLAUDE_MODEL", "")]
+    try:
+        settings = json.loads((HOME / ".claude" / "settings.json").read_text())
+    except Exception:
+        settings = {}
+    if isinstance(settings, dict):
+        sources.append(str(settings.get("model", "")))
+        block = settings.get("env") if isinstance(settings.get("env"), dict) else {}
+        sources += [str(block.get("ANTHROPIC_MODEL", "")), str(block.get("CLAUDE_MODEL", ""))]
+    return any("[1m]" in src for src in sources)
+
+
+def window_for(observed_max, model=""):
+    """(window_tokens, assumed). `window_tokens` is None when capacity is UNKNOWN, and then
+    `assumed` is True. An unknown window is never a percentage and never a handover.
+
+    ⛔ Observed usage is a LOWER BOUND on capacity, not a measurement of it. A session that
+      has reached 900k tokens proves the window is at least 900k; it cannot say whether the
+      window is 1M, 2M or larger. So observation may REFUTE a 200k assumption (usage above
+      200k rules out a 200k window for a model whose 200k was recorded) but it never
+      ASSERTS a size. Earlier revisions returned 1M with assumed=False once usage passed
+      250k; that is the false certainty this function now refuses.
+
+    ⛔ SESSION-BOUND EVIDENCE ONLY. The transcript's model id is the one fact this function
+      can bind to the running session, and it is used as such: exact measured ids, the native
+      1M families, and the 200k refutation above. A `[1m]` selector in settings or env is NOT
+      evidence. It is a configured preference, and a `--model` override on the command line can
+      make even a matching selector stale. So a selector never ASSERTS a window. Where a 200k
+      assumption would rest on an unbound selector, the window is UNVERIFIED instead."""
     m = (model or "").lower()
     if any(tok in m for tok in KNOWN_2M_MODEL_TOKENS):
         return 2_000_000, False
     if any(tok in m for tok in KNOWN_1M_MODEL_TOKENS):
         return 1_000_000, False
-    for src in (os.environ.get("ANTHROPIC_MODEL", ""),
-                os.environ.get("CLAUDE_MODEL", "")):
-        if "[1m]" in src:
-            return 1_000_000, False
-    try:
-        s = json.loads((HOME / ".claude" / "settings.json").read_text())
-        if "[1m]" in str(s.get("model", "")):
-            return 1_000_000, False
-    except Exception:
-        pass
-    if observed_max > 250_000:
+    if _exact_model_id(model) in KNOWN_1M_EXACT_MODEL_IDS:
         return 1_000_000, False
-    known_200k = any(tok in m for tok in KNOWN_200K_MODEL_TOKENS)
-    return 200_000, not known_200k
+    if any(tok in m for tok in KNOWN_200K_MODEL_TOKENS) and observed_max <= 200_000:
+        # ⛔ A `[1m]` selector anywhere in config or env makes this 200k assumption AMBIGUOUS:
+        #   the session may really be the 1M variant, and no hook can bind the selector to this
+        #   session. A selector cannot raise capacity to 1M, and it cannot be ignored either,
+        #   so the window is UNVERIFIED rather than asserted as 200k.
+        if _selector_1m_present():
+            return None, True
+        return 200_000, False
+    return None, True
+
+
+# ── Claude native compaction policy (measured 2026-11-12) ─────────────────
+# The CLI compacts its own context. A hook can read two things: the CONFIGURED value
+# (settings `autoCompactEnabled`) and the disabling variables the CLI honours. Only
+# DISABLE_AUTO_COMPACT and DISABLE_COMPACT are real switches; CLAUDE_CODE_DISABLE_AUTOCOMPACT
+# is not, and is deliberately not read. Managed or command-line overrides are invisible from
+# a hook, so no state below claims the CLI's effective policy.
+COMPACT_DISABLE_ENV_NAMES = ("DISABLE_AUTO_COMPACT", "DISABLE_COMPACT")
+COMPACTION_OFF_STATES = ("env-disabled", "configured-off")
+_TRUTHY = ("1", "true", "yes", "on")
+
+
+def claude_compaction_policy(settings=None, environ=None):
+    """(state, detail). state is one of:
+      env-disabled    a disabling variable is set (process environment or settings `env`)
+      configured-off  settings say autoCompactEnabled:false, with no variable overriding it
+      configured-on   settings say autoCompactEnabled:true (effective policy not measured)
+      unknown         autoCompactEnabled is absent or not a boolean (nothing measured)
+    `settings` and `environ` are injectable so the policy can be tested without a home dir."""
+    env = os.environ if environ is None else environ
+    if settings is None:
+        try:
+            settings = json.loads((HOME / ".claude" / "settings.json").read_text())
+        except Exception:
+            settings = {}
+    if not isinstance(settings, dict):
+        settings = {}
+    session_env = settings.get("env") if isinstance(settings.get("env"), dict) else {}
+    for name in COMPACT_DISABLE_ENV_NAMES:
+        for source in (env, session_env):
+            if str(source.get(name, "")).strip().lower() in _TRUTHY:
+                return "env-disabled", name
+    flag = settings.get("autoCompactEnabled")
+    if flag is True:
+        return "configured-on", "autoCompactEnabled:true"
+    if flag is False:
+        return "configured-off", "autoCompactEnabled:false"
+    return "unknown", "autoCompactEnabled absent"
+
+
+def _policy_sentence(state, detail):
+    """One honest line about native compaction. It names what was measured, and nothing more."""
+    if state == "env-disabled":
+        return f"Native auto-compaction is OFF: {detail} is set in the environment."
+    if state == "configured-off":
+        return ("Native auto-compaction is configured OFF (settings autoCompactEnabled:false); "
+                "this gauge does not measure the CLI's effective policy.")
+    if state == "configured-on":
+        # CONDITIONAL override: it applies because the setting reads true. Standing steer text
+        # written before this gauge measured compaction still names a relay at 70%; while
+        # compaction is configured on, that instruction is superseded by this line.
+        return ("Native auto-compaction is configured on (settings autoCompactEnabled:true); "
+                "this gauge does not measure the CLI's effective policy. This line OVERRIDES any "
+                "standing relay-at-70% nudge in steering text: while compaction is on, it "
+                "continues in place, and this gauge commands no relay.")
+    return ("Native auto-compaction is not set in settings (autoCompactEnabled absent); "
+            "this gauge does not measure the CLI's effective policy. A standing relay-at-70% "
+            "nudge is not applied here, because nothing measured says compaction is off, and this "
+            "gauge commands no relay.")
+
+
+# Advisory wording for a session whose native compaction is configured on, or not measured.
+# Nothing here commands a relay, and nothing says that no compaction is armed.
+NATIVE_COMPACTION_MESSAGES = {
+    "NOTICE": (
+        "CONTEXT GAUGE — {pct}% of the {win} window used ({used:,} tokens). {policy}\n"
+        "No handover is commanded by this gauge at this level. Keep working the unit in flight."
+    ),
+    "LAND": (
+        "CONTEXT GAUGE — {pct}% of the {win} window used ({used:,} tokens). {policy}\n"
+        "This gauge does NOT command a relay at this level. Keep reads bounded and check the real "
+        "figure with /context. A relay is an operator choice, not a gauge instruction."
+    ),
+    "CRITICAL": (
+        "⚠ CONTEXT GAUGE — {pct}% of the {win} window used ({used:,} tokens). {policy}\n"
+        "The window is nearly full. This gauge does not claim whether compaction is running: check "
+        "/context and keep reads small. A turn that returns 'Prompt is too long' is a different "
+        "state, reported on its own as an overflow, and that is the one state where you HOLD."
+    ),
+}
+
+# A window the gauge has not measured has no percentage and no verdict band. Usage is shown only
+# as a lower bound. The silence floor is the 55% NOTICE point of the 200k default this gauge once
+# assumed; it decides WHEN to say something, never what percentage is claimed.
+UNVERIFIED_NOTE_FLOOR = 110_000
+UNVERIFIED_WINDOW_MESSAGE = (
+    "⚠ CONTEXT GAUGE — WINDOW UNVERIFIED. Model '{model}' has no measured window in this gauge. "
+    "The {used:,} tokens seen in the last request are a LOWER BOUND on the window, not a "
+    "measurement of it, so no percentage is computed and this is not a handover instruction. "
+    "Run /context and trust IT."
+)
+# Added when a `[1m]` selector is configured. It explains why no window is asserted, and it does not
+# say which window the selector names, because the selector cannot be bound to this session.
+UNVERIFIED_SELECTOR_SENTENCE = (
+    " A `[1m]` selector is set in config or env, but it cannot be bound to this session, so it is "
+    "not used as evidence of the window.")
+
+# The API's own overflow report, as a native refusal row (never prose). Shown whatever the
+# window, the band or the compaction policy. It carries no keep-working advice on purpose.
+OVERFLOW_HOLD_MESSAGE = (
+    "⛔ CONTEXT OVERFLOW — the last assistant turn is a native refusal that returned 'Prompt is "
+    "too long'. That is the API's own report, not a gauge estimate. HOLD: do not retry the same "
+    "context in a loop. Report it; the next step is an operator decision (a manual /compact or a "
+    "fresh session). A later turn that completes normally clears this state."
+)
 
 
 def read_usage_zcode(path):
@@ -307,14 +452,65 @@ def project_next_request(rows):
     return last + median
 
 
-def read_usage(path):
-    """(used, observed_max, dead) from the tail of a transcript.
+# ── Claude transcript markers (requirements A and D) ─────────────────────
+# The CLI writes a refused or failed turn as its OWN assistant row, not as model prose:
+#   • `isApiErrorMessage: true` is the CLI's discriminator on error records (measured record:
+#     ygg-babysit.py and ygg_transcript.py key on it, with `apiErrorStatus`/`error`).
+#   • `message.model == "<synthetic>"` is the model id the CLI writes on refused turns (this
+#     gauge's own measured note on the overflow row). It is a FALLBACK only: an explicit marker
+#     (`true` or `false`) decides, and the fallback applies when the marker key is absent.
+# Prose is NOT a marker. A normal successful report may quote 'Prompt is too long' verbatim, and
+# that must never read as an overflow. Only a native refusal row carrying the API text counts.
+NATIVE_REFUSAL_MODEL = "<synthetic>"
+API_OVERFLOW_TEXT = "Prompt is too long"
 
-    `used` is the LAST assistant row carrying a non-zero token count — not the max.
-    ⛔ The distinction is load-bearing twice over: a `/clear` or a compaction DROPS
-      the count, and a max would keep reporting the pre-compaction peak forever; and
-      a refused turn is written as a `<synthetic>` row whose usage is 0, which must
-      not read as "context is empty now"."""
+
+def _claude_text(msg):
+    """The text blocks of an assistant message, joined. Tool blocks and images are ignored."""
+    content = msg.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return " ".join(p.get("text", "") for p in content
+                        if isinstance(p, dict) and p.get("type") == "text")
+    return ""
+
+
+def _is_native_refusal(row, msg):
+    """True when the CLI, rather than the model, wrote this assistant row.
+
+    ⛔ When the marker key is PRESENT it decides, and only `true` is a refusal. An explicit
+      `false`, or any invalid non-boolean, is an ordinary row, even when the model is
+      `<synthetic>`: the CLI's ordinary synthetic rows carry the marker `false` and may quote the
+      overflow text. The `<synthetic>` model fallback applies ONLY when the key is ABSENT, for
+      transcripts that predate the marker. The text is never used to guess the source."""
+    if "isApiErrorMessage" in row:
+        return row["isApiErrorMessage"] is True
+    return msg.get("model") == NATIVE_REFUSAL_MODEL
+
+
+def _claude_tokens(usage, key):
+    value = usage.get(key, 0)
+    return value if isinstance(value, int) and not isinstance(value, bool) else 0
+
+
+def read_usage(path):
+    """(used, observed_max, dead, model) from the tail of a Claude transcript.
+
+    ⛔ `used` is the LAST assistant row carrying a non-zero native usage total, not the max.
+      A `/clear` or a compaction DROPS the count, and a max would report the pre-compaction
+      peak forever. A refused turn carries usage 0, which must not read as "context is empty".
+
+    ⛔ USAGE IS ADDITIVE for Claude. `input_tokens` is the fresh (uncached) part of a request;
+      `cache_read_input_tokens` and `cache_creation_input_tokens` are separate counts, and the
+      request's context is their sum. The SKILL's measurement formula sums the same three keys.
+      Earlier code used a convention auto-detect that dropped cache writes whenever reads were
+      zero, and dropped fresh input whenever it exceeded the reads. That detect belongs to the
+      zcode adapter, whose rows are inclusive, and it is not used here.
+
+    ⛔ `dead` is decided by the LAST assistant row alone. It is True only when that row is a
+      native refusal (see `_is_native_refusal`) whose text is the API's overflow string. A
+      later normal turn clears it. An ordinary report that quotes the string stays False."""
     try:
         size = os.path.getsize(path)
         with open(path, "rb") as fh:
@@ -323,7 +519,7 @@ def read_usage(path):
                 fh.readline()          # discard the partial line we landed inside
             blob = fh.read().decode("utf-8", errors="ignore")
     except OSError:
-        return 0, 0, False
+        return 0, 0, False, ""
 
     used = 0
     observed_max = 0
@@ -336,29 +532,20 @@ def read_usage(path):
             row = json.loads(line)
         except Exception:
             continue
-        if row.get("type") != "assistant":
+        if not isinstance(row, dict) or row.get("type") != "assistant":
             continue
-        msg = row.get("message", {})
-        content = msg.get("content")
-        text = content if isinstance(content, str) else ""
-        if isinstance(content, list):
-            text = " ".join(p.get("text", "") for p in content
-                            if isinstance(p, dict) and p.get("type") == "text")
-        # The exact string the API returns when the window is already exceeded.
-        dead = "Prompt is too long" in text
-        u = msg.get("usage") or {}
-        input_tok = u.get("input_tokens", 0)
-        cache_read = u.get("cache_read_input_tokens", 0)
-        cache_write = u.get("cache_creation_input_tokens", 0)
-        # Same convention auto-detect as the camelCase block above.
-        if cache_read and input_tok <= cache_read:
-            total = input_tok + cache_read + cache_write
-        else:
-            total = input_tok
+        msg = row.get("message") if isinstance(row.get("message"), dict) else {}
+        dead = _is_native_refusal(row, msg) and API_OVERFLOW_TEXT in _claude_text(msg)
+        u = msg.get("usage") if isinstance(msg.get("usage"), dict) else {}
+        total = (_claude_tokens(u, "input_tokens")
+                 + _claude_tokens(u, "cache_read_input_tokens")
+                 + _claude_tokens(u, "cache_creation_input_tokens"))
         if total > 0:
             used = total
             observed_max = max(observed_max, total)
-            model = msg.get("model") or model
+            name = msg.get("model")
+            if isinstance(name, str) and name and name != NATIVE_REFUSAL_MODEL:
+                model = name
     return used, observed_max, dead, model
 
 
@@ -927,37 +1114,88 @@ def main():
     # Dispatch by transcript shape: zcode rollouts carry `model_io` rows with
     # camelCase usage; Claude transcripts carry `assistant` rows. Filename
     # prefix is the cheap tell (both are JSONL).
-    if Path(path).name.startswith("model-io-"):
+    zcode = Path(path).name.startswith("model-io-")
+    if zcode:
         used, observed_max, dead, model = read_usage_zcode(path)
     else:
         used, observed_max, dead, model = read_usage(path)
     win, assumed = window_for(observed_max, model)
-    if used <= 0:
+    if used <= 0 and not dead:
         return 0
-    pct = round(100.0 * used / win)
-    v = verdict(pct)
-    win_label = (f"{win // 1_000_000}M"
-                 if win >= 1_000_000 and win % 1_000_000 == 0
-                 else f"{win // 1000}k")
+    # Native compaction is a Claude Code fact. Zcode rollouts keep their legacy handover text.
+    compaction = None if zcode else claude_compaction_policy()
+    measured = (not assumed) and win is not None and used > 0
+    # Raw pressure: the band the usage reaches, kept even when it is not acted on.
+    pct_exact = round(100.0 * used / win, 1) if measured else None
+    pct = round(100.0 * used / win) if measured else None
+    band = verdict(pct) if measured else None
+    win_label = None
+    if win is not None:
+        win_label = (f"{win // 1_000_000}M"
+                     if win >= 1_000_000 and win % 1_000_000 == 0
+                     else f"{win // 1000}k")
+    # A handover command needs a MEASURED window and a compaction policy that is off (or zcode).
+    handover_policy = compaction is None or compaction[0] in COMPACTION_OFF_STATES
+
+    if dead:
+        # ⛔ A native overflow is a FAULT. It outranks the band, the window and the policy, and
+        #   it is shown with no keep-working advice, so it cannot be read as a healthy reading.
+        verdict_out, action, relay, fault = "FAULT", "hold", False, "native-overflow"
+        notes = [OVERFLOW_HOLD_MESSAGE]
+    elif not measured:
+        # ⛔ Unknown capacity: no percentage, no band, no handover. Speak only past the floor.
+        verdict_out, action, relay, fault = "UNKNOWN", "unverified", False, None
+        notes = []
+        if used >= UNVERIFIED_NOTE_FLOOR:
+            notes.append(UNVERIFIED_WINDOW_MESSAGE.format(
+                used=used, model=model or "unknown")
+                + (UNVERIFIED_SELECTOR_SENTENCE if _selector_1m_present() else ""))
+    elif handover_policy:
+        # The legacy handover text is kept where compaction is OFF by setting or by variable.
+        verdict_out = band
+        action = ("relay" if band in ("LAND", "CRITICAL")
+                  else "advisory" if band == "NOTICE" else "none")
+        relay, fault = action == "relay", None
+        notes = []
+        if band != "OK":
+            if compaction is None:
+                notes.append(MESSAGES[band].format(pct=pct, win=win_label, used=used))
+            else:
+                notes.append(_policy_sentence(*compaction) + "\n"
+                             + MESSAGES[band].format(pct=pct, win=win_label, used=used))
+    else:
+        # ⛔ Compaction configured ON, or not measured. The action verdict is advisory and can
+        #   never say LAND or CRITICAL: a consumer that reads the verdict as a relay would relay
+        #   a session whose text says not to. The raw band is published beside it.
+        verdict_out = "NOTICE" if band != "OK" else "OK"
+        action = "advisory" if band != "OK" else "none"
+        relay, fault = False, None
+        notes = []
+        if band != "OK":
+            notes.append(NATIVE_COMPACTION_MESSAGES[band].format(
+                pct=pct, win=win_label, used=used, policy=_policy_sentence(*compaction)))
 
     publish(session_id or "unknown", {
-        "session": session_id, "pct": pct, "used": used, "window": win,
-        "window_assumed": assumed, "model": model,
-        "verdict": v, "dead": dead, "cwd": os.getcwd(),
+        "session": session_id, "pct": pct, "pct_exact": pct_exact, "used": used,
+        "window": win, "window_assumed": assumed, "model": model,
+        "observed_max": observed_max,
+        "pressure_band": band, "verdict": verdict_out, "dead": dead, "fault": fault,
+        "action": action, "relay_recommended": relay,
+        "compaction": compaction[0] if compaction else None,
+        "cwd": os.getcwd(),
     })
 
-    if v != "OK":
-        msg = MESSAGES[v].format(pct=pct, win=win_label, used=used)
-        if assumed:
-            msg = (f"⚠ WINDOW ASSUMED — model '{model or 'unknown'}' is not in this gauge's "
-                   f"table, so {win_label} is a GUESS. Before acting on ANY line below, run "
-                   "/context and trust IT; this gauge has cried wall at 19% real usage before "
-                   "(Fable 1M read as 200k, 2026-08-20).\n") + msg
-        print(msg + RITUAL)
+    if notes:
+        print("\n".join(notes) + RITUAL)
     elif report:
-        print(f"CONTEXT GAUGE — {pct}% of the {win_label} window used "
-              f"({used:,} tokens) — model {model or '?'}, window "
-              f"{'ASSUMED' if assumed else 'known'}. OK; relay at {LAND}%.")
+        if measured:
+            tail = (f"OK; relay at {LAND}%." if handover_policy
+                    else f"OK; advisory only at {LAND}%.")
+            print(f"CONTEXT GAUGE — {pct}% of the {win_label} window used "
+                  f"({used:,} tokens) — model {model or '?'}, window known. {tail}")
+        else:
+            print(f"CONTEXT GAUGE — {used:,} tokens seen, model {model or '?'}, window UNVERIFIED. "
+                  "No percentage and no handover from this gauge. Run /context.")
     return 0
 
 
