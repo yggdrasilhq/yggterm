@@ -482,6 +482,22 @@ def _():
     assert not os.path.exists(os.path.join(ya.store_dir("codex"), SLUG + ".json")), "a foreign bundle was stored"
 
 
+@screen("a reader pull of an UNCHANGED record never restarts the codex daemons")
+def _():
+    reset()
+    bundle = ya.access_bundle(record("RT-LIVE-SAME", 10, 1))
+    ya.apply_reader_bundle("codex", SLUG, bundle, "host-a")
+    live = ya.HARNESSES["codex"]["auth_file"]("codex")
+    ya.atomic_write_json(live, ya.reader_record(bundle, "host-a"))
+    real_stop, restarts = ya.stop_codex_daemons, []
+    ya.stop_codex_daemons = lambda home, *a, **k: restarts.append(home) or []
+    try:
+        ya.apply_reader_bundle("codex", SLUG, bundle, "host-a", )
+    finally:
+        ya.stop_codex_daemons = real_stop
+    assert restarts == [], f"an unchanged record restarted the daemons: {restarts}"
+
+
 @screen("evidence never carries a token")
 def _():
     reset()

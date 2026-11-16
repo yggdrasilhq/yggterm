@@ -2176,7 +2176,10 @@ def apply_reader_bundle(harness, slug, bundle, writer, lock_held=False, supersed
     atomic_write_json(_store_path(harness, slug), rec)
     stamp_provenance(harness, slug, record=rec, writer=writer, role="reader",
                      source="sync", writer_updated_at=time.time())
-    if live_here:
+    # Rewrite the live file and restart the daemons that cache it ONLY when the record
+    # actually changed. A reader pulls every run; restarting on an unchanged record would
+    # interrupt running codex work every few hours for nothing.
+    if live_here and record_hash(live) != record_hash(rec):
         atomic_write_json(HARNESSES[harness]["auth_file"](harness), rec)
         _restart_codex_for(harness)
     return {"slug": slug, "writer": writer, "access_expires_at": bundle.get("access_expires_at")}
