@@ -469,6 +469,19 @@ def _():
     assert out["state"] == "reader_pulled" and asked == ["host-a"], out
 
 
+@screen("an access bundle for a DIFFERENT account is refused (wrong store behind an alias)")
+def _():
+    reset()
+    other = record("RT-OTHER", 10, 1)
+    other["tokens"]["id_token"] = jwt({"email": "someone-else@example.test",
+                                       "https://api.openai.com/auth": {"chatgpt_account_id": "acct-other",
+                                                                        "chatgpt_plan_type": "plus"}})
+    other["tokens"]["account_id"] = "acct-other"
+    expect_auth_error(lambda: ya.apply_reader_bundle("codex", SLUG, ya.access_bundle(other), "host-a"),
+                      "identity_mismatch")
+    assert not os.path.exists(os.path.join(ya.store_dir("codex"), SLUG + ".json")), "a foreign bundle was stored"
+
+
 @screen("evidence never carries a token")
 def _():
     reset()

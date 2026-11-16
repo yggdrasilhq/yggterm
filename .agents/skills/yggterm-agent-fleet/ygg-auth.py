@@ -515,8 +515,10 @@ def remember_ssh_dest(dest):
 def ssh_dest_candidates(dest):
     if "@" in dest:
         return [dest]
+    # A learned destination is the only one tried. The bare alias can resolve to a
+    # different login (one host's alias reaches root), i.e. a different store.
     mem = load_ssh_dests().get(dest, [])
-    return (mem + [dest]) if dest not in mem else mem
+    return mem or [dest]
 
 
 def load_fleet_hosts():
@@ -2154,6 +2156,12 @@ def apply_reader_bundle(harness, slug, bundle, writer, lock_held=False, supersed
         if not isinstance(bundle.get(key), str) or not bundle.get(key):
             raise AuthError(5, f"{writer} returned an incomplete access bundle", {"reason": "bad_bundle"})
     rec = reader_record(bundle, writer)
+    # The bundle must be THIS account. A wrong store (another login behind the same
+    # alias) must never be accepted under this slug.
+    ident = identity_of(rec, harness)
+    if ident.get("slug") != slug:
+        raise AuthError(5, f"{writer} returned an access bundle for a different account; not stored",
+                        {"reason": "identity_mismatch"})
     new_epoch = _native_epoch(rec) or 0
     _src, local = local_lineage(harness, slug)
     live = live_record(harness)
