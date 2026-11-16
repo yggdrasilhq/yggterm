@@ -591,16 +591,102 @@ def live_record(harness, required=False):
 
 def capture(harness, name=None, lock_held=False):
     """Snapshot the live record verbatim into the store. Returns (slug, path)."""
+    if not lock_held:
+        with fleet_lock():
+            return capture(harness, name=name, lock_held=True)
     record = live_record(harness, required=True)
     ident = identity_of(record, harness)
     if not ident["slug"] and not name:
         raise AuthError(3, "live record carries no usable identity; pass --name to store it anyway")
     slug = slug_for(name or ident["slug"])
     path = os.path.join(store_dir(harness), f"{slug}.json")
-    if not lock_held:
-        with fleet_lock():
-            return _capture_locked(harness, record, slug, path, ident)
     return _capture_locked(harness, record, slug, path, ident)
+
+
+def _native_epoch(record):
+    """Native refresh timestamp orders records; expiry/mtime do not prove lineage."""
+    value = record.get("last_refresh")
+    if type(value) is not str:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return parsed.timestamp() if parsed.tzinfo is not None else None
+    except (ValueError, OverflowError):
+        return None
+
+
+def _same_codex_identity(left, right):
+    a, b = identity_of(left), identity_of(right)
+    return bool(a["slug"] and a["slug"] == b["slug"] and
+                a["account_id"] != "none" and a["account_id"] == b["account_id"])
+
+
+def reconcile_native_codex():
+    """Capture a native login/refresh under the vault fence, without activation.
+
+    A newer native refresh may establish a local writer. Ambiguous/downgrade
+    evidence holds; callers cannot use a later filesystem mtime as authority.
+    """
+    with fleet_lock():
+        for _ in range(3):
+            path = HARNESSES['codex']['auth_file']('codex')
+            before = _live_fingerprint(path)
+            native = live_record('codex', required=True)
+            ident = identity_of(native)
+            if not ident['slug'] or ident['account_id'] == 'none' or not usable_record(native, 'codex'):
+                raise AuthError(5, 'native identity is not eligible for reconciliation')
+            target = os.path.join(store_dir('codex'), ident['slug'] + '.json')
+            if os.path.exists(target):
+                stored = read_json(target)
+                if record_hash(native) == record_hash(stored):
+                    return {'reconciled': ident['slug'], 'changed': False, 'native_unchanged': True}
+                if not _same_codex_identity(native, stored):
+                    raise AuthError(5, 'native and stored account identity differ; retaining both')
+                a, b = _native_epoch(native), _native_epoch(stored)
+                if a is None or b is None or a <= b:
+                    raise AuthError(5, 'native freshness is ambiguous or older; refusing vault downgrade',
+                                    {'reason': 'native_freshness_unresolved'})
+            if _live_fingerprint(path) != before:
+                continue
+            _capture_locked('codex', native, ident['slug'], target, ident)
+            return {'reconciled': ident['slug'], 'changed': True, 'native_unchanged': True}
+        raise AuthError(5, 'native login kept changing; reconciliation held')
+
+
+def cmd_reconcile(args):
+    if require_harness(args.harness) != 'codex':
+        raise AuthError(6, 'native reconciliation currently supports codex only')
+    result = reconcile_native_codex()
+    if getattr(args, 'fleet', False):
+        # Each enrolled peer PULLS this writer's stored portable profile.
+        # No native activation, no keyrings, no remote refresh, no broad sync.
+        script = open(os.path.abspath(__file__), 'rb').read()
+        peers = {}
+        hosts = load_fleet_hosts()
+        if not hosts:
+            raise AuthError(5, 'fleet pull requested without enrolled hosts; local reconciliation retained')
+        expected = record_hash(read_json(os.path.join(store_dir('codex'), result['reconciled']+'.json')))
+        for host in hosts:
+            if host == HOSTNAME:
+                continue
+            proc = None
+            for destination in ssh_dest_candidates(host):
+                proc = ssh_script(destination, ['fetch', HOSTNAME, result['reconciled'], '--harness', 'codex', '--json'], script)
+                if proc is not None and proc.returncode == 0:
+                    remember_ssh_dest(destination)
+                    break
+            try:
+                reply = json.loads(proc.stdout) if proc is not None and proc.returncode == 0 else {}
+            except (ValueError, AttributeError):
+                reply = {}
+            verified = (isinstance(reply,dict) and reply.get('slug') == result['reconciled']
+                        and reply.get('activated') is False and reply.get('stored_record_hash') == expected)
+            peers[host] = {'stored': verified,
+                           'active_account_changed': False}
+        result['peers'] = peers
+        if any(not v['stored'] for v in peers.values()):
+            raise AuthError(5, 'native login reconciled locally; some fleet pulls held', result)
+    return result
 
 
 def _capture_locked(harness, record, slug, path, ident):
@@ -812,7 +898,84 @@ def stop_codex_daemons(home, grace_seconds=3.0):
     return stopped
 
 
-def switch(harness, slug, lock_held=False, expected_active_hash=None):
+def _create_native_if_absent(path, record):
+    """Publish complete native bytes without overwriting a concurrent login."""
+    directory = os.path.dirname(path)
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(prefix='.auth-create-', dir=directory)
+    try:
+        with os.fdopen(descriptor, 'w') as output:
+            os.fchmod(output.fileno(), 0o600)
+            json.dump(record, output, indent=2)
+            output.flush();os.fsync(output.fileno())
+        try:
+            os.link(temporary, path)
+        except FileExistsError:
+            raise AuthError(5, 'native login appeared before publication; retained') from None
+        folder = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+        try:os.fsync(folder)
+        finally:os.close(folder)
+    finally:
+        os.unlink(temporary)
+
+
+def _exchange_native_paths(left, right):
+    """Linux exchange preserves the exact displaced inode. No replace fallback."""
+    import ctypes
+    if not sys.platform.startswith('linux'):
+        raise AuthError(5, 'native exchange unsupported on this platform; activation held')
+    library = ctypes.CDLL(None, use_errno=True)
+    exchange = getattr(library, 'renameat2', None)
+    if exchange is None:
+        raise AuthError(5, 'native exchange unavailable; activation held')
+    exchange.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+    exchange.restype = ctypes.c_int
+    if exchange(-100, os.fsencode(left), -100, os.fsencode(right), 2) != 0:
+        raise AuthError(5, 'native exchange failed; recovery slots retained', {'errno': ctypes.get_errno()})
+    descriptor = os.open(os.path.dirname(right), os.O_RDONLY | os.O_DIRECTORY)
+    try:os.fsync(descriptor)
+    finally:os.close(descriptor)
+
+
+def _publish_native_preserving_displaced(path, record, expected_record):
+    """Retain every displaced grant; concurrent native login wins or holds.
+
+    Atomic exchange is the publication linearization point. A concurrent
+    native writer need not honor our flock. Recovery slots remain private
+    evidence, including when storage or restoration cannot be reconciled.
+    """
+    descriptor, slot = tempfile.mkstemp(prefix='.auth-displaced-', dir=os.path.dirname(path))
+    with os.fdopen(descriptor, 'w') as output:
+        os.fchmod(output.fileno(), 0o600)
+        json.dump(record, output, indent=2);output.flush();os.fsync(output.fileno())
+    _exchange_native_paths(slot, path)
+    displaced = read_json(slot)
+    # Store the displaced record before any possible restoration exchange.
+    def retain(value):
+        atomic_write_json(os.path.join(store_dir('codex'), '.recovery', record_hash(value)+'.json'), value)
+    retain(displaced)
+    if record_hash(displaced) == record_hash(expected_record):
+        return  # The exact expected record was replaced; slot remains pinned.
+    ours = record_hash(record)
+    for _ in range(3):
+        current = read_json(path)
+        if record_hash(current) != ours:
+            # A later native writer already won. Preserve it in place.
+            retain(current)
+            raise AuthError(5, 'concurrent native login retained; activation held')
+        _exchange_native_paths(slot, path)
+        previous = read_json(slot)
+        retain(previous)
+        if record_hash(previous) == ours:
+            raise AuthError(5, 'concurrent native login restored; activation held')
+        # Another login committed between our read and restoration. It is
+        # now in slot, and the record just restored is the one we own.
+        ours = record_hash(displaced)
+        displaced = previous
+    raise AuthError(5, 'concurrent native publication unresolved; all displaced grants retained')
+
+
+def switch(harness, slug, lock_held=False, expected_active_hash=None, expected_absent=False):
     """capture-on-leave, then byte-faithful atomic swap to the named profile.
 
     The live file is re-read if the harness rewrote it mid-swap: OAuth refresh
@@ -821,6 +984,10 @@ def switch(harness, slug, lock_held=False, expected_active_hash=None):
     when the file is fingerprint-unchanged from the read; three attempts, then
     fail loudly rather than swap silently stale.
     """
+    if not lock_held:
+        with fleet_lock():
+            return switch(harness, slug, lock_held=True, expected_active_hash=expected_active_hash,
+                          expected_absent=expected_absent)
     slug = slug_for(slug)  # accept the raw email; store/lookup use one normalization
     target = os.path.join(store_dir(harness), f"{slug}.json")
     if not os.path.exists(target):
@@ -828,6 +995,25 @@ def switch(harness, slug, lock_held=False, expected_active_hash=None):
         raise AuthError(6, f"no stored profile {slug!r} for {harness}; stored: {known}")
     live_path = HARNESSES[harness]["auth_file"](harness)
     target_record = read_json(target)
+    current = live_record(harness)
+    entry_hash = record_hash(current) if current is not None else None
+    expected_absent = expected_absent or current is None
+    if expected_absent and current is not None:
+        raise AuthError(5, 'native login appeared after expected absence; retained')
+    if expected_active_hash is not None and (current is None or record_hash(current) != expected_active_hash):
+        raise AuthError(5, 'active auth changed during fallback; refusing replacement')
+    # Re-select the target AFTER capture. Previously same-account activation
+    # captured the fresh native login then overwrote it from the stale local
+    # variable read above. A same-account no-op must never roll auth backward.
+    if harness == 'codex' and current is not None and _same_codex_identity(current, target_record):
+        if record_hash(current) != record_hash(target_record):
+            a, b = _native_epoch(current), _native_epoch(target_record)
+            if a is None or b is None or a <= b:
+                raise AuthError(5, 'same-account freshness unresolved; retaining native login')
+            _capture_locked(harness, current, slug, target, identity_of(current))
+        return {'switched_to': slug, 'identity': identity_of(current),
+                'captured_before_leaving': None, 'daemons_stopped': [],
+                'activation': 'already_active_native_preserved', 'native_health': 'unknown'}
     # (identity calls below are harness-scoped)
 
     # The app-server daemon caches auth at startup and every TUI delegates
@@ -845,11 +1031,18 @@ def switch(harness, slug, lock_held=False, expected_active_hash=None):
                   f"at startup and would keep serving the previous account", file=sys.stderr)
 
     captured = None
+    outgoing_record_hash = None
+    after_stop = live_record(harness)
+    if (record_hash(after_stop) if after_stop is not None else None) != entry_hash:
+        raise AuthError(5, 'native login changed during initial teardown; activation held')
     if os.path.exists(live_path):
         swapped = False
         for _ in range(3):
             before = _live_fingerprint(live_path)
             current = live_record(harness, required=True)
+            if expected_absent:
+                raise AuthError(5, 'native login appeared during activation; retained')
+            outgoing_record_hash = record_hash(current)
             if expected_active_hash is not None and record_hash(current) != expected_active_hash:
                 raise AuthError(5, "active auth changed during fallback; refusing replacement")
             current_ident = identity_of(current, harness)
@@ -859,13 +1052,16 @@ def switch(harness, slug, lock_held=False, expected_active_hash=None):
                                            os.path.join(store_dir(harness), outgoing + ".json"), current_ident)
             if _live_fingerprint(live_path) != before:
                 continue  # the harness rewrote mid-read; its tokens would be lost — redo
-            atomic_write_json(live_path, target_record)
+            if harness == 'codex':
+                _publish_native_preserving_displaced(live_path, target_record, current)
+            else:
+                atomic_write_json(live_path, target_record)
             swapped = True
             break
         if not swapped:
             raise AuthError(5, f"the live auth file kept changing during capture ({live_path}); not switching")
     else:
-        atomic_write_json(live_path, target_record)
+        _create_native_if_absent(live_path, target_record)
 
     swapped = identity_of(live_record(harness, required=True), harness)
     if swapped["slug"] and swapped["slug"] != slug:
@@ -886,9 +1082,19 @@ def switch(harness, slug, lock_held=False, expected_active_hash=None):
             swapped = identity_of(current, harness)
             if record_hash(current) == record_hash(target_record):
                 break
+            if _same_codex_identity(current, target_record):
+                a, b = _native_epoch(current), _native_epoch(target_record)
+                if a is not None and b is not None and a > b:
+                    # Native re-login/refresh won after activation. Preserve it
+                    # and update the vault; never replay a consumed older grant.
+                    _capture_locked(harness, current, slug, target, swapped)
+                    target_record = current
+                    break
+            if record_hash(current) != outgoing_record_hash:
+                raise AuthError(5, 'unexpected native auth change during switch; retaining it for reconciliation')
             print("⚠️  the live auth file drifted during daemon teardown — re-writing "
                   f"{slug}", file=sys.stderr)
-            atomic_write_json(live_path, target_record)
+            _publish_native_preserving_displaced(live_path, target_record, current)
         else:
             raise AuthError(5, f"the live auth file kept drifting during daemon teardown ({live_path})")
     if record_hash(live_record(harness, required=True)) != record_hash(target_record):
@@ -1107,6 +1313,11 @@ def cmd_status(args):
         "live": ident,
         "profiles": [{k: v for k, v in p.items() if k != "path"} for p in profiles],
     }
+    if harness == 'codex' and ident:
+        native = live_record(harness)
+        match = next((p for p in profiles if p['slug'] == binding and not p.get('unreadable')), None)
+        out['native_vault_sync'] = ('missing' if match is None else
+            'in_sync' if record_hash(read_json(match['path'])) == record_hash(native) else 'drift_reconcile_required')
     return out
 
 
@@ -1133,36 +1344,45 @@ def cmd_switch(args):
             6, f"{slug}'s deterministic home is {home!r} — this host is {HOSTNAME!r}. "
                f"Run the switch there, reassign with `assign {slug} {HOSTNAME}`, or override with --force (owner).")
     with fleet_lock():
-        daemons_stopped_pre = []
-        if harness == "codex":
-            # the refresh and the swap must both happen with no daemon alive
-            # to race them or flush stale tokens over them; switch() re-runs
-            # this as a cheap no-op for the rotate/fetch-activate paths
-            daemons_stopped_pre = stop_codex_daemons(os.path.dirname(HARNESSES[harness]["auth_file"](harness)))
-            if daemons_stopped_pre:
-                print(f"⬇  stopped codex app-server daemon(s) {daemons_stopped_pre} — they cache auth "
-                      f"at startup and would keep serving the previous account", file=sys.stderr)
-        # deterministic hygiene: refresh the OUTGOING grant before capturing it,
-        # so the stored copy holds the newest token, never a consumed one.
-        # Single-writer guard: only refresh when THIS host owns the live lineage.
-        if harness == "codex" and os.environ.get("YGG_AUTH_NO_PREFRESH") != "1":
-            try:
-                live_rec = live_record(harness, required=True)
-                ident = identity_of(live_rec)
-                writer = get_writer(harness, ident.get("slug") or "")
-                if writer not in (None, "unknown", HOSTNAME):
-                    print(f"⚠️  pre-switch refresh skipped: {ident.get('slug')}'s lineage is owned by "
-                          f"{writer!r} — switching proceeds with the stored copy as-is",
-                          file=sys.stderr)
-                else:
-                    fresh = refresh_grant(live_rec)
-                    atomic_write_json(HARNESSES[harness]["auth_file"](harness), fresh)
-            except Exception as exc:
-                print(f"⚠️  pre-switch refresh skipped ({type(exc).__name__})", file=sys.stderr)
-        result = switch(harness, args.slug, lock_held=True)
-        if daemons_stopped_pre:
-            result["daemons_stopped"] = daemons_stopped_pre + [
-                pid for pid in result.get("daemons_stopped", []) if pid not in daemons_stopped_pre]
+        health = {'state': 'unknown', 'measured': False}
+        original_native = live_record(harness)
+        expected_native_hash = record_hash(original_native) if original_native is not None else None
+        if harness == 'codex' and os.environ.get('YGG_AUTH_NO_PREFRESH') != '1':
+            target_path = os.path.join(store_dir(harness), slug + '.json')
+            target = read_json(target_path) if os.path.exists(target_path) else None
+            if target is not None:
+                native = live_record(harness)
+                same_live = native is not None and _same_codex_identity(native, target)
+                candidate = native if same_live else target
+                probe = usage_snapshot(candidate)
+                if probe.get('ok') is not True:
+                    # Refresh only a dormant lineage owned here, never the
+                    # outgoing account or a grant cached by the live runtime.
+                    if same_live or get_writer(harness, slug) != HOSTNAME:
+                        raise AuthError(5, 'target authentication not verified; native login retained',
+                                        {'reason': 'target_auth_unverified', 'http_status': probe.get('http_status')})
+                    if probe.get('http_status') not in (401, 403) and not identity_of(candidate)['expired']:
+                        raise AuthError(5, 'target authentication probe unavailable; switch held')
+                    before_refresh = live_record(harness)
+                    if (record_hash(before_refresh) if before_refresh is not None else None) != expected_native_hash:
+                        raise AuthError(5, 'native login changed during target probe; refresh held')
+                    fresh = refresh_grant(candidate)
+                    # A rotated grant must be retained even if validation later
+                    # fails. Validate identity before native activation.
+                    atomic_write_json(os.path.join(store_dir(harness), '.recovery', record_hash(fresh) + '.json'), fresh)
+                    if not _same_codex_identity(candidate, fresh):
+                        raise AuthError(5, 'refreshed target identity changed; activation held')
+                    _capture_locked(harness, fresh, slug, target_path, identity_of(fresh))
+                    probe = usage_snapshot(fresh)
+                    if probe.get('ok') is not True:
+                        raise AuthError(5, 'refreshed target retained but authentication unverified; switch held')
+                health = {'state': 'usage_authenticated', 'measured': True,
+                          'quota_allowed': probe.get('allowed'), 'limit_reached': probe.get('limit_reached')}
+        if original_native is None and live_record(harness) is not None:
+            raise AuthError(5, 'native login appeared during validation; activation held')
+        result = switch(harness, args.slug, lock_held=True, expected_active_hash=expected_native_hash,
+                        expected_absent=original_native is None)
+        result['target_authentication'] = health
     return result
 
 
@@ -1775,19 +1995,39 @@ def fetch_remote(host, harness, slug, activate=False):
     if writer_updated_at is None:
         writer_updated_at = time.time()
 
+    if harness == 'codex' and 'remote_prov' in locals() and remote_prov.get('content_hash') not in (None, record_hash(record)):
+        raise AuthError(5, 'remote auth changed across snapshot reads; fetch held')
+
     with fleet_lock():
+        if harness == 'codex':
+            existing = os.path.join(store_dir(harness), slug + '.json')
+            local = read_json(existing) if os.path.exists(existing) else None
+            native = live_record(harness)
+            for candidate in (local, native):
+                if candidate is None:
+                    continue
+                local_ident = identity_of(candidate)
+                if local_ident.get('slug') != slug:
+                    continue
+                if not _same_codex_identity(candidate, record):
+                    raise AuthError(5, 'fetch account identity conflicts with local record; retained')
+                if record_hash(candidate) != record_hash(record):
+                    a, b = _native_epoch(candidate), _native_epoch(record)
+                    if a is None or b is None or a >= b:
+                        raise AuthError(5, 'fetch would replace newer or incomparable local auth; retained',
+                                        {'reason': 'local_auth_not_older'})
         atomic_write_json(os.path.join(store_dir(harness), f"{slug}.json"), record)
         stamp_provenance(harness, slug, record=record, writer=writer,
                          writer_updated_at=writer_updated_at,
                          source="fetch", fetched_from=used_dest)
-        if activate:
-            # "activated": True — dream ACK-0b31f4f3f5: without it the success
-            # printer fell into the stored-not-live branch and KeyError'd on
-            # 'slug' AFTER a fully successful fetch+switch (exit 1 on success).
-            return {**switch(harness, slug, lock_held=True), "fetched_from": used_dest,
-                    "activated": True}
+    if activate:
+        # Re-enter through the checked activation route after releasing the
+        # vault lock; never bypass its target probe or nest the flock.
+        result = cmd_switch(argparse.Namespace(harness=harness, slug=slug, force=False))
+        return {**result, 'fetched_from': used_dest, 'activated': True}
     return {"fetched_from": used_dest, "slug": slug,
-            "writer": writer, "activated": False}
+            "writer": writer, "activated": False,
+            "stored_record_hash": record_hash(read_json(os.path.join(store_dir(harness),slug+'.json')))}
 
 
 def cmd_fetch(args):
@@ -1989,6 +2229,17 @@ def refresh_grant(record):
         raise AuthError(5, f"refresh grant rejected: HTTP {exc.code}", {"reason": reason, "http_status": exc.code})
     except (urllib.error.URLError, OSError, ValueError) as exc:
         raise AuthError(5, "refresh grant unavailable", {"reason": "refresh_unavailable"})
+    if not isinstance(got, dict):
+        raise AuthError(5, 'refresh response is not an object')
+    if isinstance(got.get('refresh_token'), str) and got['refresh_token']:
+        recovery = json.loads(json.dumps(record))
+        container = recovery['tokens'] if isinstance(recovery.get('tokens'), dict) else recovery
+        container['refresh_token'] = got['refresh_token']
+        if isinstance(got.get('access_token'), str):
+            container['access_token'] = got['access_token']
+        if isinstance(got.get('id_token'), str):
+            container['id_token'] = got['id_token']
+        atomic_write_json(os.path.join(store_dir('codex'), '.recovery', record_hash(recovery) + '.json'), recovery)
     if not got.get("access_token"):
         raise AuthError(5, "refresh response missing access_token")
     new = json.loads(json.dumps(record))  # deep copy, verbatim shape preserved
@@ -2421,6 +2672,11 @@ def main(argv=None):
     p.add_argument("--name", help="override the profile slug")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_capture)
+
+    p = sub.add_parser("reconcile", parents=[sub_parent], help="capture a newer native login without changing the active account")
+    p.add_argument("--fleet", action="store_true", help="ask enrolled peers to pull this profile into their vaults; never activate")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_reconcile)
 
     p = sub.add_parser("switch", parents=[sub_parent], help="switch to a stored profile (capture-on-leave)")
     p.add_argument("slug", nargs="?", help="profile slug or account email from `list`")
