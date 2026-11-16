@@ -204,6 +204,29 @@ def _held_refresh(evidence_rows, roster):
     return str(exc)
 
 
+@screen("a grant the provider refused is NOT presented again (no repeat refusals)")
+def _():
+    reset()
+    put_store(record("RT-REFUSED", 1, 7))
+    real_refresh, real_evidence = ya.refresh_grant, ya.fleet_evidence
+    calls = []
+
+    def dead(_rec):
+        calls.append(1)
+        raise ya.AuthError(5, "refresh grant rejected: HTTP 401", {"reason": "refresh_invalid"})
+
+    ya.refresh_grant = dead
+    ya.fleet_evidence = lambda _h, _s, _b: [{"host": ya.HOSTNAME, "kind": "writer",
+                                             "last_refresh_epoch": NOW - 7 * DAY},
+                                            {"host": "host-b", "kind": "reader", "writer": ya.HOSTNAME}]
+    try:
+        expect_auth_error(lambda: ya._writer_access("codex", SLUG), "refresh_invalid")
+        expect_auth_error(lambda: ya._writer_access("codex", SLUG), "reauth_required")
+    finally:
+        ya.refresh_grant, ya.fleet_evidence = real_refresh, real_evidence
+    assert len(calls) == 1, f"the refused grant was presented {len(calls)} times"
+
+
 @screen("refresh is HELD when the fleet roster is unknown (never presents on a guess)")
 def _():
     why = _held_refresh([{"host": ya.HOSTNAME, "kind": "writer", "last_refresh_epoch": NOW - 7 * DAY}], [])

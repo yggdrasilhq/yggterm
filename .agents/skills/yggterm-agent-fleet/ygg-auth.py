@@ -2113,6 +2113,11 @@ def _writer_access(harness, slug):
             if src == "live":
                 _persist_writer(harness, slug, rec, refreshed=False)
             return access_bundle(rec), False
+        if profile_health(harness, slug, rec).get("state") == "reauthorization_required":
+            # The provider refused this exact grant. Presenting it again on every sync
+            # adds nothing and repeats the refusal; a new grant changes the hash and re-arms.
+            raise AuthError(5, f"{slug}: this grant was refused by the provider and is not presented again",
+                            {"reason": "reauth_required"})
         why = _refresh_gate(fleet_evidence(harness, slug, _self_bytes()), _native_epoch(rec) or 0)
         if why:
             raise AuthError(5, f"refresh held for {slug}: {why}", {"reason": "held_unproven"})
@@ -2323,6 +2328,8 @@ def sync_lineage(harness, slug, script_bytes):
     except AuthError as exc:
         if exc.details.get("reason") == "held_unproven":
             return {"slug": slug, "state": "held", "note": str(exc)[:200]}
+        if exc.details.get("reason") == "reauth_required":
+            return {"slug": slug, "state": "reauth_required", "note": str(exc)[:200]}
         if exc.details.get("reason") != "refresh_invalid":
             raise
         return recover_lineage(harness, slug, script_bytes, exc)
