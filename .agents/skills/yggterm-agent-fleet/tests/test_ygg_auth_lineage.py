@@ -447,21 +447,26 @@ def _():
     expect_auth_error(lambda: ya._sign_in_gate("codex", None), "name_required")
 
 
-@screen("sync leaves a fresh reader alone (no pull, no network)")
+@screen("sync asks the writer on every run; a fresh writer answers without refreshing")
 def _():
     reset()
     ya.apply_reader_bundle("codex", SLUG, ya.access_bundle(record("RT-LIVE", 10, 1)), "host-a")
-    real_pull = ya.pull_access
+    real_pull, real_refresh = ya.pull_access, ya.refresh_grant
+    asked = []
 
-    def must_not_pull(*_a, **_k):
-        raise AssertionError("a fresh reader was pulled")
+    def pull(_h, _s, writer, _b):
+        asked.append(writer)
+        return ya.access_bundle(record("RT-LIVE-FRESH", 10, 0))
 
-    ya.pull_access = must_not_pull
+    def must_not_refresh(_rec):
+        raise AssertionError("a reader triggered a refresh")
+
+    ya.pull_access, ya.refresh_grant = pull, must_not_refresh
     try:
         out = ya.sync_lineage("codex", SLUG, b"")
     finally:
-        ya.pull_access = real_pull
-    assert out["state"] == "reader_fresh", out
+        ya.pull_access, ya.refresh_grant = real_pull, real_refresh
+    assert out["state"] == "reader_pulled" and asked == ["host-a"], out
 
 
 @screen("evidence never carries a token")

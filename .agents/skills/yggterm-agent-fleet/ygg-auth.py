@@ -2294,9 +2294,9 @@ def sync_lineage(harness, slug, script_bytes):
     of_record = get_writer(harness, slug)
     if is_reader_record(rec) or of_record not in (None, HOSTNAME):
         writer = of_record or "unknown"
-        exp = access_expiry(rec)
-        if is_reader_record(rec) and exp is not None and exp - time.time() > ACCESS_PULL_AHEAD_S:
-            return {"slug": slug, "state": "reader_fresh", "writer": writer}
+        # A reader asks its writer on EVERY run, not only near expiry: the writer answers
+        # from its own copy unless its access token is close to expiry, and the reader's
+        # copy of last_refresh then tracks the writer's latest refresh (never stale).
         try:
             bundle = pull_access(harness, slug, writer, script_bytes)
             apply_reader_bundle(harness, slug, bundle, writer)
