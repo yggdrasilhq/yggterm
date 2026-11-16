@@ -144,7 +144,22 @@ from datetime import datetime, timezone
 STORE_ROOT = os.environ.get("YGG_AUTH_HOME") or os.path.expanduser("~/.yggterm/auth")
 LOCK_FILE = os.path.join(STORE_ROOT, ".lock")
 DEFAULT_COOLDOWN_MINUTES = 30
-HOSTNAME = socket.gethostname()
+def _self_name():
+    """This host's name in the fleet roster. The kernel hostname can differ from the
+    roster alias (one host reports a vendor name), and provenance writer stamps must
+    use the alias or every peer comparison silently misses this host. An explicit
+    `.host-alias` file wins; the kernel name is the fallback."""
+    try:
+        with open(os.path.join(STORE_ROOT, ".host-alias")) as f:
+            alias = f.read().strip()
+            if alias:
+                return alias
+    except OSError:
+        pass
+    return socket.gethostname()
+
+
+HOSTNAME = _self_name()
 FLEET_HOSTS_FILE = os.path.join(STORE_ROOT, ".fleet-hosts")
 SSH_DESTS_FILE = os.path.join(STORE_ROOT, ".ssh-dests.json")
 PROVENANCE_FILE = os.path.join(STORE_ROOT, ".provenance")
@@ -2098,9 +2113,28 @@ def _writer_access(harness, slug):
             if src == "live":
                 _persist_writer(harness, slug, rec, refreshed=False)
             return access_bundle(rec), False
+        why = _refresh_gate(fleet_evidence(harness, slug, _self_bytes()), _native_epoch(rec) or 0)
+        if why:
+            raise AuthError(5, f"refresh held for {slug}: {why}", {"reason": "held_unproven"})
         fresh = refresh_profile(harness, slug, rec)   # raises refresh_invalid on a dead grant
         _persist_writer(harness, slug, fresh, refreshed=True)
         return access_bundle(fresh), True
+
+
+def _refresh_gate(rows, local_epoch):
+    """A grant may be presented to the provider ONLY when this host can prove it holds
+    the newest grant: the roster is known, every peer answered, and no peer holds a newer
+    writer grant. Anything less holds the refresh. Presenting a rotated-out grant can get
+    the whole family revoked, and a peer that cannot be read might hold a newer one."""
+    if not load_fleet_hosts():
+        return "fleet roster missing: cannot prove this grant is the newest"
+    peers = [r for r in rows if r.get("host") != HOSTNAME]
+    if any(r.get("kind") == "unreachable" for r in peers):
+        return "a peer is unreachable: cannot prove this grant is the newest"
+    newer = [r for r in peers if r.get("kind") == "writer" and (r.get("last_refresh_epoch") or 0) > local_epoch]
+    if newer:
+        return f"{newer[0].get('host')} holds a newer grant: this one is superseded"
+    return None
 
 
 def apply_reader_bundle(harness, slug, bundle, writer, lock_held=False, supersede=False):
@@ -2287,6 +2321,8 @@ def sync_lineage(harness, slug, script_bytes):
         _bundle, refreshed = _writer_access(harness, slug)
         return {"slug": slug, "state": "writer_refreshed" if refreshed else "writer_fresh"}
     except AuthError as exc:
+        if exc.details.get("reason") == "held_unproven":
+            return {"slug": slug, "state": "held", "note": str(exc)[:200]}
         if exc.details.get("reason") != "refresh_invalid":
             raise
         return recover_lineage(harness, slug, script_bytes, exc)

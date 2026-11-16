@@ -39,6 +39,9 @@ os.makedirs(os.environ["CODEX_HOME"])
 _spec = importlib.util.spec_from_file_location("ygg_auth_under_test", SCRIPT)
 ya = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(ya)
+# The real roster lives under the user's store, which the sandbox does not use. Screens
+# that exercise the refresh gate override it with an unknown or partial roster themselves.
+ya.load_fleet_hosts = lambda: [ya.HOSTNAME, "host-a", "host-b"]
 
 NOW = time.time()
 DAY = 86400
@@ -165,14 +168,62 @@ def _():
         return out
 
     ya.refresh_grant = rotated
+    real_evidence, real_hosts = ya.fleet_evidence, ya.load_fleet_hosts
+    ya.fleet_evidence = lambda _h, _s, _b: [
+        {"host": ya.HOSTNAME, "kind": "writer", "last_refresh_epoch": NOW - 7 * DAY},
+        {"host": "host-b", "kind": "reader", "writer": ya.HOSTNAME}]
+    ya.load_fleet_hosts = lambda: [ya.HOSTNAME, "host-b"]
     try:
         bundle, refreshed = ya._writer_access("codex", SLUG)
     finally:
-        ya.refresh_grant = real
+        ya.refresh_grant, ya.fleet_evidence, ya.load_fleet_hosts = real, real_evidence, real_hosts
     assert refreshed is True
     assert read_store()["tokens"]["refresh_token"] == "RT-W2", "rotated grant was not persisted"
     prov = ya.load_provenance("codex")[SLUG]
     assert prov.get("role") == "writer" and prov.get("source") == "refresh"
+
+
+def _held_refresh(evidence_rows, roster):
+    """Run a near-expiry writer read with the fleet view stubbed. Returns the reason the
+    refresh was held, and fails the screen if the provider was called anyway."""
+    reset()
+    put_store(record("RT-GATED", 1, 7))
+    real_refresh, real_evidence, real_hosts = ya.refresh_grant, ya.fleet_evidence, ya.load_fleet_hosts
+
+    def must_not_present(_rec):
+        raise AssertionError("the refresh grant was presented without a proven-newest fleet view")
+
+    ya.refresh_grant = must_not_present
+    ya.fleet_evidence = lambda _h, _s, _b: evidence_rows
+    ya.load_fleet_hosts = lambda: roster
+    try:
+        exc = expect_auth_error(lambda: ya._writer_access("codex", SLUG), "held_unproven")
+    finally:
+        ya.refresh_grant, ya.fleet_evidence, ya.load_fleet_hosts = real_refresh, real_evidence, real_hosts
+    assert read_store()["tokens"]["refresh_token"] == "RT-GATED", "a held grant was rotated anyway"
+    return str(exc)
+
+
+@screen("refresh is HELD when the fleet roster is unknown (never presents on a guess)")
+def _():
+    why = _held_refresh([{"host": ya.HOSTNAME, "kind": "writer", "last_refresh_epoch": NOW - 7 * DAY}], [])
+    assert "roster missing" in why, why
+
+
+@screen("refresh is HELD while a peer is unreachable")
+def _():
+    why = _held_refresh([{"host": ya.HOSTNAME, "kind": "writer", "last_refresh_epoch": NOW - 7 * DAY},
+                         {"host": "host-b", "kind": "unreachable"}],
+                        [ya.HOSTNAME, "host-b"])
+    assert "unreachable" in why, why
+
+
+@screen("refresh is HELD when a peer holds a NEWER grant (this one is superseded)")
+def _():
+    why = _held_refresh([{"host": ya.HOSTNAME, "kind": "writer", "last_refresh_epoch": NOW - 7 * DAY},
+                         {"host": "host-a", "kind": "writer", "last_refresh_epoch": NOW - 1 * DAY}],
+                        [ya.HOSTNAME, "host-a"])
+    assert "superseded" in why, why
 
 
 @screen("the refresh grant refuses a reader copy before any network call")
