@@ -1404,10 +1404,11 @@ Mechanics an agent must know before relying on it:
   quota-locked account it just fled. `status` shows the cooldown.
 - **Applies to NEW invocations.** A running codex/claude session keeps the
   tokens it loaded at start; rotate, then start fresh rows.
-- **Credentials never leave the host.** The store is
-  `~/.yggterm/auth/<harness>/` — never in `~/.yggterm/memory`, never posted to
-  a board, never synced. No verb prints a token. Violating this is the one way
-  this tool can hurt the fleet.
+- **Refresh grants never leave their writer host; access tokens move only by
+  pull.** The store is `~/.yggterm/auth/<harness>/` — never in
+  `~/.yggterm/memory`, never posted to a board, never synced. A reader receives
+  the access + id token over ssh (`access --for-reader`, refuses a terminal) and
+  stores it with a sentinel where the refresh token was. No verb prints a token.
 
 ⛔ **The one sanctioned exception to the Harness Isolation Law (§5):**
 `ygg-auth.py` may swap a harness's WHOLE auth file (`~/.codex/auth.json`,
@@ -1429,11 +1430,15 @@ piecemeal edit of harness state. Everything else in that law stands.
   ⛔ `<ssh-dest>` must land on the ACCOUNT that owns the store, user included —
   measured 2026-09-20: plain `dev` from oc resolves to root@dev (/root) and
   finds nothing; write `pi@dev`.
-- ⛔ **Single-writer law for replicated profiles.** OAuth refresh ROTATES the
-  refresh token: refresh on the host where the profile is LIVE only, never on
-  two hosts against the same stored copy — the second refresh uses a revoked
-  token. A stale copy on another host is harmless until switched; if its
-  refresh then fails, re-fetch from the writer host.
+- ⛔ **One writer per lineage; sign-in is the last resort (2026-11-16).** OAuth
+  refresh ROTATES the refresh token, so a second copy of it is a second writer.
+  The writer (the host holding the newest grant) is the only caller of the
+  refresh grant, and only when the access token has under 3 days left. Every
+  other host is a READER: `sync` (timer, every 6 h) pulls its access bundle from
+  the writer, and a reader never refreshes. A grant is presented only when the
+  roster is known, every peer answered, and no peer holds a newer grant
+  (`_refresh_gate`); a grant the provider refused is not presented again.
+  `login` is refused while any host refreshed the account within 30 days.
 
 - **Provenance makes single-writer enforceable** (dream ACK-68ce18afa6, built
   2026-09-20): every mutating verb stamps `~/.yggterm/auth/<harness>/.provenance.json`
