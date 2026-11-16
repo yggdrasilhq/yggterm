@@ -1339,7 +1339,7 @@ def cmd_switch(args):
         raise AuthError(6, "switch needs a profile slug (see `list`)")
     slug = slug_for(args.slug)
     home = assignment_of(slug)
-    if home and home != HOSTNAME and not getattr(args, "force", False):
+    if home and home != HOSTNAME and not getattr(args, "force", False) and not _store_is_reader(harness, slug):
         raise AuthError(
             6, f"{slug}'s deterministic home is {home!r} — this host is {HOSTNAME!r}. "
                f"Run the switch there, reassign with `assign {slug} {HOSTNAME}`, or override with --force (owner).")
@@ -1347,6 +1347,17 @@ def cmd_switch(args):
         health = {'state': 'unknown', 'measured': False}
         original_native = live_record(harness)
         expected_native_hash = record_hash(original_native) if original_native is not None else None
+        if harness == 'codex' and os.environ.get('YGG_AUTH_NO_PREFRESH') != '1' and _store_is_reader(harness, slug):
+            # A reader copy is refreshed by PULLING from its writer, never by a grant here.
+            cur = read_json(_store_path(harness, slug))
+            exp = access_expiry(cur)
+            if exp is None or exp - time.time() <= ACCESS_PULL_AHEAD_S:
+                writer = get_writer(harness, slug) or "unknown"
+                try:
+                    bundle = pull_access(harness, slug, writer, _self_bytes())
+                    apply_reader_bundle(harness, slug, bundle, writer, lock_held=True)
+                except AuthError as exc:
+                    recover_lineage(harness, slug, _self_bytes(), exc, lock_held=True)
         if harness == 'codex' and os.environ.get('YGG_AUTH_NO_PREFRESH') != '1':
             target_path = os.path.join(store_dir(harness), slug + '.json')
             target = read_json(target_path) if os.path.exists(target_path) else None
@@ -1752,13 +1763,16 @@ def _msgboard_post(args_list):
     return m.group(0) if m else None
 
 
-def device_login(harness, name=None, notify=True):
+def device_login(harness, name=None, notify=True, force=False):
     """Ported from the proven litellm prototype: codex device-code OAuth.
     Dream ACK-52ebf788f0: the code is the one thing a human must touch, so it
     also goes where the owner actually looks — a pinned msgGraph card that
     auto-closes when the poll completes."""
     if HARNESSES[harness]["login"] is None:
         raise AuthError(4, f"login is not implemented for {harness}: {HARNESSES[harness]['live_note']}")
+
+    if not force:
+        _sign_in_gate(harness, name)
 
     def post_json(url, payload, as_form=False):
         if as_form:
@@ -1887,7 +1901,7 @@ def cmd_login(args):
     require_token_harness(require_harness(args.harness), "login")
 
     return device_login(require_harness(args.harness), name=args.name,
-                        notify=not args.no_notify)
+                        notify=not args.no_notify, force=getattr(args, "force", False))
 
 
 def import_foreign(path, harness, name=None, writer=None):
@@ -1938,96 +1952,417 @@ def cmd_import(args):
 
 
 def fetch_remote(host, harness, slug, activate=False):
-    """Pull one profile from another host's store over ssh and store it here.
-
-    Pull, never push: the remote host is the authority for its own records
-    (owner-authorized cross-host provisioning, 2026-09-20). ssh must work
-    keyless (BatchMode) — the fleet standard. Destinations are self-learned
-    (dream ACK-62a8b4abe4): a working user@host is remembered under its bare
-    alias and tried first next time. Provenance (dream ACK-68ce18afa6): the
-    remote's writer + writer stamp ride along, so doctor can compare.
-    """
+    """Install a READER copy of an account whose refresh grant lives on `host`
+    (or on the writer `host` reports). No refresh token crosses: the writer serves
+    an access bundle, and this host stores it with the reader sentinel."""
     require_harness(harness)
     slug = slug_for(slug)
-    remote_path = f"~/.yggterm/auth/{harness}/{slug}.json"
-    record = None
-    used_dest = None
-    last_err = "no destination tried"
-    for dest in ssh_dest_candidates(host):
-        cmd = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", dest,
-               "cat", remote_path]
+    script_bytes = _self_bytes()
+    writer = host
+    ev = _remote_evidence(host, harness, slug, script_bytes)
+    if ev.get("kind") == "reader" and ev.get("writer") and ev["writer"] != host:
+        writer = ev["writer"]
+    bundle = pull_access(harness, slug, writer, script_bytes)
+    with fleet_lock():
+        apply_reader_bundle(harness, slug, bundle, writer, lock_held=True)
+    if activate:
+        # Re-enter through the checked activation route after releasing the lock.
+        result = cmd_switch(argparse.Namespace(harness=harness, slug=slug, force=False))
+        return {**result, "fetched_from": writer, "activated": True}
+    return {"fetched_from": writer, "slug": slug, "writer": writer, "activated": False,
+            "access_expires_at": bundle.get("access_expires_at")}
+
+
+# ── Lineage law (2026-11-16) ─────────────────────────────────────────────────
+# A refresh token ROTATES on every use. Two hosts holding copies of one family
+# race: whichever refreshes first kills the other, and the loser is told
+# "refresh grant rejected: HTTP 401". That is not an expiry; it is a second
+# writer. The architecture that ends it:
+#   WRITER  the one host whose record holds the live refresh grant. Only the
+#           writer calls the refresh grant, and only when the access token is
+#           close to expiry, so the family is used at least every ~7 days and
+#           an account never idles long enough to need a sign-in.
+#   READER  every other host. It holds the access + id token and a sentinel in
+#           place of the refresh token. A reader cannot rotate the family, and
+#           the provider rejecting a sentinel costs the family nothing.
+#   Readers pull a fresh access bundle from the writer before expiry (sync).
+#           Refresh grants never cross hosts.
+#   RECOVERY a dead writer grant moves the lineage to the newest live copy
+#           elsewhere (one candidate: an older token is a rotated-out one).
+#   SIGN-IN refused while any fleet host refreshed the account within 30 days,
+#           or while a host that may hold it cannot be read.
+READER_RT_PREFIX = "ygg-reader:"
+ACCESS_REFRESH_AHEAD_S = 3 * 86400   # writer refreshes when the access token has < 3 days left
+ACCESS_PULL_AHEAD_S = 2 * 86400      # reader pulls when the access token has < 2 days left
+SIGN_IN_IDLE_FLOOR_S = 30 * 86400    # sign-in only after 30 days with no refresh anywhere
+
+
+def _self_bytes():
+    """This script's own bytes. Sent over ssh so a peer runs exactly this revision."""
+    with open(os.path.abspath(__file__), "rb") as f:
+        return f.read()
+
+
+def _tokens_of(record):
+    return record.get("tokens") if isinstance(record.get("tokens"), dict) else record
+
+
+def is_reader_record(record):
+    rt = _tokens_of(record).get("refresh_token")
+    return isinstance(rt, str) and rt.startswith(READER_RT_PREFIX)
+
+
+def access_expiry(record):
+    exp = decode_jwt_claims(_tokens_of(record).get("access_token") or "").get("exp")
+    return float(exp) if type(exp) in (int, float) else None
+
+
+def access_bundle(record):
+    """The only thing a writer hands a reader: access + id token, never the grant."""
+    t = _tokens_of(record)
+    return {"access_token": t.get("access_token"), "id_token": t.get("id_token"),
+            "account_id": t.get("account_id"), "last_refresh": record.get("last_refresh"),
+            "access_expires_at": access_expiry(record)}
+
+
+def reader_record(bundle, writer):
+    return {"auth_mode": "chatgpt", "OPENAI_API_KEY": None,
+            "tokens": {"id_token": bundle["id_token"], "access_token": bundle["access_token"],
+                       "refresh_token": READER_RT_PREFIX + writer,
+                       "account_id": bundle["account_id"]},
+            "last_refresh": bundle["last_refresh"]}
+
+
+def _store_path(harness, slug):
+    return os.path.join(store_dir(harness), slug + ".json")
+
+
+def _store_is_reader(harness, slug):
+    path = _store_path(harness, slug)
+    try:
+        return os.path.exists(path) and is_reader_record(read_json(path))
+    except (OSError, ValueError):
+        return False
+
+
+def local_lineage(harness, slug):
+    """The newest copy of one account on THIS host: (source, record), or (None, None).
+    Codex rewrites the live file in place, so live is often newer than the store;
+    native refresh order decides, and a tie goes to live."""
+    found = []
+    live = live_record(harness)
+    if live is not None and identity_of(live, harness)["slug"] == slug:
+        found.append(("live", live))
+    path = _store_path(harness, slug)
+    if os.path.exists(path):
+        found.append(("store", read_json(path)))
+    if not found:
+        return None, None
+    return max(found, key=lambda c: ((_native_epoch(c[1]) or 0), c[0] == "live"))
+
+
+def _restart_codex_for(harness):
+    if harness == "codex":
+        # codex app-server daemons cache the grant they were started with; a
+        # rotated-out grant left in a daemon's memory fails its next refresh.
+        stop_codex_daemons(os.path.dirname(HARNESSES[harness]["auth_file"](harness)))
+
+
+def _persist_writer(harness, slug, rec, refreshed):
+    """Keep this host's writer copy canonical. A refresh also rewrites the live
+    file when it IS this lineage, and restarts the daemons that cache it."""
+    atomic_write_json(_store_path(harness, slug), rec)
+    stamp_provenance(harness, slug, record=rec, writer=HOSTNAME, role="writer",
+                     source="refresh" if refreshed else "capture", writer_updated_at=time.time())
+    if refreshed:
+        live = live_record(harness)
+        if live is not None and identity_of(live, harness)["slug"] == slug:
+            atomic_write_json(HARNESSES[harness]["auth_file"](harness), rec)
+            _restart_codex_for(harness)
+
+
+def _writer_access(harness, slug):
+    """Writer side. Returns (access bundle, refreshed?) for a lineage this host
+    refreshes. A READ never rotates: the grant runs only when the access token is
+    near expiry. The refresh token is never in the return value."""
+    with fleet_lock():
+        src, rec = local_lineage(harness, slug)
+        if rec is None:
+            raise AuthError(6, f"no {slug} lineage on this host", {"reason": "no_lineage"})
+        if is_reader_record(rec):
+            writer = get_writer(harness, slug)
+            raise AuthError(6, f"{slug} is a reader copy here; its writer is {writer}",
+                            {"reason": "not_writer", "writer": writer})
+        exp = access_expiry(rec)
+        if exp is not None and exp - time.time() > ACCESS_REFRESH_AHEAD_S:
+            if src == "live":
+                _persist_writer(harness, slug, rec, refreshed=False)
+            return access_bundle(rec), False
+        fresh = refresh_profile(harness, slug, rec)   # raises refresh_invalid on a dead grant
+        _persist_writer(harness, slug, fresh, refreshed=True)
+        return access_bundle(fresh), True
+
+
+def apply_reader_bundle(harness, slug, bundle, writer, lock_held=False, supersede=False):
+    """Reader side: install an access-only copy of a lineage whose writer is `writer`.
+    Refuses to demote a writer copy that is NEWER than the bundle (that would throw
+    away this host's live grant), unless `supersede`, which only recovery passes
+    after this host's own grant has just been rejected."""
+    if not lock_held:
+        with fleet_lock():
+            return apply_reader_bundle(harness, slug, bundle, writer, lock_held=True, supersede=supersede)
+    for key in ("access_token", "id_token", "account_id", "last_refresh"):
+        if not isinstance(bundle.get(key), str) or not bundle.get(key):
+            raise AuthError(5, f"{writer} returned an incomplete access bundle", {"reason": "bad_bundle"})
+    rec = reader_record(bundle, writer)
+    new_epoch = _native_epoch(rec) or 0
+    _src, local = local_lineage(harness, slug)
+    live = live_record(harness)
+    live_here = live is not None and identity_of(live, harness)["slug"] == slug
+    if not supersede:
+        if local is not None and not is_reader_record(local) and (_native_epoch(local) or 0) >= new_epoch:
+            raise AuthError(5, f"this host holds a writer grant for {slug} at least as new as {writer}'s; "
+                               "not demoting it", {"reason": "local_writer_newer"})
+        if live_here and not is_reader_record(live) and (_native_epoch(live) or 0) >= new_epoch:
+            raise AuthError(5, f"the live {slug} login here is a writer at least as new as {writer}'s; "
+                               "not demoting it", {"reason": "live_writer_newer"})
+    atomic_write_json(_store_path(harness, slug), rec)
+    stamp_provenance(harness, slug, record=rec, writer=writer, role="reader",
+                     source="sync", writer_updated_at=time.time())
+    if live_here:
+        atomic_write_json(HARNESSES[harness]["auth_file"](harness), rec)
+        _restart_codex_for(harness)
+    return {"slug": slug, "writer": writer, "access_expires_at": bundle.get("access_expires_at")}
+
+
+def pull_access(harness, slug, writer, script_bytes):
+    """Ask the writer for its current access bundle over ssh. The writer runs THIS
+    revision from stdin, so no remote install is needed. The bundle is parsed here
+    and never printed; the refresh grant is never requested."""
+    last = "no destination tried"
+    for dest in ssh_dest_candidates(writer):
+        proc = ssh_script(dest, ["access", "--harness", harness, "--slug", slug, "--for-reader"],
+                          script_bytes, timeout=60)
+        if proc is None:
+            last = f"ssh {dest} timed out"
+            continue
+        if proc.returncode != 0:
+            last = f"ssh {dest}: {proc.stderr.decode('utf-8', 'replace').strip()[-200:] or proc.returncode}"
+            continue
         try:
-            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-        except subprocess.TimeoutExpired:
-            last_err = f"ssh {dest} timed out"
+            bundle = json.loads(proc.stdout.decode("utf-8"))
+        except ValueError:
+            last = f"{dest}: unparseable access bundle"
+            continue
+        remember_ssh_dest(dest)
+        return bundle
+    raise AuthError(5, f"could not pull {slug} access from {writer}: {last}", {"reason": "pull_failed"})
+
+
+def local_evidence(harness, slug):
+    """What this host holds for one account: kinds and times only, never a token."""
+    _src, rec = local_lineage(harness, slug)
+    if rec is None:
+        return {"kind": "absent"}
+    if is_reader_record(rec):
+        return {"kind": "reader", "writer": get_writer(harness, slug),
+                "access_expires_at": access_expiry(rec)}
+    of_record = get_writer(harness, slug)
+    return {"kind": "writer" if of_record in (None, HOSTNAME) else "orphan",
+            "of_record": of_record, "last_refresh_epoch": _native_epoch(rec),
+            "access_expires_at": access_expiry(rec)}
+
+
+def _remote_evidence(host, harness, slug, script_bytes):
+    last = "no destination tried"
+    for dest in ssh_dest_candidates(host):
+        proc = ssh_script(dest, ["evidence", "--harness", harness, "--slug", slug, "--json"],
+                          script_bytes, timeout=30)
+        if proc is None:
+            last = f"ssh {dest} timed out"
             continue
         if proc.returncode == 0:
             try:
-                record = json.loads(proc.stdout)
+                ev = json.loads(proc.stdout.decode("utf-8"))
             except ValueError:
-                last_err = f"{dest}:{remote_path} is not valid JSON"
+                last = f"{dest}: unparseable evidence"
                 continue
-            used_dest = dest
-            break
-        last_err = f"ssh {dest}: {proc.stderr.strip()[:160]}"
-    if record is None:
-        raise AuthError(5, f"could not read {slug} from {host}: {last_err}")
-    remember_ssh_dest(used_dest)
+            if isinstance(ev, dict) and "kind" in ev:
+                remember_ssh_dest(dest)
+                return ev
+        last = f"ssh {dest}: {proc.stderr.decode('utf-8', 'replace').strip()[-160:] or proc.returncode}"
+    raise AuthError(5, f"could not read {slug} evidence from {host}: {last}", {"reason": "unreachable"})
 
-    ident = identity_of(record, harness)
-    if ident["slug"] and ident["slug"] != slug:
-        raise AuthError(6, f"record at {used_dest}:{remote_path} identifies as {ident['slug']!r}, not {slug!r}")
 
-    # carry the remote's lineage stamp when the remote keeps provenance
-    writer, writer_updated_at = None, None
-    prov_cmd = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", used_dest,
-                "cat", f"~/.yggterm/auth/{harness}/.provenance.json"]
+def fleet_evidence(harness, slug, script_bytes):
+    """One row per fleet host, self included. Peers answer through their own read-only
+    `evidence` verb: it never refreshes and never prints a token."""
+    rows = [{**local_evidence(harness, slug), "host": HOSTNAME}]
+    for host in load_fleet_hosts():
+        if host == HOSTNAME:
+            continue
+        try:
+            rows.append({**_remote_evidence(host, harness, slug, script_bytes), "host": host})
+        except AuthError:
+            rows.append({"host": host, "kind": "unreachable"})
+    return rows
+
+
+def _reauth_refused(slug, rows, failure):
+    """No live grant anywhere. Sign-in is the last resort, and only after 30 idle days."""
+    ages = [f"{r['host']}={(time.time() - r['last_refresh_epoch']) / 86400:.1f}d"
+            for r in rows if r.get("last_refresh_epoch")]
+    newest = max((r["last_refresh_epoch"] for r in rows if r.get("last_refresh_epoch")), default=None)
+    if newest is not None and time.time() - newest < SIGN_IN_IDLE_FLOOR_S:
+        msg = (f"{slug}: a grant was refused inside the 30-day window ({', '.join(ages)}). "
+               "That is not an expiry. Investigate before any sign-in.")
+        reason = "refused_inside_window"
+    else:
+        msg = (f"{slug}: no host holds a live grant ({', '.join(ages) or 'no copies'}). "
+               "Sign-in is the only path now.")
+        reason = "reauth_required"
+    return AuthError(5, msg, {"reason": reason, "failure": str(failure)[:200]})
+
+
+def recover_lineage(harness, slug, script_bytes, failure, lock_held=False):
+    """This host's grant for the lineage is dead. Only a copy NEWER than the dead one can
+    be live: any older copy was rotated out before it, and presenting it can make the
+    provider revoke the whole family. Try the newest such copy, and only that one. On
+    success this host becomes a reader of it."""
+    _src, rec = local_lineage(harness, slug)
+    dead_epoch = (_native_epoch(rec) or 0) if rec is not None else 0
+    rows = fleet_evidence(harness, slug, script_bytes)
+    cands = [r for r in rows if r.get("kind") == "writer" and r.get("host") != HOSTNAME
+             and (r.get("last_refresh_epoch") or 0) > dead_epoch]
+    if not cands:
+        raise _reauth_refused(slug, rows, failure)
+    best = max(cands, key=lambda r: r["last_refresh_epoch"])
     try:
-        prov_proc = subprocess.run(prov_cmd, capture_output=True, text=True, timeout=20)
-        if prov_proc.returncode == 0:
-            remote_prov = (json.loads(prov_proc.stdout) or {}).get(slug) or {}
-            writer = remote_prov.get("writer")
-            writer_updated_at = remote_prov.get("writer_updated_at")
-    except (subprocess.TimeoutExpired, ValueError):
-        pass
-    if writer is None:
-        writer = used_dest.split("@")[-1]
-    if writer_updated_at is None:
-        writer_updated_at = time.time()
+        bundle = pull_access(harness, slug, best["host"], script_bytes)
+        apply_reader_bundle(harness, slug, bundle, best["host"], lock_held=lock_held, supersede=True)
+    except AuthError as exc:
+        raise _reauth_refused(slug, rows, f"{failure}; {best['host']}: {exc}")
+    return {"slug": slug, "state": "lineage_moved", "writer": best["host"]}
 
-    if harness == 'codex' and 'remote_prov' in locals() and remote_prov.get('content_hash') not in (None, record_hash(record)):
-        raise AuthError(5, 'remote auth changed across snapshot reads; fetch held')
 
-    with fleet_lock():
-        if harness == 'codex':
-            existing = os.path.join(store_dir(harness), slug + '.json')
-            local = read_json(existing) if os.path.exists(existing) else None
-            native = live_record(harness)
-            for candidate in (local, native):
-                if candidate is None:
-                    continue
-                local_ident = identity_of(candidate)
-                if local_ident.get('slug') != slug:
-                    continue
-                if not _same_codex_identity(candidate, record):
-                    raise AuthError(5, 'fetch account identity conflicts with local record; retained')
-                if record_hash(candidate) != record_hash(record):
-                    a, b = _native_epoch(candidate), _native_epoch(record)
-                    if a is None or b is None or a >= b:
-                        raise AuthError(5, 'fetch would replace newer or incomparable local auth; retained',
-                                        {'reason': 'local_auth_not_older'})
-        atomic_write_json(os.path.join(store_dir(harness), f"{slug}.json"), record)
-        stamp_provenance(harness, slug, record=record, writer=writer,
-                         writer_updated_at=writer_updated_at,
-                         source="fetch", fetched_from=used_dest)
-    if activate:
-        # Re-enter through the checked activation route after releasing the
-        # vault lock; never bypass its target probe or nest the flock.
-        result = cmd_switch(argparse.Namespace(harness=harness, slug=slug, force=False))
-        return {**result, 'fetched_from': used_dest, 'activated': True}
-    return {"fetched_from": used_dest, "slug": slug,
-            "writer": writer, "activated": False,
-            "stored_record_hash": record_hash(read_json(os.path.join(store_dir(harness),slug+'.json')))}
+def sync_lineage(harness, slug, script_bytes):
+    """One account on this host. A reader pulls when due. A writer keeps its grant
+    alive when due. A writer-capable copy this host does not own is demoted by pulling
+    from its writer. Never refreshes a grant it does not own."""
+    _src, rec = local_lineage(harness, slug)
+    if rec is None:
+        return {"slug": slug, "state": "absent"}
+    of_record = get_writer(harness, slug)
+    if is_reader_record(rec) or of_record not in (None, HOSTNAME):
+        writer = of_record or "unknown"
+        exp = access_expiry(rec)
+        if is_reader_record(rec) and exp is not None and exp - time.time() > ACCESS_PULL_AHEAD_S:
+            return {"slug": slug, "state": "reader_fresh", "writer": writer}
+        try:
+            bundle = pull_access(harness, slug, writer, script_bytes)
+            apply_reader_bundle(harness, slug, bundle, writer)
+            return {"slug": slug, "state": "reader_pulled", "writer": writer}
+        except AuthError as exc:
+            if not is_reader_record(rec):
+                return {"slug": slug, "state": "orphan_unresolved", "writer": writer,
+                        "note": str(exc)[:160]}
+            return recover_lineage(harness, slug, script_bytes, exc)
+    # A writer-capable copy that another host holds a NEWER grant for is a rotated-out
+    # member of the family. Presenting it can make the provider revoke the whole family,
+    # so it is never refreshed here: it is demoted by pulling from the newest writer.
+    local_epoch = _native_epoch(rec) or 0
+    rows = fleet_evidence(harness, slug, script_bytes)
+    newer = [r for r in rows if r.get("host") != HOSTNAME and r.get("kind") == "writer"
+             and (r.get("last_refresh_epoch") or 0) > local_epoch]
+    if newer:
+        best = max(newer, key=lambda r: r["last_refresh_epoch"])
+        try:
+            bundle = pull_access(harness, slug, best["host"], script_bytes)
+            apply_reader_bundle(harness, slug, bundle, best["host"])
+            return {"slug": slug, "state": "superseded_moved", "writer": best["host"]}
+        except AuthError as exc:
+            return {"slug": slug, "state": "superseded_unresolved", "writer": best["host"],
+                    "note": str(exc)[:160]}
+    try:
+        _bundle, refreshed = _writer_access(harness, slug)
+        return {"slug": slug, "state": "writer_refreshed" if refreshed else "writer_fresh"}
+    except AuthError as exc:
+        if exc.details.get("reason") != "refresh_invalid":
+            raise
+        return recover_lineage(harness, slug, script_bytes, exc)
+
+
+def stored_slugs(harness):
+    slugs = set()
+    d = store_dir(harness)
+    if os.path.isdir(d):
+        slugs |= {f[:-5] for f in os.listdir(d) if f.endswith(".json") and not f.startswith(".")}
+    live = live_record(harness)
+    if live is not None and identity_of(live, harness)["slug"]:
+        slugs.add(identity_of(live, harness)["slug"])
+    return sorted(slugs)
+
+
+def cmd_sync(args):
+    """Timer verb: keep every lineage on this host alive. Readers pull, writers refresh
+    when due. Safe to run any time; a fresh copy costs nothing and makes no request."""
+    harness = require_harness(args.harness)
+    require_token_harness(harness, "sync")
+    script_bytes = _self_bytes()
+    rows = []
+    scope = [slug_for(args.slug)] if getattr(args, "slug", None) else stored_slugs(harness)
+    for slug in scope:
+        try:
+            rows.append(sync_lineage(harness, slug, script_bytes))
+        except AuthError as exc:
+            rows.append({"slug": slug, "state": "error", "reason": exc.details.get("reason"),
+                         "message": str(exc)[:240]})
+    return {"harness": harness, "lineages": rows}
+
+
+def cmd_access(args):
+    """Writer side of a reader's pull. Emits the access bundle on stdout and never the
+    refresh grant. Refuses a terminal, so a token cannot land in scrollback or a log."""
+    if not args.for_reader:
+        raise AuthError(6, "access is a machine verb for readers; pass --for-reader")
+    if sys.stdout.isatty():
+        raise AuthError(6, "refusing to print access tokens to a terminal")
+    harness = require_harness(args.harness)
+    if not args.slug:
+        raise AuthError(6, "access needs --slug")
+    bundle, _refreshed = _writer_access(harness, slug_for(args.slug))
+    sys.stdout.write(json.dumps(bundle))
+    sys.stdout.flush()
+    return {"_printed": True}
+
+
+def cmd_evidence(args):
+    harness = require_harness(args.harness)
+    if not args.slug:
+        raise AuthError(6, "evidence needs --slug")
+    return local_evidence(harness, slug_for(args.slug))
+
+
+def _sign_in_gate(harness, name):
+    """Sign-in is the last resort. Refused while any fleet host refreshed this account
+    within 30 days, and refused while a host that may hold it cannot be read."""
+    if not name:
+        raise AuthError(6, "login needs --name <account email>, so the fleet can be checked "
+                           "for a live lineage first", {"reason": "name_required"})
+    slug = slug_for(name)
+    rows = fleet_evidence(harness, slug, _self_bytes())
+    epochs = [r["last_refresh_epoch"] for r in rows if r.get("kind") == "writer" and r.get("last_refresh_epoch")]
+    if epochs:
+        newest = max(epochs)
+        age = time.time() - newest
+        if age < SIGN_IN_IDLE_FLOOR_S:
+            on = [r["host"] for r in rows if r.get("kind") == "writer" and r.get("last_refresh_epoch") == newest]
+            raise AuthError(5, f"{slug} is live: refreshed {age / 86400:.1f} days ago on {', '.join(on)}. "
+                               "No sign-in. Run `ygg auth sync` to move it here.", {"reason": "lineage_live"})
+    unreachable = [r["host"] for r in rows if r.get("kind") == "unreachable"]
+    if unreachable:
+        raise AuthError(5, f"cannot prove {slug} has no live lineage: unreachable {', '.join(unreachable)}. "
+                           "Retry when they answer, or --force (owner).", {"reason": "lineage_unproven"})
 
 
 def cmd_fetch(args):
@@ -2209,6 +2544,9 @@ def cmd_usage(args):
 def refresh_grant(record):
     """OAuth refresh grant — the same client_id codex itself uses. ROTATES the
     refresh token: the caller MUST persist the returned record immediately."""
+    if is_reader_record(record):
+        raise AuthError(6, "reader copy: the refresh grant belongs to this account's writer; run `ygg auth sync`",
+                        {"reason": "not_writer"})
     tokens = record.get("tokens") if isinstance(record.get("tokens"), dict) else record
     refresh_token = tokens.get("refresh_token")
     if not refresh_token:
@@ -2651,7 +2989,7 @@ def main(argv=None):
         prog="ygg-auth.py",
         description="Fleet auth-rotation plane: fast multi-account switching for harness CLIs.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="Credentials never leave the host. Output never prints tokens.")
+        epilog="Refresh grants never leave their writer host; readers hold access tokens only. Output never prints tokens.")
     parser.add_argument("--harness", default="codex", help="target harness (default codex)")
     # Subparsers re-declare --harness with a SUPPRESS default so it may sit on
     # either side of the verb (`--harness claude capture` AND `capture --harness
@@ -2659,6 +2997,24 @@ def main(argv=None):
     sub_parent = argparse.ArgumentParser(add_help=False)
     sub_parent.add_argument("--harness", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     sub = parser.add_subparsers(dest="verb", required=True)
+
+    p = sub.add_parser("sync", parents=[sub_parent],
+                       help="keep this host's lineages alive: readers pull access, writers refresh when due")
+    p.add_argument("--slug", help="limit to one account (default: every account on this host)")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_sync)
+
+    p = sub.add_parser("access", parents=[sub_parent],
+                       help="writer side of a reader pull (machine verb; emits access tokens on stdout only)")
+    p.add_argument("--slug", required=True)
+    p.add_argument("--for-reader", action="store_true")
+    p.set_defaults(func=cmd_access)
+
+    p = sub.add_parser("evidence", parents=[sub_parent],
+                       help="what this host holds for one account: kinds and times, never tokens")
+    p.add_argument("--slug", required=True)
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_evidence)
 
     p = sub.add_parser("status", parents=[sub_parent], help="live identity + stored profiles")
     p.add_argument("--json", action="store_true")
@@ -2723,6 +3079,8 @@ def main(argv=None):
     p.set_defaults(func=cmd_exec)
 
     p = sub.add_parser("login", parents=[sub_parent], help="device-code OAuth into a NEW account (codex)")
+    p.add_argument("--force", action="store_true",
+                   help="owner override: sign in even when the fleet shows a live lineage")
     p.add_argument("--name", help="override the profile slug")
     p.add_argument("--no-notify", action="store_true",
                    help="do not post the device-code card to infra/auth")
@@ -2861,6 +3219,16 @@ def main(argv=None):
                 print(f"📡 fetched {out['switched_to']} from {out['fetched_from']} and activated: {idt['email']} ({idt['plan']})")
             else:
                 print(f"📡 fetched {out['slug']} from {out['fetched_from']} — stored, not live (use `switch` or `--activate`)")
+        elif args.verb == "access":
+            pass  # cmd_access already wrote the bundle to stdout
+        elif args.verb == "sync":
+            for row in out["lineages"]:
+                note = row.get("message") or row.get("note") or ""
+                print(f"  {row['slug']:<38} {row['state']:<18} {(row.get('writer') or ''):<12} {note}")
+            if not out["lineages"]:
+                print("  no lineages on this host")
+        elif args.verb == "evidence":
+            print(json.dumps(out, indent=2))
         elif args.verb == "usage":
             for acct in out["accounts"]:
                 u = acct["usage"]
